@@ -8,7 +8,7 @@ def FullClearPropagation_Simulation(pulse, N, num, Dmat, gamma, E_sat, g_0, h, t
                                     Frensel_k, omega, delta, Delta, phi, ITER_NUM):
     """ Последовательное моделирование ITER_NUM итераций """
     current_pulse = np.copy(pulse)
-    for i in trange(ITER_NUM - 1):
+    for _ in trange(ITER_NUM - 1):
         current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
         current_pulse = RightBoundary(current_pulse, omega, delta, Delta, phi)
         current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
