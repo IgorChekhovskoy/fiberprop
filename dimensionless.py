@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 
 
 def GetScales(beta_2, gamma_2, C):  # эта реализация функции только для гексагонального волокна

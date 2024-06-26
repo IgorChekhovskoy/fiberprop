@@ -1,6 +1,4 @@
 from scipy.signal import find_peaks
-# import matplotlib.ticker as ticker
-import matplotlib.pyplot as plt
 from tests import *
 import numpy as np
 
@@ -60,11 +58,11 @@ def EnergyEvo(dirName, A, B, n, M, N, step, z1, z2):
     z = np.arange(N)
     for i in range(n + 1):
         if i == n:
-            F = lambda x: SimpsonIntegral(M - 1, step, P_single[x])
+            F = lambda x: GetEnergy_Simpson(P_single[x], step)
             E_z = np.vectorize(F)(z)
             asw.append(E_z / 1e6)
             continue
-        F = lambda x: SimpsonIntegral(M - 1, step, P[i][x])
+        F = lambda x: GetEnergy_Simpson(P[i][x], step)
         E_z = np.vectorize(F)(z)
         asw.append(E_z / 1e6)
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -643,7 +641,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     texts = []
     sumPow = 0.0
     for i in range(num):
-        energy = SimpsonIntegral(M - 1, t_step, P[i][outId])
+        energy = GetEnergy_Simpson(P[i][outId], t_step)
         meanPower = energy/(t2-t1)
         sumPow += meanPower
     if config == 'ring':
@@ -651,7 +649,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * i / (num)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = SimpsonIntegral(M - 1, t_step, P[i][outId])
+            energy = GetEnergy_Simpson(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} core:\n{round(value, 1)}%'
@@ -659,7 +657,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     elif config == 'ring_with_central':
         point = (0, 0)
         points.append(point)
-        energy = SimpsonIntegral(M - 1, t_step, P[0][outId])
+        energy = GetEnergy_Simpson(P[0][outId], t_step)
         meanPower = energy / (t2 - t1)
         value = 100 * meanPower / sumPow  # в процентах
         text = f'0 core:\n{round(value, 1)}%'
@@ -668,7 +666,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * (i - 1) / (num - 1)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = SimpsonIntegral(M - 1, t_step, P[i][outId])
+            energy = GetEnergy_Simpson(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} core:\n{round(value, 1)}%'
