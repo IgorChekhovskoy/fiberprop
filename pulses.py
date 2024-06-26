@@ -10,7 +10,7 @@ def KuznetsovMaSoliton(t, x, par=1):
     return (1 + numer / den) * np.exp(1j * x)
 
 
-def ElementarySoliton(t, x, beta_2, lamb=1, c=1):
+def fundamental_soliton(t, x, beta_2, lamb=1, c=1):
     """ Классический солитон """
     return c * lamb / np.cosh(lamb*t) * np.exp(-1j * beta_2 * lamb**2 * x)
 

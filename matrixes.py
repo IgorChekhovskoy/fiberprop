@@ -1,7 +1,10 @@
 import numpy as np
+from scipy.linalg import expm
 from math import factorial, cos, pi, sqrt
+from numba import jit
 
 
+@jit(nopython=True)
 def GetRingCouplingMatrix(n):
     elem = [1, -2, 1]
     lstlen = len(elem)
@@ -10,6 +13,7 @@ def GetRingCouplingMatrix(n):
     return np.array(asw)
 
 
+@jit(nopython=True)
 def GetCentralCouplingMatrix(n):
     asw = []
     k = sqrt(2 * (1 - cos(2 * pi / (n - 1))))
@@ -28,45 +32,75 @@ def GetCentralCouplingMatrix(n):
     return np.array(asw)
 
 
+@jit(nopython=True)
 def CreateMyFreqMatrix(mat, beta_2, alpha, g_0, w, step):
-    asw = []
     n = len(mat)
+    m = len(w)
+    asw = np.empty((n * n, m), dtype=np.complex128)
+
+    diag_elements = step * (1j * np.diag(mat)[:, None] + (1j * beta_2 * w ** 2 - alpha - g_0) / 2)
+    off_diag_elements = step * 1j * mat
+
     for i in range(n * n):
         x = i // n
         y = i % n
-        row = []
         if x == y:
-            row = [step * (1j * mat[x][y] + (1j * beta_2 * w_k**2 - alpha - g_0) / 2) for w_k in w]
+            asw[i] = diag_elements[x]
         else:
-            row = [step * 1j * mat[x][y]] * len(w)
-        asw.append(row)
-    return np.array(asw)
+            asw[i] = off_diag_elements[x, y]
+
+    return asw
 
 
-def PadeExpForMatrix(matrix, k=6, m=6):
-    leftPart = np.zeros((len(matrix), len(matrix[0])), dtype=complex)
-    rightPart = np.zeros((len(matrix), len(matrix[0])), dtype=complex)
+def precompute_coeffs(k, m):
+    left_coeffs = np.zeros(m + 1)
+    right_coeffs = np.zeros(k + 1)
     for i in range(m + 1):
-        leftPart += factorial(k + m - i) * factorial(m) / (
-                    factorial(k + m) * factorial(m - i) * factorial(i)) * np.linalg.matrix_power(-matrix, i)
+        left_coeffs[i] = factorial(k + m - i) * factorial(m) / (factorial(k + m) * factorial(m - i) * factorial(i))
     for j in range(k + 1):
-        rightPart += factorial(k + m - j) * factorial(k) / (
-                    factorial(k + m) * factorial(k - j) * factorial(j)) * np.linalg.matrix_power(matrix, j)
+        right_coeffs[j] = factorial(k + m - j) * factorial(k) / (factorial(k + m) * factorial(k - j) * factorial(j))
+    return left_coeffs, right_coeffs
+
+def PadeExpForMatrix(matrix, left_coeffs, right_coeffs, leftPart, rightPart):
+    np.copyto(leftPart, np.zeros_like(matrix))
+    np.copyto(rightPart, np.zeros_like(matrix))
+
+    for i, coeff in enumerate(left_coeffs):
+        leftPart += coeff * np.linalg.matrix_power(-matrix, i)
+
+    for j, coeff in enumerate(right_coeffs):
+        rightPart += coeff * np.linalg.matrix_power(matrix, j)
+
     return np.dot(np.linalg.inv(leftPart), rightPart)
 
-
-def PadeExpForMyFreqMatrix(FreqMat):
-    ret = np.empty_like(FreqMat)
-    n = len(FreqMat)
+def PadeExpForMyFreqMatrix(FreqMat, k=6, m=6):
+    n, p = FreqMat.shape
     side = int(sqrt(n))
-    m = len(FreqMat[0])
-    for i in range(m):
-        vec = np.zeros(n, dtype=complex)
-        for j in range(n):
-            vec[j] = FreqMat[j][i]
-        mat = PadeExpForMatrix(np.reshape(vec, (side, side)))
-        vec = np.reshape(mat, n)
-        for j in range(n):
-            ret[j][i] = vec[j]
+    ret = np.empty((n, p), dtype=complex)
+    left_coeffs, right_coeffs = precompute_coeffs(k, m)
+    leftPart = np.zeros((side, side), dtype=complex)
+    rightPart = np.zeros((side, side), dtype=complex)
+    temp_matrix = np.empty((side, side), dtype=complex)
+
+    for i in range(p):
+        vec = FreqMat[:, i]
+        np.copyto(temp_matrix, np.reshape(vec, (side, side)))
+        mat = PadeExpForMatrix(temp_matrix, left_coeffs, right_coeffs, leftPart, rightPart)
+        ret[:, i] = np.reshape(mat, n)
+
     return ret
 
+
+#@jit(nopython=True)
+def PadeExpForMyFreqMatrix2(FreqMat):
+    n, p = FreqMat.shape
+    side = int(sqrt(n))
+    ret = np.empty((n, p), dtype=complex)
+    temp_matrix = np.empty((side, side), dtype=complex)
+
+    for i in range(p):
+        temp_matrix[:, :] = FreqMat[:, i].reshape(side, side)
+        mat = expm(temp_matrix)
+        ret[:, i] = mat.ravel()
+
+    return ret

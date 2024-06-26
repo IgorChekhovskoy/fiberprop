@@ -2,32 +2,39 @@ from cmath import exp as cexp
 from tqdm import trange
 from SSFM_MCF import *
 from matrixes import *
+from numpy.fft import fftfreq
 
 
-def FullClearPropagation_Simulation(pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau,
-                                    Frensel_k, omega, delta, Delta, phi, ITER_NUM):
+def FullClearPropagation_Simulation(pulse, N, num, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0,
+                                    Fresnel_k, omega, delta, Delta, phi, ITER_NUM):
+
     """ Последовательное моделирование ITER_NUM итераций """
+
+    M = pulse.shape[1]
+    w = fftfreq(M, tau) * 2 * pi
+    Dmat = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, h))
+
     current_pulse = np.copy(pulse)
     for _ in trange(ITER_NUM - 1):
         current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
         current_pulse = RightBoundary(current_pulse, omega, delta, Delta, phi)
         current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
-        current_pulse = LeftBoundary(current_pulse, Frensel_k)
+        current_pulse = LeftBoundary(current_pulse, Fresnel_k)
     current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
     current_pulse = RightBoundary(current_pulse, omega, delta, Delta, phi)
     current_pulse = SimulateClearPropagation(current_pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau)
-    current_pulse = OutputCouplerCondition(current_pulse, Frensel_k)
+    current_pulse = OutputCouplerCondition(current_pulse, Fresnel_k)
     return current_pulse
 
 
-def OutputCouplerCondition(pulse, Frensel_k):
+def OutputCouplerCondition(pulse, Fresnel_k):
     """ Коэффициент отсечения при выходе из волокна """
-    return pulse * (1 - Frensel_k)
+    return pulse * (1 - Fresnel_k)
 
 
-def LeftBoundary(pulse, Frensel_k):
+def LeftBoundary(pulse, Fresnel_k):
     """ Условие на левой границе резонатора """
-    return pulse * Frensel_k
+    return pulse * Fresnel_k
 
 
 def RightBoundary(pulse, omega, delta, Delta, phi):
@@ -38,11 +45,81 @@ def RightBoundary(pulse, omega, delta, Delta, phi):
     return new_pulse
 
 
-def SimulateClearPropagation(pulse, N, num, Dmat, gamma, E_sat, g_0, h, tau):
+def SimulateClearPropagation(pulse, N, num, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0):
     """ Строит решение методом SSFM, строит конечное значение поля в каждой сердцевине """
-    currentEnergy = np.array([0] * num, dtype=float)
+
+    M = pulse.shape[1]
+    w = fftfreq(M, tau) * 2 * pi
+    Dmat = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, h))
+
+    current_energy = np.array([0] * num, dtype=float)
     for n in range(N - 1):
-        pulse = SSFMOrder2(pulse, currentEnergy, Dmat, gamma, E_sat, g_0, h, tau)
+        pulse = SSFMOrder2(pulse, current_energy, Dmat, gamma, E_sat, g_0, h, tau)
+    return pulse
+
+
+def SimulateClearPropagationCompactNDN(pulse, N, num, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0):
+    """ Строит решение методом SSFM, строит конечное значение поля в каждой сердцевине """
+
+    M = pulse.shape[1]
+    w = fftfreq(M, tau) * 2*pi
+    Dmat = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, h))
+
+    current_energy = np.array([0] * num, dtype=float)
+
+    num = len(pulse)
+    if g_0 != 0:
+        for i in range(num):
+            current_energy[i] = GetEnergy_Rectangles(pulse[i], tau)
+    NonLinear(pulse, gamma, E_sat, g_0, current_energy, h / 2)
+
+    for n in range(N - 1):
+        pulse = FFTforVector(pulse)
+        pulse = DispAndCoup(pulse, Dmat)
+        pulse = iFFTforVector(pulse)
+
+        if g_0 != 0:
+            for i in range(num):
+                current_energy[i] = GetEnergy_Rectangles(pulse[i], tau)
+        NonLinear(pulse, gamma, E_sat, g_0, current_energy, h)
+
+    if g_0 != 0:
+        for i in range(num):
+            current_energy[i] = GetEnergy_Rectangles(pulse[i], tau)
+    NonLinear(pulse, gamma, E_sat, g_0, current_energy, -h / 2)
+
+    return pulse
+
+
+def SimulateClearPropagationCompactDND(pulse, N, num, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0):
+    """ Строит решение методом SSFM, строит конечное значение поля в каждой сердцевине """
+
+    M = pulse.shape[1]
+    w = fftfreq(M, tau) * 2 * pi
+    DmatH = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, h))
+    DmatH2Plus = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, h / 2))
+    DmatH2Minus = PadeExpForMyFreqMatrix2(CreateMyFreqMatrix(coupling_matrix, beta_2, alpha, g_0, w, -h / 2))
+
+    pulse = FFTforVector(pulse)
+    pulse = DispAndCoup(pulse, DmatH2Plus)
+    pulse = iFFTforVector(pulse)
+
+    current_energy = np.array([0] * num, dtype=float)
+
+    for n in range(N - 1):
+        if g_0 != 0:
+            for i in range(num):
+                current_energy[i] = GetEnergy_Rectangles(pulse[i], tau)
+        NonLinear(pulse, gamma, E_sat, g_0, current_energy, h)
+
+        pulse = FFTforVector(pulse)
+        pulse = DispAndCoup(pulse, DmatH)
+        pulse = iFFTforVector(pulse)
+
+    pulse = FFTforVector(pulse)
+    pulse = DispAndCoup(pulse, DmatH2Minus)
+    pulse = iFFTforVector(pulse)
+
     return pulse
 
 

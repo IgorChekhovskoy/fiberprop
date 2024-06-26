@@ -62,21 +62,38 @@ def DispAndCoup(psi, Dmat):
     return resV
 
 
-def SSFMOrder2(psi, CurrentEnergy, D, gamma, E_sat, g_0, h, tau):
+def SSFMOrder2(psi, currentEnergy, D, gamma, E_sat, g_0, h, tau):
     """ Реализация схемы расщепления """
     num = len(psi)
     if g_0 != 0:
         for i in range(num):
-            CurrentEnergy[i] = GetEnergy_Rectangles(psi[i], tau)
-    NonLinear(psi, gamma, E_sat, g_0, CurrentEnergy, h/2)
+            currentEnergy[i] = GetEnergy_Rectangles(psi[i], tau)
+    NonLinear(psi, gamma, E_sat, g_0, currentEnergy, h/2)
+
     psi = FFTforVector(psi)
     psi = DispAndCoup(psi, D)
     psi = iFFTforVector(psi)
+
     if g_0 != 0:
         for i in range(num):
-            CurrentEnergy[i] = GetEnergy_Rectangles(psi[i], tau)
-    NonLinear(psi, gamma, E_sat, g_0, CurrentEnergy, h/2)
+            currentEnergy[i] = GetEnergy_Rectangles(psi[i], tau)
+    NonLinear(psi, gamma, E_sat, g_0, currentEnergy, h/2)
     return psi
 
 
+def SSFMOrder2_2(psi, currentEnergy, D, gamma, E_sat, g_0, h, tau):
+    """ Реализация схемы расщепления """
+    psi = FFTforVector(psi)
+    psi = DispAndCoup(psi, D)
+    psi = iFFTforVector(psi)
 
+    num = len(psi)
+    if g_0 != 0:
+        for i in range(num):
+            currentEnergy[i] = GetEnergy_Rectangles(psi[i], tau)
+    NonLinear(psi, gamma, E_sat, g_0, currentEnergy, h)
+
+    psi = FFTforVector(psi)
+    psi = DispAndCoup(psi, D)
+    psi = iFFTforVector(psi)
+    return psi
