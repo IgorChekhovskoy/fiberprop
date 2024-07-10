@@ -15,7 +15,7 @@ def fundamental_soliton(t, x, beta_2, lamb=1, c=1):
     return c * lamb / np.cosh(lamb*t) * np.exp(-1j * beta_2 * lamb**2 * x)
 
 
-def GainLossSoliton(t, x, beta_2, gamma, E_sat, alpha, g_0):
+def gain_loss_soliton(t, x, beta_2, gamma, E_sat, alpha, g_0):
     """ Солитон для случая равномерного усиления и без учёта быстрого насыщения поглощения """
     E_s = E_sat * (g_0 - alpha) / alpha
     multiplier = E_s * np.sqrt(gamma / (-4*beta_2))
@@ -32,8 +32,8 @@ def AnySoliton(t, x, a, theta, tau, Phi_z):
 
 def GaussianPulse(t, p=0.687, tau=1.775, phase=0, chirp=0):
     """ Импульс Гаусса """
-    powr = -t**2 / (2 * tau**2) * (1 + 1j*chirp)
-    return np.sqrt(p) * np.exp(powr) * np.exp(1j*phase)
+    power = -t**2 / (2 * tau**2) * (1 + 1j*chirp)
+    return np.sqrt(p) * np.exp(power) * np.exp(1j*phase)
 
 
 def LaserPulse(t, p, tau, phase=0, chirp=0):
@@ -42,14 +42,14 @@ def LaserPulse(t, p, tau, phase=0, chirp=0):
     return np.sqrt(p) * np.exp(1j*phase) * simple**(1 + 1j*chirp)
 
 
-def GetAnalyticalField(params_dict, t_arr, z_arr, function):
+def get_analytical_field(params_dict, t_arr, z_arr, function):
     """ По функции и некоторым параметрам строит поле её значений (аналитическое решение для одной сердцевины) """
     N = len(z_arr)
     M = len(t_arr) + 1
-    analyticalSolution = np.zeros((N, M - 1), dtype=complex)  # сюда будет записываться решение
+    analytical_solution = np.zeros((N, M - 1), dtype=complex)  # сюда будет записываться решение
     for n, z in enumerate(z_arr):
-        analyticalSolution[n] = function(t_arr, z, **params_dict)
-    return analyticalSolution
+        analytical_solution[n] = function(t_arr, z, **params_dict)
+    return analytical_solution
 
 
 

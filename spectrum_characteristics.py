@@ -21,8 +21,8 @@ def PrintSpectrumInfo(A, B, n, N, M, z1, z2, t1, t2, step, dirName):
     central_freq = (ligthVelocity) / central_wavelength  # Hz*1e15
 
     z_2 = np.linspace(z1, z2, N)
-    w_2 = fftshift(fftfreq(M - 1, step)) + central_freq  # Hz*1e15
-    wavelengths = ligthVelocity / w_2 * 1e9  # nm
+    omega_2 = fftshift(fftfreq(M - 1, step)) + central_freq  # Hz*1e15 TODO : Георгий, тут не перепутана ли круговая и обычная?
+    wavelengths = ligthVelocity / omega_2 * 1e9  # nm
     W, Z = np.meshgrid(wavelengths, z_2)
 
     fig = plt.figure(figsize=(22, 20))

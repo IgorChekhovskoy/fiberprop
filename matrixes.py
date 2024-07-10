@@ -5,7 +5,7 @@ from numba import jit
 
 
 @jit(nopython=True)
-def GetRingCouplingMatrix(n):
+def get_ring_coupling_matrix(n):
     elem = [1, -2, 1]
     lstlen = len(elem)
     a = elem[lstlen % 2:] + [0] * (n - lstlen) + elem[:lstlen % 2]
@@ -14,7 +14,7 @@ def GetRingCouplingMatrix(n):
 
 
 @jit(nopython=True)
-def GetCentralCouplingMatrix(n):
+def get_cental_coupling_matrix(n):
     asw = []
     k = sqrt(2 * (1 - cos(2 * pi / (n - 1))))
     for i in range(n):
@@ -33,12 +33,12 @@ def GetCentralCouplingMatrix(n):
 
 
 @jit(nopython=True)
-def CreateMyFreqMatrix(mat, beta_2, alpha, g_0, w, step):
+def create_freq_matrix(mat, beta_2, alpha, g_0, omega, step):
     n = len(mat)
-    m = len(w)
+    m = len(omega)
     asw = np.empty((n * n, m), dtype=np.complex128)
 
-    diag_elements = step * (1j * np.diag(mat)[:, None] + (1j * beta_2 * w ** 2 - alpha - g_0) / 2)
+    diag_elements = step * (1j * np.diag(mat)[:, None] + (1j * beta_2[:, None] * omega ** 2 - alpha[:, None] - g_0[:, None]) / 2)
     off_diag_elements = step * 1j * mat
 
     for i in range(n * n):
@@ -73,7 +73,7 @@ def PadeExpForMatrix(matrix, left_coeffs, right_coeffs, leftPart, rightPart):
 
     return np.dot(np.linalg.inv(leftPart), rightPart)
 
-def PadeExpForMyFreqMatrix(FreqMat, k=6, m=6):
+def get_pade_exponential(FreqMat, k=6, m=6):
     n, p = FreqMat.shape
     side = int(sqrt(n))
     ret = np.empty((n, p), dtype=complex)
@@ -92,7 +92,7 @@ def PadeExpForMyFreqMatrix(FreqMat, k=6, m=6):
 
 
 #@jit(nopython=True)
-def PadeExpForMyFreqMatrix2(FreqMat):
+def get_pade_exponential2(FreqMat):
     n, p = FreqMat.shape
     side = int(sqrt(n))
     ret = np.empty((n, p), dtype=complex)
