@@ -244,8 +244,8 @@ def SimulatePropagationDND(pulse, N, equation_number, h, tau, coupling_matrix, b
     current_energy = np.array([0] * equation_number, dtype=float)
 
     for n in range(N - 1):
-        if g_0 != 0:
-            for i in range(equation_number):
+        for i in range(equation_number):
+            if g_0[i] != 0:
                 current_energy[i] = get_energy_rectangles(pulse[i], tau)
         nonlinear_step(pulse, gamma, E_sat, g_0, current_energy, h)
 

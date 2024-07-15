@@ -20,11 +20,11 @@ def test_case2(plot=True):
     T1, T2 = -25, 25
 
     num = 7
-    beta_2 = -1.0
-    gamma = 1.0
-    E_sat = 1.0
-    alpha = 0.1
-    g_0 = 0.4
+    beta_2 = np.full(num, -1.0, dtype=float)
+    gamma = np.full(num, 1.0, dtype=float)
+    E_sat = np.full(num, 1.0, dtype=float)
+    alpha = np.full(num, 0.1, dtype=float)
+    g_0 = np.full(num, 0.4, dtype=float)
 
     h = (L2 - L1) / (N - 1)
     tau = (T2 - T1) / (M - 1)
@@ -40,7 +40,7 @@ def test_case2(plot=True):
     # начальные условия
     old = np.zeros((num, M - 1), dtype=complex)
     for k in range(num):
-        old[k] = 2 * fundamental_soliton(t[:-1], 0, beta_2)
+        old[k] = 2 * fundamental_soliton(t[:-1], 0, beta_2[0])
         numerical_solution[k][0] = old[k]
 
     # итерации численного метода
@@ -69,11 +69,11 @@ def test_case3(plot=True):
     T1, T2 = -25, 25
 
     num = 7
-    beta_2 = -1.0
-    gamma = 1.0
-    E_sat = 1.0
-    alpha = 0.1
-    g_0 = 0.4
+    beta_2 = np.full(num, -1.0, dtype=float)
+    gamma = np.full(num, 1.0, dtype=float)
+    E_sat = np.full(num, 1.0, dtype=float)
+    alpha = np.full(num, 0.1, dtype=float)
+    g_0 = np.full(num, 0.4, dtype=float)
 
     h = (L2 - L1) / (N - 1)
     tau = (T2 - T1) / (M - 1)
@@ -84,9 +84,10 @@ def test_case3(plot=True):
 
     # начальные условия
     input_pulse = np.zeros((num, M - 1), dtype=complex)
+    scalsr_equation_parameters = {'beta_2': beta_2[0], 'gamma': gamma[0], 'E_sat': E_sat[0], 'alpha': alpha[0], 'g_0': g_0[0]}
     equation_parameters = {'beta_2': beta_2, 'gamma': gamma, 'E_sat': E_sat, 'alpha': alpha, 'g_0': g_0}
     for k in range(num):
-        input_pulse[k] = gain_loss_soliton(t=t[:-1], x=0, **equation_parameters)
+        input_pulse[k] = gain_loss_soliton(t=t[:-1], x=0, **scalsr_equation_parameters)
 
     # итерации численного метода
     # output_pulse = SimulatePropagation(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
@@ -94,7 +95,7 @@ def test_case3(plot=True):
     output_pulse = SimulatePropagationDND(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
 
     # аналитическое решение
-    analytical_output = gain_loss_soliton(t=t[:-1], x=h*(N-1), **equation_parameters)
+    analytical_output = gain_loss_soliton(t=t[:-1], x=h*(N-1), **scalsr_equation_parameters)
 
     # вычисление ошибки
     absolute_error = abs(analytical_output - output_pulse[num//2])  # берём одну сердцевину из численного решения
