@@ -11,8 +11,8 @@ from time import time
 
 @dataclass
 class ComputationalParameters:
-    N: int = 0
-    M: int = 0
+    N: int = 0  # количество шагов, а не точек
+    M: int = 0  # количество учитываемых точек по времени
     L1: float = 0.0
     L2: float = 0.0
     T1: float = 0.0
@@ -22,13 +22,13 @@ class ComputationalParameters:
     tau: float = field(init=False, default=0.0)
 
     def __post_init__(self):
-        if self.N > 1:
-            self.h = (self.L2 - self.L1) / (self.N - 1)
+        if self.N > 0:
+            self.h = (self.L2 - self.L1) / self.N
         else:
             self.h = 0.0
 
-        if self.M > 1:
-            self.tau = (self.T2 - self.T1) / (self.M - 1)
+        if self.M > 0:
+            self.tau = (self.T2 - self.T1) / self.M
         else:
             self.tau = 0.0
 
@@ -72,8 +72,8 @@ class SimulationRunner:
         self.analytical_solution = None
 
     def initialize_arrays(self):
-        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M)
-        self.omega = fftfreq(self.com.M - 1, self.com.tau) * 2 * pi
+        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False)
+        self.omega = fftfreq(self.com.M, self.com.tau) * 2*pi
 
     def calculate_D_matrix(self):
         coupling_matrix = get_ring_coupling_matrix(self.eq.num_equations)
@@ -88,18 +88,18 @@ class SimulationRunner:
         return {k: v for k, v in vars(self.eq).items() if k in func_params}
 
     def run_numerical_simulation(self):
-        self.numerical_solution = np.zeros((self.eq.num_equations, self.com.N, self.com.M-1), dtype=complex)
+        self.numerical_solution = np.zeros((self.eq.num_equations, self.com.N+1, self.com.M), dtype=complex)
         self.current_energy = np.zeros(self.eq.num_equations, dtype=float)
-        old = np.zeros((self.eq.num_equations, self.com.M - 1), dtype=complex)
+        old = np.zeros((self.eq.num_equations, self.com.M), dtype=complex)
 
         for k in range(self.eq.num_equations):
             pulse_params = self.filter_params(self.pulse)
-            old[k] = self.pulse(t=self.t[:-1], x=0,
+            old[k] = self.pulse(t=self.t, x=0,
                                 **{key: val[k] if isinstance(val, np.ndarray) else val for key, val in
                                    pulse_params.items()})
             self.numerical_solution[k][0] = old[k]
 
-        for n in trange(self.com.N - 1):
+        for n in trange(self.com.N):
             new = SSFMOrder2(old, self.current_energy, self.D, self.eq.gamma,
                              self.eq.E_sat, self.eq.g_0, self.com.h, self.com.tau)
             for i in range(self.eq.num_equations):
@@ -107,27 +107,27 @@ class SimulationRunner:
             old = new
 
     def get_analytical_solution(self):
-        z = np.linspace(self.com.L1, self.com.L2, self.com.N)
-        self.analytical_solution = np.zeros((self.eq.num_equations, self.com.N, self.com.M - 1),
+        z = np.linspace(self.com.L1, self.com.L2, self.com.N+1)
+        self.analytical_solution = np.zeros((self.eq.num_equations, self.com.N+1, self.com.M),
                                             dtype=complex)  # сюда будет записываться решение
 
         for k in range(self.eq.num_equations):
             pulse_params = self.filter_params(self.pulse)
             pulse_params = {key: val[k] if isinstance(val, np.ndarray) else val for key, val in pulse_params.items()}
             for n, z_val in enumerate(z):
-                self.analytical_solution[k, n] = self.pulse(t=self.t[:-1], x=z_val, **pulse_params)
+                self.analytical_solution[k, n] = self.pulse(t=self.t, x=z_val, **pulse_params)
 
     def calculate_error(self):
         self.absolute_error = abs(self.analytical_solution[self.eq.num_equations // 2] -
                                   self.numerical_solution[self.eq.num_equations // 2])
-        self.C_norm = np.max(self.absolute_error[self.com.N - 1])
+        self.C_norm = np.max(self.absolute_error[self.com.N])
         print('C norm =\t', self.C_norm)
-        self.L2_norm = get_energy_rectangles(self.absolute_error[self.com.N - 1] ** 2, self.com.tau)
+        self.L2_norm = get_energy_rectangles(self.absolute_error[self.com.N]**2, self.com.tau)
         print('L2 norm =\t', self.L2_norm)
 
     def plot_error(self, plot=True):
         if plot:
-            T_grid, Z_grid = np.meshgrid(self.t[:-1], np.linspace(self.com.L1, self.com.L2, self.com.N))
+            T_grid, Z_grid = np.meshgrid(self.t, np.linspace(self.com.L1, self.com.L2, self.com.N+1))
             name = 'абсолютная_ошибка-case1'
             plot3D(Z_grid, T_grid, self.absolute_error, name)
 
@@ -146,7 +146,7 @@ def FullPropagation_Simulation(pulse, N, equation_number, h, tau, coupling_matri
     """ Последовательное моделирование ITER_NUM итераций """
 
     M = pulse.shape[1]
-    w = fftfreq(M, tau) * 2 * pi
+    w = fftfreq(M, tau) * 2*pi
     Dmat = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, h))
 
     current_pulse = np.copy(pulse)
@@ -184,11 +184,11 @@ def SimulatePropagation(pulse, N, equation_number, h, tau, coupling_matrix, beta
     """ Строит решение методом SSFM, строит конечное значение поля в каждой сердцевине """
 
     M = pulse.shape[1]
-    w = fftfreq(M, tau) * 2 * pi
+    w = fftfreq(M, tau) * 2*pi
     Dmat = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, h))
 
     current_energy = np.array([0] * equation_number, dtype=float)
-    for n in range(N - 1):
+    for n in range(N):
         pulse = SSFMOrder2(pulse, current_energy, Dmat, gamma, E_sat, g_0, h, tau)
     return pulse
 
@@ -209,7 +209,7 @@ def SimulatePropagationNDN(pulse, N, equation_number, h, tau, coupling_matrix, b
             current_energy[i] = get_energy_rectangles(pulse[i], tau)
     nonlinear_step(pulse, gamma, E_sat, g_0, current_energy, h / 2)
 
-    for n in range(N - 1):
+    for n in range(N):
         pulse = fft(pulse, axis=1)
         pulse = linear_step(pulse, Dmat)
         pulse = ifft(pulse, axis=1)
@@ -232,7 +232,7 @@ def SimulatePropagationDND(pulse, N, equation_number, h, tau, coupling_matrix, b
      используя объединение соседних половинных шагов """
 
     M = pulse.shape[1]
-    w = fftfreq(M, tau) * 2 * pi
+    w = fftfreq(M, tau) * 2*pi
     DmatH = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, h))
     DmatH2Plus = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, h / 2))
     DmatH2Minus = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, -h / 2))
@@ -243,7 +243,7 @@ def SimulatePropagationDND(pulse, N, equation_number, h, tau, coupling_matrix, b
 
     current_energy = np.array([0] * equation_number, dtype=float)
 
-    for n in range(N - 1):
+    for n in range(N):
         for i in range(equation_number):
             if g_0[i] != 0:
                 current_energy[i] = get_energy_rectangles(pulse[i], tau)
@@ -262,24 +262,23 @@ def SimulatePropagationDND(pulse, N, equation_number, h, tau, coupling_matrix, b
 
 def makeFull(tens):
     """ Добавляет последнюю точку по времени из периодичности условий (для полного поля во всех сердцевинах) """
-    equation_number, N, M_ = tens.shape
-    M = M_ + 1
-    new = np.empty((equation_number, N, M), dtype=complex)
+    equation_number, N_add, M = tens.shape
+    new = np.empty((equation_number, N_add, M+1), dtype=complex)
     for j in range(equation_number):
-        for k in range(N):
-            for i in range(M - 1):
+        for k in range(N_add):
+            for i in range(M):
                 new[j][k][i] = tens[j][k][i]
-            new[j][k][M - 1] = tens[j][k][0]
+            new[j][k][M] = tens[j][k][0]
     return new
 
 
 def makeFull1D(tens, equation_number, M):
     """ Добавляет последнюю точку по времени из периодичности условий (для последней точки по z во всех сердцевинах) """
-    new = np.empty((equation_number, M), dtype=complex)
+    new = np.empty((equation_number, M+1), dtype=complex)
     for j in range(equation_number):
-        for i in range(M - 1):
+        for i in range(M):
             new[j][i] = tens[j][i]
-        new[j][M - 1] = tens[j][0]
+        new[j][M] = tens[j][0]
     return new
 
 

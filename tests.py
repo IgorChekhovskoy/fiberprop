@@ -3,7 +3,7 @@ from drawing import *
 
 
 def test_case1_using_classes(plot=True):
-    computational_params = ComputationalParameters(N=100, M=2**10 + 1, L1=0, L2=1, T1=-25, T2=25)
+    computational_params = ComputationalParameters(N=100, M=2**10, L1=0, L2=1, T1=-25, T2=25)
     equation_params = EquationParameters(num_equations=7, beta_2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
 
     simulation_runner = SimulationRunner(computational_params, equation_params, pulse=gain_loss_soliton)
@@ -14,8 +14,8 @@ def test_case1_using_classes(plot=True):
 def test_case2(plot=True):
     """ Строит поле мощности решения методом SSFM, начальные данные - не подходящий солитон, кольцевая структура """
 
-    N = 100
-    M = 2 ** 10 + 1
+    N = 100 - 1  # количество шагов, а не точек
+    M = 2**10  # количество учитываемых точек по времени
     L1, L2 = 0, 1
     T1, T2 = -25, 25
 
@@ -26,25 +26,25 @@ def test_case2(plot=True):
     alpha = np.full(num, 0.1, dtype=float)
     g_0 = np.full(num, 0.4, dtype=float)
 
-    h = (L2 - L1) / (N - 1)
-    tau = (T2 - T1) / (M - 1)
+    h = (L2 - L1) / N
+    tau = (T2 - T1) / M
 
-    t = np.linspace(T1, T2, M)
-    omega = fftfreq(M - 1, tau) * 2 * pi
+    t = np.linspace(T1, T2, M, endpoint=False)
+    omega = fftfreq(M, tau) * 2*pi
     
     coupling_matrix = get_ring_coupling_matrix(num)
     D = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, omega, h))
-    numerical_solution = np.zeros((num, N, M-1), dtype=complex)
+    numerical_solution = np.zeros((num, N+1, M), dtype=complex)
     current_energy = np.array([0] * num, dtype=float)
 
     # начальные условия
-    old = np.zeros((num, M - 1), dtype=complex)
+    old = np.zeros((num, M), dtype=complex)
     for k in range(num):
-        old[k] = 2 * fundamental_soliton(t[:-1], 0, beta_2[0])
+        old[k] = 2 * fundamental_soliton(t, 0, beta_2[0])
         numerical_solution[k][0] = old[k]
 
     # итерации численного метода
-    for n in trange(N - 1):
+    for n in trange(N):
         new = SSFMOrder2(old, current_energy, D, gamma, E_sat, g_0, h, tau)
         for i in range(num):
             numerical_solution[i][n+1] = new[i]
@@ -52,8 +52,8 @@ def test_case2(plot=True):
 
     # вывод поля мощности
     if plot:
-        z = np.linspace(L1, L2, N)
-        T_grid, Z_grid = np.meshgrid(t[:-1], z)
+        z = np.linspace(L1, L2, N+1)
+        T_grid, Z_grid = np.meshgrid(t, z)
         name = 'поле_мощности-case2'
         power_field = abs(numerical_solution[num//2])**2
         plot3D(Z_grid, T_grid, power_field, name)
@@ -63,8 +63,8 @@ def test_case2(plot=True):
 def test_case3(plot=True):
     """ Строит поле ошибок метода SSFM, начальные данные - солитон, кольцевая структура """
 
-    N = 100
-    M = 2 ** 10 + 1
+    N = 100 - 1  # количество шагов, а не точек
+    M = 2**10  # количество учитываемых точек по времени
     L1, L2 = 0, 1
     T1, T2 = -25, 25
 
@@ -75,19 +75,19 @@ def test_case3(plot=True):
     alpha = np.full(num, 0.1, dtype=float)
     g_0 = np.full(num, 0.4, dtype=float)
 
-    h = (L2 - L1) / (N - 1)
-    tau = (T2 - T1) / (M - 1)
+    h = (L2 - L1) / N
+    tau = (T2 - T1) / M
 
-    t = np.linspace(T1, T2, M)
+    t = np.linspace(T1, T2, M, endpoint=False)
     
     coupling_matrix = get_ring_coupling_matrix(num)
 
     # начальные условия
-    input_pulse = np.zeros((num, M - 1), dtype=complex)
+    input_pulse = np.zeros((num, M), dtype=complex)
     scalsr_equation_parameters = {'beta_2': beta_2[0], 'gamma': gamma[0], 'E_sat': E_sat[0], 'alpha': alpha[0], 'g_0': g_0[0]}
     equation_parameters = {'beta_2': beta_2, 'gamma': gamma, 'E_sat': E_sat, 'alpha': alpha, 'g_0': g_0}
     for k in range(num):
-        input_pulse[k] = gain_loss_soliton(t=t[:-1], x=0, **scalsr_equation_parameters)
+        input_pulse[k] = gain_loss_soliton(t=t, x=0, **scalsr_equation_parameters)
 
     # итерации численного метода
     # output_pulse = SimulatePropagation(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
@@ -95,7 +95,7 @@ def test_case3(plot=True):
     output_pulse = SimulatePropagationDND(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
 
     # аналитическое решение
-    analytical_output = gain_loss_soliton(t=t[:-1], x=h*(N-1), **scalsr_equation_parameters)
+    analytical_output = gain_loss_soliton(t=t, x=h*N, **scalsr_equation_parameters)
 
     # вычисление ошибки
     absolute_error = abs(analytical_output - output_pulse[num//2])  # берём одну сердцевину из численного решения
@@ -107,14 +107,14 @@ def test_case3(plot=True):
     # вывод графика ошибки
     if plot:
         name = 'абсолютная_ошибка-case3'
-        plot2D(t[:-1], absolute_error, name)
+        plot2D(t, absolute_error, name)
     return absolute_error
 
 
 def test_case_MCF_2core(N, M, num, beta_2, gamma, E_sat, alpha, g_0, L1, L2, T1, T2, plot=True):
     """ Строит поле ошибок метода SSFM, начальные данные - солитон, кольцевая структура """
-    N = 1000
-    M = 2 ** 10 + 1
+    N = 1000 - 1  # количество шагов, а не точек
+    M = 2**10  # количество учитываемых точек по времени
     num = 2
     beta_2 = -1.0
     gamma = 1.0
@@ -124,17 +124,17 @@ def test_case_MCF_2core(N, M, num, beta_2, gamma, E_sat, alpha, g_0, L1, L2, T1,
     L1, L2 = 0, 5
     T1, T2 = -10, 10
 
-    t = np.linspace(T1, T2, M)
-    h = (L2 - L1) / (N - 1)
-    tau = (T2 - T1) / (M - 1)
+    t = np.linspace(T1, T2, M, endpoint=False)
+    h = (L2 - L1) / N
+    tau = (T2 - T1) / M
     coupling_matrix = get_ring_coupling_matrix(num)
 
     # начальные условия
-    input_pulse = np.zeros((num, M - 1), dtype=complex)
+    input_pulse = np.zeros((num, M), dtype=complex)
     equation_parameters = {'beta_2': beta_2, 'gamma': gamma, 'E_sat': E_sat, 'alpha': alpha, 'g_0': g_0}
 
     for k in range(num):
-        input_pulse[k] = fundamental_soliton(t[:-1], 0, beta_2, lamb=1, c=1)
+        input_pulse[k] = fundamental_soliton(t, 0, beta_2, lamb=1, c=1)
 
     # итерации численного метода
     output_pulse = SimulatePropagation(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
@@ -142,7 +142,7 @@ def test_case_MCF_2core(N, M, num, beta_2, gamma, E_sat, alpha, g_0, L1, L2, T1,
     # output_pulse = SimulatePropagationCompactDND(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
 
     # аналитическое решение
-    analytical_output = gain_loss_soliton(t=t[:-1], x=h*(N-1), **equation_parameters)
+    analytical_output = gain_loss_soliton(t=t, x=h*N, **equation_parameters)
 
     # вычисление ошибки
     absolute_error = abs(analytical_output - output_pulse[num//2])  # берём одну сердцевину из численного решения
@@ -153,8 +153,8 @@ def test_case_MCF_2core(N, M, num, beta_2, gamma, E_sat, alpha, g_0, L1, L2, T1,
 
     # вывод поля мощности
     if plot:
-        z = np.linspace(L1, L2, N)
-        T_grid, Z_grid = np.meshgrid(t[:-1], z)
+        z = np.linspace(L1, L2, N+1)
+        T_grid, Z_grid = np.meshgrid(t, z)
         name = 'поле_мощности-case2'
         power_field = abs(numerical_solution[num // 2]) ** 2
         plot3D(Z_grid, T_grid, power_field, name)
