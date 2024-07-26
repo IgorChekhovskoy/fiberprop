@@ -42,18 +42,24 @@ def nonlinear_step(psi, gamma, E_sat, g_0, current_energy, step):
 def linear_step(psi, Dmat):
     """ Линейный оператор (связи, дисперсия и потери) """
     n = len(psi)
-    resV = np.zeros_like(psi)
+    res_vector = np.zeros_like(psi)
     for i in range(n):
         for j in range(n):
-            resV[i] += psi[j] * Dmat[i*n + j]
-    return resV
+            res_vector[i] += psi[j] * Dmat[i*n + j]
+    return res_vector
+
+
+def coupling_step(psi, Dmat_disp_free):
+    """ Линейный оператор для бездисперсионного случая (только связи и потери) """
+    res_psi = np.matmul(Dmat_disp_free, psi)
+    return res_psi
 
 
 def SSFMOrder2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
     """ Реализация схемы расщепления """
     num = len(psi)
     for i in range(num):
-        if g_0[i] != 0:
+        if g_0[i] != 0:  # нет усиления
             current_energy[i] = get_energy_rectangles(psi[i], tau)
     nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
 
@@ -75,12 +81,25 @@ def SSFMOrder2_2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
     psi = ifft(psi, axis=1)
 
     num = len(psi)
-    if g_0 != 0:
-        for i in range(num):
+    for i in range(num):
+        if g_0[i] != 0:  # нет усиления
             current_energy[i] = get_energy_rectangles(psi[i], tau)
     nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h)
 
     psi = fft(psi, axis=1)
     psi = linear_step(psi, D)
     psi = ifft(psi, axis=1)
+    return psi
+
+def SSFMOrder2_dispersion_free(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
+    """ Реализация схемы расщепления для случая, когда ДГС отсутствует """
+    psi = coupling_step(psi, D)
+
+    num = len(psi)
+    for i in range(num):
+        if g_0[i] != 0:  # нет усиления
+            current_energy[i] = get_energy_rectangles(psi[i], tau)
+    nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h)
+
+    psi = coupling_step(psi, D)
     return psi

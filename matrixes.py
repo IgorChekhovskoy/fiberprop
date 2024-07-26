@@ -32,6 +32,12 @@ def get_cental_coupling_matrix(n):
     return np.array(asw)
 
 
+def create_simple_disp_free_matrix(mat, alpha, g_0, step):
+    diag_addition = -step * 0.5*(alpha + g_0)
+    res_mat = step * 1j*mat + np.diagflat(diag_addition)
+    return res_mat
+
+
 @jit(nopython=True)
 def create_freq_matrix(mat, beta_2, alpha, g_0, omega, step):
     n = len(mat)

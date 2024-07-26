@@ -76,10 +76,14 @@ class SimulationRunner:
         self.omega = fftfreq(self.com.M, self.com.tau) * 2*pi
 
     def calculate_D_matrix(self):
-        coupling_matrix = get_ring_coupling_matrix(self.eq.num_equations)
-        self.D = get_pade_exponential2(create_freq_matrix(coupling_matrix, self.eq.beta_2,
-                                                          self.eq.alpha, self.eq.g_0,
-                                                          self.omega, self.com.h))
+        coupling_matrix = get_ring_coupling_matrix(self.eq.num_equations)  # TODO: Может прописать структуру отдельно?
+        if all(self.eq.beta_2) == 0.0:
+            operator_matrix = create_simple_disp_free_matrix(coupling_matrix, self.eq.alpha, self.eq.g_0, self.com.h)
+            self.D = expm(operator_matrix)
+        else:
+            self.D = get_pade_exponential2(create_freq_matrix(coupling_matrix, self.eq.beta_2,
+                                                              self.eq.alpha, self.eq.g_0,
+                                                              self.omega, self.com.h))
 
     def filter_params(self, func):
         # Получаем список параметров, которые принимает функция
@@ -94,9 +98,8 @@ class SimulationRunner:
 
         for k in range(self.eq.num_equations):
             pulse_params = self.filter_params(self.pulse)
-            old[k] = self.pulse(t=self.t, x=0,
-                                **{key: val[k] if isinstance(val, np.ndarray) else val for key, val in
-                                   pulse_params.items()})
+            params_dict = {key: val[k] if isinstance(val, np.ndarray) else val for key, val in pulse_params.items()}
+            old[k] = self.pulse(t=self.t, x=0, **params_dict)
             self.numerical_solution[k][0] = old[k]
 
         for n in trange(self.com.N):
@@ -131,7 +134,7 @@ class SimulationRunner:
             name = 'абсолютная_ошибка-case1'
             plot3D(Z_grid, T_grid, self.absolute_error, name)
 
-    def run(self):
+    def run(self):  # TODO: Может назвать по-другому? Эта функция же годится только для тестов, где известна аналитика?
         self.initialize_arrays()
         self.calculate_D_matrix()
         self.run_numerical_simulation()
@@ -140,11 +143,9 @@ class SimulationRunner:
         self.plot_error()
 
 
-def FullPropagation_Simulation(pulse, N, equation_number, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0,
-                                    Fresnel_k, omega, delta, Delta, phi, ITER_NUM):
-
+def resonator_simulation(pulse, N, equation_number, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0,
+                         Fresnel_k, omega, delta, Delta, phi, ITER_NUM):
     """ Последовательное моделирование ITER_NUM итераций """
-
     M = pulse.shape[1]
     w = fftfreq(M, tau) * 2*pi
     Dmat = get_pade_exponential2(create_freq_matrix(coupling_matrix, beta_2, alpha, g_0, w, h))
