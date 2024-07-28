@@ -7,29 +7,27 @@ from numba import jit
 @jit(nopython=True)
 def get_ring_coupling_matrix(n):
     elem = [1, -2, 1]
-    lstlen = len(elem)
-    a = elem[lstlen % 2:] + [0] * (n - lstlen) + elem[:lstlen % 2]
+    list_len = len(elem)
+    a = elem[list_len % 2:] + [0] * (n - list_len) + elem[:list_len % 2]
     asw = [[a[k - i] for k in range(n)] for i in range(n)]
     return np.array(asw)
 
 
 @jit(nopython=True)
-def get_cental_coupling_matrix(n):
-    asw = []
+def get_central_coupling_matrix(n):
+    asw = np.zeros((n, n))
     k = sqrt(2 * (1 - cos(2 * pi / (n - 1))))
     for i in range(n):
-        row = []
         if i == 0:
-            row = [1 for j in range(n)]
-            row[0] = -(n - 1)
+            asw[i, :] = 1
+            asw[i, 0] = -(n - 1)
         else:
-            rowPart = [k, -(1 + 2 * k), k] + [0] * (n - 4)
+            row_part = np.array([k, -(1 + 2 * k), k] + [0] * (n - 4))
             shift = i - 2
-            rowPart = rowPart[-shift:] + rowPart[:-shift]
-            row = [1] + rowPart
-        row = np.array(row)
-        asw.append(row)
-    return np.array(asw)
+            row_part = np.roll(row_part, shift)
+            asw[i, 1:] = row_part
+            asw[i, 0] = 1
+    return asw
 
 
 @jit(nopython=True)

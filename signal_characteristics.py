@@ -42,7 +42,7 @@ def VolumetricErrorField(dirName, Z, T, A, B):
     ax = figSC.add_subplot(111, projection='3d')
     ax.set_title('absolute error')
     ax.plot_surface(Z, T, field, cmap='inferno')
-    name = 'поле_шибки_3D'
+    name = 'поле_ошибки_3D'
     path = dirName + '/' + name
     figSC.savefig('{}.png'.format(path), bbox_inches='tight', facecolor='white')
     plt.close(figSC)
@@ -58,11 +58,11 @@ def EnergyEvo(dirName, A, B, n, M, N, step, z1, z2):
     z = np.arange(N)
     for i in range(n + 1):
         if i == n:
-            F = lambda x: GetEnergy_Simpson(P_single[x], step)
+            F = lambda x: get_energy_simpson(P_single[x], step)
             E_z = np.vectorize(F)(z)
             asw.append(E_z / 1e6)
             continue
-        F = lambda x: GetEnergy_Simpson(P[i][x], step)
+        F = lambda x: get_energy_simpson(P[i][x], step)
         E_z = np.vectorize(F)(z)
         asw.append(E_z / 1e6)
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -472,7 +472,7 @@ def InstantFrequencyField(A, B, n, N, M, z1, z2, t1, t2, step, dirName, smoothBo
     return IFreq, IFreq_single
 
 
-def GetXCirp(IFreqField, Field, time, M, x, way):
+def GetXChirp(IFreqField, Field, time, M, x, way):
     """ Функция рассчитывает чирп трёх видов в зависимости от аргумента way
     (по полной ширине, по ширине на полувысоте, в малой окрестности t=0) """
     maxVal = max(abs(Field[x]))
@@ -501,11 +501,11 @@ def CentralPhaseChirp(dirName, IFreq, IFreq_single, A, B, n, z1, z2, t1, t2, N, 
     choose = []
     z = np.arange(N)
     for i in range(n):
-        F = lambda x: GetXCirp(IFreq[i], A[i], t_2, M, x, way)
+        F = lambda x: GetXChirp(IFreq[i], A[i], t_2, M, x, way)
         vals = np.vectorize(F)(z)
         asw.append(vals)
         choose.append(vals[0])
-    F_single = lambda x: GetXCirp(IFreq_single, B, t_2, M, x, way)
+    F_single = lambda x: GetXChirp(IFreq_single, B, t_2, M, x, way)
     vals_single = np.vectorize(F_single)(z)
     asw_single = vals_single
     criteria = asw_single[0]
@@ -641,7 +641,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     texts = []
     sumPow = 0.0
     for i in range(num):
-        energy = GetEnergy_Simpson(P[i][outId], t_step)
+        energy = get_energy_simpson(P[i][outId], t_step)
         meanPower = energy/(t2-t1)
         sumPow += meanPower
     if config == 'ring':
@@ -649,7 +649,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * i / (num)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = GetEnergy_Simpson(P[i][outId], t_step)
+            energy = get_energy_simpson(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} core:\n{round(value, 1)}%'
@@ -657,7 +657,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     elif config == 'ring_with_central':
         point = (0, 0)
         points.append(point)
-        energy = GetEnergy_Simpson(P[0][outId], t_step)
+        energy = get_energy_simpson(P[0][outId], t_step)
         meanPower = energy / (t2 - t1)
         value = 100 * meanPower / sumPow  # в процентах
         text = f'0 core:\n{round(value, 1)}%'
@@ -666,7 +666,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * (i - 1) / (num - 1)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = GetEnergy_Simpson(P[i][outId], t_step)
+            energy = get_energy_simpson(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} core:\n{round(value, 1)}%'
