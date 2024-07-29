@@ -1,9 +1,12 @@
 from tests import *
 from tests_unit import *
 from coupling_coeff_tests import *
+# from tests_mcf_nn import *
+# from tests_parallel import *
 import warnings
 
 warnings.filterwarnings('ignore')
+
 
 
 if __name__ == '__main__':
@@ -23,3 +26,7 @@ if __name__ == '__main__':
     # t1 = time()
     # test_computational_parameters_initialization()
     # print(time() - t1)
+
+    # test_mcf_nn_reservoir_computing()
+
+    # main()

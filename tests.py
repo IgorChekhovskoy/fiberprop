@@ -6,9 +6,9 @@ def test_case1_using_classes(plot=True):
     computational_params = ComputationalParameters(N=100, M=2**10, L1=0, L2=1, T1=-25, T2=25)
     equation_params = EquationParameters(num_equations=7, beta_2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
 
-    simulation_runner = SimulationRunner(computational_params, equation_params, pulse=gain_loss_soliton)
-    simulation_runner.run()
-    gain_loss_error = simulation_runner.absolute_error
+    solver = Solver(computational_params, equation_params, pulse=gain_loss_soliton)
+    solver.run()
+    gain_loss_error = solver.absolute_error
 
 
 def test_case2(plot=True):
@@ -87,7 +87,7 @@ def test_case3(plot=True):
     scalsr_equation_parameters = {'beta_2': beta_2[0], 'gamma': gamma[0], 'E_sat': E_sat[0], 'alpha': alpha[0], 'g_0': g_0[0]}
     equation_parameters = {'beta_2': beta_2, 'gamma': gamma, 'E_sat': E_sat, 'alpha': alpha, 'g_0': g_0}
     for k in range(num):
-        input_pulse[k] = gain_loss_soliton(t=t, x=0, **scalsr_equation_parameters)
+        input_pulse[k] = gain_loss_soliton(t=t, z=0, **scalsr_equation_parameters)
 
     # итерации численного метода
     # output_pulse = SimulatePropagation(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
@@ -95,7 +95,7 @@ def test_case3(plot=True):
     output_pulse = SimulatePropagationDND(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
 
     # аналитическое решение
-    analytical_output = gain_loss_soliton(t=t, x=h*N, **scalsr_equation_parameters)
+    analytical_output = gain_loss_soliton(t=t, z=h*N, **scalsr_equation_parameters)
 
     # вычисление ошибки
     absolute_error = abs(analytical_output - output_pulse[num//2])  # берём одну сердцевину из численного решения
@@ -142,7 +142,7 @@ def test_case_MCF_2core(N, M, num, beta_2, gamma, E_sat, alpha, g_0, L1, L2, T1,
     # output_pulse = SimulatePropagationCompactDND(input_pulse, N, num, h, tau, coupling_matrix, **equation_parameters)
 
     # аналитическое решение
-    analytical_output = gain_loss_soliton(t=t, x=h*N, **equation_parameters)
+    analytical_output = gain_loss_soliton(t=t, z=h*N, **equation_parameters)
 
     # вычисление ошибки
     absolute_error = abs(analytical_output - output_pulse[num//2])  # берём одну сердцевину из численного решения

@@ -1,31 +1,31 @@
 import numpy as np
 
 
-def KuznetsovMaSoliton(t, x, par=1):
+def KuznetsovMaSoliton(t, z, par=1):
     """ Солитон Кузнецова-Ма """
     b = np.sqrt(8 * par * (1 - 2 * par))
     w = 2 * np.sqrt(1 - 2 * par)
-    numer = 2 * (1 - 2 * par) * np.cosh(b * x) + 1j * b * np.sinh(b * x)
-    den = np.sqrt(2 * par) * np.cos(w * t) - np.cosh(b * x)
-    return (1 + numer / den) * np.exp(1j * x)
+    numer = 2 * (1 - 2 * par) * np.cosh(b * z) + 1j * b * np.sinh(b * z)
+    den = np.sqrt(2 * par) * np.cos(w * t) - np.cosh(b * z)
+    return (1 + numer / den) * np.exp(1j * z)
 
 
-def fundamental_soliton(t, x, beta_2, lamb=1, c=1):
+def fundamental_soliton(t, z, beta_2, lamb=1, c=1):
     """ Классический солитон """
-    return c * lamb / np.cosh(lamb*t) * np.exp(-1j * beta_2 * lamb**2 * x)
+    return c * lamb / np.cosh(lamb*t) * np.exp(-1j * beta_2 * lamb**2 * z)
 
 
-def gain_loss_soliton(t, x, beta_2, gamma, E_sat, alpha, g_0):
+def gain_loss_soliton(t, z, beta_2, gamma, E_sat, alpha, g_0):
     """ Солитон для случая равномерного усиления и без учёта быстрого насыщения поглощения """
     E_s = E_sat * (g_0 - alpha) / alpha
     multiplier = E_s * np.sqrt(gamma / (-4*beta_2))
-    numer = np.exp(-1j * E_s**2 * gamma**2 * x / (8*beta_2))
+    numer = np.exp(-1j * E_s**2 * gamma**2 * z / (8*beta_2))
     denum = np.cosh(-t * E_s * gamma / (2*beta_2))
     return multiplier * (numer / denum)
 
 
-def AnySoliton(t, x, a, theta, tau, Phi_z):
-    mul1 = a * np.exp(1j*Phi_z*x)
+def AnySoliton(t, z, a, theta, tau, Phi_z):
+    mul1 = a * np.exp(1j*Phi_z*z)
     mul2 = 1 / (np.cosh(t*tau)**(1 - 1j*theta/tau))
     return mul1 * mul2
 
