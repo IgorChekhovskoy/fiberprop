@@ -14,7 +14,7 @@ def get_ring_coupling_matrix(n):
 
 
 @jit(nopython=True)
-def get_cental_coupling_matrix(n):
+def get_central_coupling_matrix(n):
     asw = []
     k = sqrt(2 * (1 - cos(2 * pi / (n - 1))))
     for i in range(n):
