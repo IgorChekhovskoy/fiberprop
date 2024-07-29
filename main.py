@@ -1,19 +1,17 @@
 from tests import *
 from tests_unit import *
 from coupling_coeff_tests import *
-# from tests_mcf_nn import *
+from tests_mcf_nn import *
 # from tests_parallel import *
 import warnings
 
 warnings.filterwarnings('ignore')
 
 
-
 if __name__ == '__main__':
+    #example_of_coefficients_calculation()
 
-    example_of_coefficients_calculation()
-
-    # test_case1_using_classes()
+    test_case1_using_classes()
     # test_case2(plot=True)
     # test_case3(plot=True)
 

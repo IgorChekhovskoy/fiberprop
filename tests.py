@@ -4,9 +4,9 @@ from drawing import *
 
 def test_case1_using_classes(plot=True):
     computational_params = ComputationalParameters(N=100, M=2**10, L1=0, L2=1, T1=-25, T2=25)
-    equation_params = EquationParameters(num_equations=7, beta_2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
+    equation_params = EquationParameters(size=7, beta_2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
 
-    solver = Solver(computational_params, equation_params, pulse=gain_loss_soliton)
+    solver = Solver(computational_params, equation_params)
     solver.run()
     gain_loss_error = solver.absolute_error
 
@@ -53,10 +53,9 @@ def test_case2(plot=True):
     # вывод поля мощности
     if plot:
         z = np.linspace(L1, L2, N+1)
-        T_grid, Z_grid = np.meshgrid(t, z)
         name = 'поле_мощности-case2'
         power_field = abs(numerical_solution[num//2])**2
-        plot3D(Z_grid, T_grid, power_field, name)
+        plot3D(z, t, power_field, name)
     return numerical_solution
 
 

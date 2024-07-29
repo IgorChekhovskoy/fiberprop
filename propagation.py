@@ -351,7 +351,7 @@ class Solver:
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
 
     def calculate_D_matrix(self):
-        coupling_matrix = get_ring_coupling_matrix(self.eq.num_equations)  # TODO: Может прописать структуру отдельно?
+        coupling_matrix = get_ring_coupling_matrix(self.eq.size)
         if all(self.eq.beta_2) == 0.0:
             operator_matrix = create_simple_disp_free_matrix(coupling_matrix, self.eq.alpha, self.eq.g_0, self.com.h)
             self.D = expm(operator_matrix)
@@ -402,15 +402,17 @@ class Solver:
         print('L2 norm =\t', self.L2_norm)
 
     def plot_error(self):
-        name = 'абсолютная_ошибка-case1'
-        plot3D(self.z, self.t, self.absolute_error, name)
+        name1 = 'абсолютная_ошибка-case1'
+        plot3D(self.z, self.t, self.absolute_error, name1)
+        name2 = 'относительная_ошибка_в_пике-case1'
+        plot2D(self.z, self.absolute_error[:, self.com.M//2] / abs(self.analytical_solution[self.eq.size//2][:, self.com.M//2]), name2)
 
     def run(self):
         self.calculate_D_matrix()
         self.run_numerical_simulation()
-        # self.get_analytical_solution()
-        # self.calculate_error()
-        # self.plot_error()
+        self.get_analytical_solution()
+        self.calculate_error()
+        self.plot_error()
 
 
 def resonator_simulation(pulse, N, equation_number, h, tau, coupling_matrix, beta_2, gamma, E_sat, alpha, g_0,
