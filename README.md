@@ -48,7 +48,7 @@
 
 1. Склонируйте репозиторий:
     ```sh
-    git clone https://github.com/yourusername/fiberprop.git
+    git clone https://github.com/IgorChekhovskoy/fiberprop.git
     ```
 
 2. Перейдите в каталог проекта:
