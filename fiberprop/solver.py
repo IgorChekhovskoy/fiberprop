@@ -543,6 +543,13 @@ class Solver:
         self.peak_power *= P
         self.energy *= E
 
+        self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
+        self.eq.gamma = gamma  # [1/(W*m)]
+        self.eq.beta2 = beta2  # [ps^2/km]
+        self.eq.alpha = self.eq.alpha * coupling_coefficient  # [1/cm]
+        self.eq.g_0 = self.eq.g_0 * coupling_coefficient  # [1/cm]
+        self.eq.E_sat = self.eq.E_sat * E  # [pJ]
+
     def find_stationary_solution(self, lambda_val, max_iter=200, tol=1e-11, plot_graphs=False, update_interval=0.01, yscale='linear'):
         self.numerical_solution[0] = find_stationary_solution(self.numerical_solution[0],
                                                               self.com.M, self.com.tau,
