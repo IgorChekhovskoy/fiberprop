@@ -90,7 +90,8 @@ def plot2D(t_arrr, func_arr, name='', filename=None, file_format='png', yscale='
     return
 
 
-def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', names=None, filename=None, file_format='png', yscale='linear'):
+def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_text='График функций',
+                  names=None, filename=None, file_format='png', yscale='linear'):
     """ Функция строит и выводит одномерный график с использованием Plotly """
 
     fig = go.Figure()
@@ -112,7 +113,7 @@ def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', names=No
                                  )))
 
     fig.update_layout(
-        title=dict(text='График функций', font=dict(size=20, family='Times New Roman')),
+        title=dict(text=title_text, font=dict(size=20, family='Times New Roman')),
         xaxis_title=dict(text=x_axis_label, font=dict(size=18, family='Times New Roman')),
         yaxis_title=dict(text=y_axis_label, font=dict(size=18, family='Times New Roman')),
         font=dict(family='Times New Roman', size=15, color='black'),
