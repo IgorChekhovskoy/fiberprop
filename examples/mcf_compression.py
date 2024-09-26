@@ -20,11 +20,12 @@ def mcf_compression():
 
     energies = [solver.energy[i, :] for i in range(solver.eq.size)]
     names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, energies, names=names, x_axis_label='z')
+    plot2D_plotly(solver.z, energies, title_text='Динамика энергии, обезразмеренная', names=names, x_axis_label='z')
 
     peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
     names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z')
+    plot2D_plotly(solver.z, peak_powers, title_text='Динамика пиковой мощности, обезразмеренная',
+                  names=names, x_axis_label='z')
 
     # plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][0])**2,
     #                          np.abs(solver.numerical_solution[solver.com.N][0])**2],
@@ -32,6 +33,7 @@ def mcf_compression():
 
     plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][3])**2,
                              np.abs(solver.numerical_solution[solver.com.N][3])**2],
+                  title_text='Сравнение профиля импульса в начале и в конце, обезразмеренное',
                   names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t')
 
     # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[3]) ** 2, f"$|U_3(z,t)|^2$")
@@ -79,18 +81,21 @@ def mcf_compression():
 
     energies = [solver.energy[i, :] for i in range(solver.eq.size)]
     names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, energies, names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
+    plot2D_plotly(solver.z, energies, title_text='Динамика энергии',
+                  names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
 
     peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
     names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
+    plot2D_plotly(solver.z, peak_powers, title_text='Динамика пиковой мощности',
+                  names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
 
     plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][3]) ** 2,
                              np.abs(solver.numerical_solution[solver.com.N][3]) ** 2],
+                  title_text='Сравнение профиля импульса в начале и в конце',
                   names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
 
     # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[3]) ** 2, f"$|U_3(z,t)|^2$")
 
 
 if __name__ == '__main__':
-    test_mcf_compression()
+    mcf_compression()
