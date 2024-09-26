@@ -3,7 +3,7 @@ import numpy as np
 
 from fiberprop.drawing import plot2D_plotly
 
-from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, print_matrix
+from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig, print_matrix
 from fiberprop.pulses import fundamental_soliton
 
 
@@ -12,7 +12,7 @@ def test_stationary_solution_solver_conservative_mcf():
     beta2 = -2
 
     computational_params = ComputationalParameters(N=2000, M=2 ** 13, L1=0, L2=10, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta2=beta2, gamma=1)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=beta2, gamma=1)
 
     solver = Solver(computational_params, equation_params,
                     pulses=fundamental_soliton, pulse_params_list=[
@@ -47,7 +47,7 @@ def test_stationary_solution_solver_nonconservative_mcf_7core_hexagonal():
     beta2 = -2
 
     computational_params = ComputationalParameters(N=2000, M=2 ** 12, L1=0, L2=10, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta2=beta2, gamma=1)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=beta2, gamma=1)
 
     solver = Solver(computational_params, equation_params,
                     pulses=fundamental_soliton, pulse_params_list=[
@@ -68,7 +68,7 @@ def test_stationary_solution_solver_nonconservative_mcf_7core_hexagonal():
 
     # --------------------------------
 
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta2=beta2, gamma=1, E_sat=100,
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=beta2, gamma=1, E_sat=100,
                                          alpha=10, g_0=10)
 
     solver = Solver(computational_params, equation_params,
@@ -122,7 +122,7 @@ def test_stationary_solution_solver_nonconservative_mcf():
 
     computational_params = ComputationalParameters(N=100 * length, M=2 ** 12, L1=0, L2=length, T1=-120, T2=120)
 
-    equation_params = EquationParameters(core_configuration=1, size=2, beta2=beta2, gamma=gamma)
+    equation_params = EquationParameters(core_configuration=CoreConfig.empty_ring, size=2, beta2=beta2, gamma=gamma)
 
     solver = Solver(computational_params, equation_params,
                     pulses=fundamental_soliton, pulse_params_list=[
@@ -141,7 +141,7 @@ def test_stationary_solution_solver_nonconservative_mcf():
 
     # --------------------------------
 
-    equation_params = EquationParameters(core_configuration=1, size=2, beta2=beta2, gamma=gamma,
+    equation_params = EquationParameters(core_configuration=CoreConfig.empty_ring, size=2, beta2=beta2, gamma=gamma,
                                          g_0=[1, 0],
                                          E_sat=[1, 1],
                                          alpha=[0.2, 0.1])

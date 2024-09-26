@@ -1,4 +1,4 @@
-from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
+from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 from fiberprop.coupling_coefficient import Fiber, Light, CoreConfiguration, FiberMaterial, get_coupling_coefficients
 
 from fiberprop.propagation import *
@@ -10,7 +10,8 @@ def mcf_compression():
     PRA 2016, Fig.10, 91.6% combining, 6.37 compression
     """
     computational_params = ComputationalParameters(N=500, M=2 ** 11, L1=0, L2=1.78, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
+                                         beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
 
     solver = Solver(computational_params, equation_params,
                     pulses=gaussian_pulse, pulse_params_list={"p": 0.687, "tau": 1.775},
