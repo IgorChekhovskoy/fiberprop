@@ -1,6 +1,6 @@
 from importlib import reload
 
-from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
+from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 from fiberprop.coupling_coefficient import Fiber, Light, CoreConfiguration, FiberMaterial, get_coupling_coefficients
 from fiberprop import propagation
 from fiberprop import ssfm_mcf
@@ -46,7 +46,7 @@ def mackey_glass_masked(t, M, **mg_params):
 
 def test_mcf_nn_reservoir_computing():
     computational_params = ComputationalParameters(N=500, M=2 ** 13, L1=0, L2=1.78, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1,
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
                                          beta2=-2, gamma=1, E_sat=1, alpha=0.1, g_0=1)
 
     solver = Solver(computational_params, equation_params, use_gpu=True, precision='float64')

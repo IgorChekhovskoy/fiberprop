@@ -2,12 +2,12 @@ from fiberprop.propagation import *
 from fiberprop.drawing import *
 from fiberprop.matrices import get_ring_coupling_matrix
 from fiberprop.pulses import fundamental_soliton, gain_loss_soliton
-from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
+from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 
 
 def test_case1_using_classes(plot=True):
     computational_params = ComputationalParameters(N=100, M=2**10, L1=0, L2=1, T1=-25, T2=25)
-    equation_params = EquationParameters(core_configuration=1, size=7, beta2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
+    equation_params = EquationParameters(core_configuration=CoreConfig.empty_ring, size=7, beta2=-1.0, gamma=1.0, E_sat=1.0, alpha=0.1, g_0=0.4)
 
     solver = Solver(computational_params, equation_params, pulses=gain_loss_soliton, use_gpu=True)
     solver.run_test()

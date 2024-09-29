@@ -3,7 +3,7 @@ import numpy as np
 
 from fiberprop.drawing import plot2D_plotly
 
-from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, print_matrix
+from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig, print_matrix
 from fiberprop.pulses import fundamental_soliton
 
 
@@ -12,7 +12,7 @@ def stationary_solution_solver_conservative_mcf():
     beta2 = -2
 
     computational_params = ComputationalParameters(N=2000, M=2 ** 13, L1=0, L2=10, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta2=beta2, gamma=1)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=beta2, gamma=1)
 
     solver = Solver(computational_params, equation_params,
                     pulses=fundamental_soliton, pulse_params_list=[

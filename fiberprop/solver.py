@@ -44,19 +44,20 @@ class ComputationalParameters:
         else:
             self.tau = 0.0
 
+@dataclass
+class CoreConfig(Enum):
+    ring_with_center: int = 0  # 1d круговая с центральной сердцевиной
+    empty_ring: int = 1  # 1d круговая без центральной сердцевиной
+    square: int = 2  # 2d квадратная решетка
+    hexagonal: int = 3  # 2d гексагональная решетка
+    manakov_eq: int = 4 # уравнения Манакова
 
 @dataclass
 class EquationParameters:
-    """ core_configuration - конфигурация сердцевин в MCF:
-        0 - 1d круговая с центральной сердцевиной
-        1 - 1d круговая без центральной сердцевиной
-        2 - 2d квадратная решетка
-        3 - 2d гексагональная решетка
-        10 - уравнения Манакова
-
+    """ core_configuration - конфигурация сердцевин в MCF (тип CoreConfig)
         ring_number - число колец для 2d конфигураций. Радиус, ограничивающий некоторое число колец в 2d конфигурациях
         """
-    core_configuration: int = 1
+    core_configuration: CoreConfig
     size: int = 1
     ring_number: float = 0
 
@@ -229,21 +230,22 @@ class Solver:
         temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
         center = temp_array_size // 2
 
-        if self.eq.core_configuration == 0:
+        if self.eq.core_configuration is CoreConfig.ring_with_center:
             for i in range(self.eq.size + 1):
                 temp_array[0][i] = True
 
-        elif self.eq.core_configuration in (1, 10):
+        elif ((self.eq.core_configuration is CoreConfig.empty_ring) or
+              (self.eq.core_configuration is CoreConfig.manakov_eq)):
             for i in range(self.eq.size):
                 temp_array[0][i] = True
 
-        elif self.eq.core_configuration == 2:
+        elif self.eq.core_configuration  is CoreConfig.square:
             for i in range(temp_array_size):
                 for j in range(temp_array_size):
                     if (i - center) ** 2 + (j - center) ** 2 <= self.eq.ring_number ** 2 + 1e-13:
                         temp_array[i][j] = True
 
-        elif self.eq.core_configuration == 3:
+        elif self.eq.core_configuration is CoreConfig.hexagonal:
             h_i = 1.0
             h_j = 1.0 / sqrt(3.0)
             for i in range(temp_array_size):
@@ -266,7 +268,7 @@ class Solver:
         return index_1d
 
     def set_configuration(self):
-        if self.eq.core_configuration < 0 or (self.eq.core_configuration > 3 and self.eq.core_configuration != 10):
+        if type(self.eq.core_configuration) is not CoreConfig:
             raise ValueError("Non-existent fiberprop configuration!")
 
         if self.eq.ring_number < 0:
@@ -278,7 +280,7 @@ class Solver:
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
         self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
 
-        if self.eq.core_configuration == 0:
+        if self.eq.core_configuration is CoreConfig.ring_with_center:
             for j in range(1, self.eq.size):
                 self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
                 self.linear_coeffs_array[j][0] = 1.0 * self.eq.coupling_coefficient[j]
@@ -290,7 +292,7 @@ class Solver:
                 self.linear_coeffs_array[1][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[1]
                 self.linear_coeffs_array[self.eq.size - 1][1] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
 
-        elif self.eq.core_configuration == 1:
+        elif self.eq.core_configuration is CoreConfig.empty_ring:
             for j in range(self.eq.size - 1):
                 self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
                 self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
@@ -300,7 +302,7 @@ class Solver:
                 self.linear_coeffs_array[0][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[0]
                 self.linear_coeffs_array[self.eq.size - 1][0] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
 
-        elif self.eq.core_configuration == 2:
+        elif self.eq.core_configuration is CoreConfig.square:
             if self.eq.size > 1:
                 for j in range(self.eq.size):
                     self.linear_coeffs_array[j][j] = -4.0 * self.eq.coupling_coefficient[j]
@@ -314,7 +316,7 @@ class Solver:
                                     self.mask_array[j].number_2d_x == self.mask_array[k].number_2d_x:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
 
-        elif self.eq.core_configuration == 3:
+        elif self.eq.core_configuration is CoreConfig.hexagonal:
             if self.eq.size > 1:
                 for j in range(self.eq.size):
                     self.linear_coeffs_array[j][j] = -6.0 * self.eq.coupling_coefficient[j]
@@ -337,7 +339,7 @@ class Solver:
 
         for j in range(self.eq.size):
             for k in range(self.eq.size):
-                if self.eq.core_configuration == 10:
+                if self.eq.core_configuration is CoreConfig.manakov_eq:
                     if self.eq.size > 1:
                         self.nonlinear_cubic_coeffs_array[j][k] = self.eq.gamma[j]
                     else:
@@ -493,6 +495,12 @@ class Solver:
         self.calculate_error()
         self.plot_error()
 
+    def convert_to_dimensionless(self, fiber_length, coupling_coefficient, gamma, beta2, g_0, P_sat):
+        """
+        Функция приводит размерные параметры к безразмерному виду
+        """
+        pass
+
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2):
         """ Функция приводит безразмерное решение к размерному виду
         Параметры:
@@ -507,11 +515,11 @@ class Solver:
             energy [J]
          """
 
-        if self.eq.core_configuration == 0:
+        if self.eq.core_configuration is CoreConfig.ring_with_center:
             self_coefficient = 2
-        elif self.eq.core_configuration == 2:
+        elif self.eq.core_configuration is CoreConfig.square:
             self_coefficient = 4
-        elif self.eq.core_configuration == 3:
+        elif self.eq.core_configuration is CoreConfig.hexagonal:
             self_coefficient = 6
         else:
             raise RuntimeError('Unsupportable MCF configuration')

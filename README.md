@@ -82,7 +82,7 @@ from fiberprop.pulses import gaussian_pulse
 
 # Установите параметры вычислений и уравнений
 computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=0, L2=1.78, T1=-30, T2=30)
-equation_params = EquationParameters(core_configuration=3, size=7, ring_number=1, beta_2=-2.0, gamma=1.0, E_sat=0.1,
+equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta_2=-2.0, gamma=1.0, E_sat=0.1,
                                      alpha=0.1, g_0=1)
 
 # Создайте объект Solver
