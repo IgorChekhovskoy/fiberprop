@@ -55,9 +55,9 @@ def coupling_step(psi, Dmat_disp_free):
     return res_psi
 
 
-def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
+def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau, noise_amplitude=None):
     """ Реализация схемы расщепления """
-    damping_length = 0.1
+    damping_length = 0.1  # TODO: условия на эту переменную всегда выполняются, может надо убрать блоки "if" ?
     num = len(psi)
     for i in range(num):
         if g_0[i] != 0:  # нет усиления
@@ -65,7 +65,7 @@ def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
     nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
 
     if damping_length != 0:
-        psi = apply_absorbing_boundary(psi, damping_length=damping_length)
+        psi = apply_absorbing_boundary(psi, damping_length=damping_length)  # TODO: Зачем это нужно?
 
     psi = fft(psi, axis=1)
     psi = linear_step(psi, D)
@@ -82,6 +82,10 @@ def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
     if damping_length != 0:
         psi = apply_absorbing_boundary(psi, damping_length=damping_length)
 
+    if noise_amplitude is not None:
+        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
+                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
+        psi += current_noise
     return psi
 
 

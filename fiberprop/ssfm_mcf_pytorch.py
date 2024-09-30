@@ -1,5 +1,6 @@
 import torch
 import torch.fft as fft
+import numpy as np
 
 
 def get_energy_rectangles_pytorch(arr_func, time_step):
@@ -42,7 +43,7 @@ def linear_step_pytorch(psi, Dmat):
     return resV
 
 
-def ssfm_order2_pytorch(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
+def ssfm_order2_pytorch(psi, current_energy, D, gamma, E_sat, g_0, h, tau, noise_amplitude=None):
     """ Реализация схемы расщепления """
     num = psi.shape[0]
     for i in range(num):
@@ -58,4 +59,9 @@ def ssfm_order2_pytorch(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
         if g_0[i] != 0:
             current_energy[i] = get_energy_rectangles_pytorch(psi[i], tau)
     nonlinear_step_pytorch(psi, gamma, E_sat, g_0, current_energy, h / 2)
+
+    if noise_amplitude is not None:
+        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
+                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
+        psi += current_noise
     return psi
