@@ -36,6 +36,11 @@ def gaussian_pulse(t, p=0.687, tau=1.775, phase=0, chirp=0):
     return np.sqrt(p) * np.exp(power) * np.exp(1j*phase)
 
 
+def zero_pulse(t):
+    """ Отсутствие импульса """
+    return 0.0 if type(t) is float else np.zeros(np.shape(t), dtype=complex)
+
+
 def laser_pulse(t, p, tau, phase=0, chirp=0):
     """ Лазерный импульс, для дипломной работы """
     simple = 1 / np.cosh(1.7627 * t/tau)
