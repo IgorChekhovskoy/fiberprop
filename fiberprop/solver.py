@@ -44,13 +44,24 @@ class ComputationalParameters:
         else:
             self.tau = 0.0
 
+    @staticmethod
+    def get_info():
+        """
+        Функция выводит информацию о параметрах класса и их размерностях
+        """
+        print('\n\nComputationalParameters:')
+        print('\"N\" -- количество шагов по эволюционной переменной, целое число;')
+        print('\"M\" -- количество шагов по времени, целое число;')
+        print('\"L1, L2\" -- границы расчётной области по эволюционной переменной [m];')
+        print('\"T1, T2\" -- границы расчётной области по времени [ps].\n')
+
 @dataclass
 class CoreConfig(Enum):
     ring_with_center: int = 0  # 1d круговая с центральной сердцевиной
     empty_ring: int = 1  # 1d круговая без центральной сердцевиной
     square: int = 2  # 2d квадратная решетка
     hexagonal: int = 3  # 2d гексагональная решетка
-    manakov_eq: int = 4 # уравнения Манакова
+    manakov_eq: int = 4  # уравнения Манакова
 
 @dataclass
 class EquationParameters:
@@ -100,6 +111,27 @@ class EquationParameters:
         #     self.linear_coefficient = np.full(self.size, self.linear_coefficient, dtype=float)
         # if isinstance(self.linear_gain_coefficient, (int, float)):
         #     self.linear_gain_coefficient = np.full(self.size, self.linear_gain_coefficient, dtype=float)
+
+    @staticmethod
+    def get_info():
+        """
+        Функция выводит информацию о параметрах класса и их размерностях
+        """
+        print('\n\nEquationParameters:')
+        print('\"core_configuration\" -- конфигурация MCF, объект класса \"CoreConfig\";')
+        print('\"size\" -- количество сердцевин в MCF, целое число;')
+        print('\"ring_number\" -- количество коаксиальных колец в MCF ?, вещественное число.\n')
+
+        print('\"beta2\" -- коэффициент дисперсии групповых скоростей [ps^2/km];')
+        print('\"gamma\" -- коэффициент нелинейности Керра [1/(W*m)];')
+        print('\"E_sat\" -- энергия насыщения [pJ];')
+        print('\"alpha\" -- коэффициент потерь [1/km];')
+        print('\"g_0\" -- ненасыщенное усиление [1/m];')
+        print('\"coupling_coefficient\" -- коэффициент линейных связей [1/cm].\n')
+
+        print('При решении время имеет размерность [ps],\n',
+              'расстояние имеет размерность [m],\n',
+              'мощность имеет размерность [W]\n.')
 
 
 @dataclass
@@ -173,15 +205,20 @@ def print_matrix(matrix, name='matrix'):
 
 class Solver:
 
-    def __init__(self, com: ComputationalParameters, eq: EquationParameters,
+    def __init__(self, com: ComputationalParameters, eq: EquationParameters, measure_flag=False, noise_amplitude=None,
                  pulses=gain_loss_soliton, pulse_params_list=None, use_gpu=False, precision='float64'):
         self.com = com
         self.eq = eq
+        self.noise_amplitude = noise_amplitude  # амплитуда аддитивного белого шума (на каждом шаге)
+        self.__measure_flag = measure_flag  # размерная или безразмерная задача
         self.use_gpu = use_gpu and USE_TORCH  # Устанавливаем режим GPU только если PyTorch доступен
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         self.precision = precision
         self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
         self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
+
+        if (not self.__measure_flag) and (eq.coupling_coefficient != 1.0 or eq.coupling_coefficient != 0.0):
+            raise RuntimeError("In dimensionless problem coupling_coefficient can be equal only 1.0 or 0.0 !!!")
 
         print("use_gpu =", self.use_gpu)
 
@@ -239,7 +276,7 @@ class Solver:
             for i in range(self.eq.size):
                 temp_array[0][i] = True
 
-        elif self.eq.core_configuration  is CoreConfig.square:
+        elif self.eq.core_configuration is CoreConfig.square:
             for i in range(temp_array_size):
                 for j in range(temp_array_size):
                     if (i - center) ** 2 + (j - center) ** 2 <= self.eq.ring_number ** 2 + 1e-13:
@@ -280,11 +317,12 @@ class Solver:
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
         self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
 
+        central_coef = 0.0 if self.__measure_flag else 1.0  # у безразмерной задачи на диагонали должны быть нули
         if self.eq.core_configuration is CoreConfig.ring_with_center:
             for j in range(1, self.eq.size):
                 self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
                 self.linear_coeffs_array[j][0] = 1.0 * self.eq.coupling_coefficient[j]
-                self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j]
+                self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j] * central_coef
             for j in range(1, self.eq.size - 1):
                 self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
                 self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
@@ -298,14 +336,14 @@ class Solver:
                 self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
             if self.eq.size > 1:
                 for j in range(self.eq.size):
-                    self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j] * central_coef
                 self.linear_coeffs_array[0][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[0]
                 self.linear_coeffs_array[self.eq.size - 1][0] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
 
         elif self.eq.core_configuration is CoreConfig.square:
             if self.eq.size > 1:
                 for j in range(self.eq.size):
-                    self.linear_coeffs_array[j][j] = -4.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j][j] = -4.0 * self.eq.coupling_coefficient[j] * central_coef
                 for j in range(self.eq.size):
                     for k in range(self.eq.size):
                         if j != k:
@@ -319,7 +357,7 @@ class Solver:
         elif self.eq.core_configuration is CoreConfig.hexagonal:
             if self.eq.size > 1:
                 for j in range(self.eq.size):
-                    self.linear_coeffs_array[j][j] = -6.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j][j] = -6.0 * self.eq.coupling_coefficient[j] * central_coef
                 for j in range(self.eq.size):
                     for k in range(self.eq.size):
                         if j != k:
@@ -387,7 +425,6 @@ class Solver:
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
 
     def calculate_D_matrix(self):
-        # coupling_matrix = get_ring_coupling_matrix(self.eq.size)
         if all(self.eq.beta2) == 0.0:
             self.D = create_simple_dispersion_free_matrix(self.linear_coeffs_array, self.eq.alpha, self.eq.g_0,
                                                           self.com.h)
@@ -410,7 +447,7 @@ class Solver:
 
         if self.D is None:
             self.calculate_D_matrix()
-
+        # TODO: Может выделить случай use_gpu в отдельную функцию?
         if self.use_gpu:
             # Инициализация тензоров на GPU с использованием to()
             psi_gpu = torch.tensor(self.numerical_solution[0], dtype=self.ctype).to(self.device, non_blocking=True)
@@ -428,7 +465,7 @@ class Solver:
             if self.use_gpu:
                 # Выполнение на PyTorch
                 psi_gpu = ssfm_order2_pytorch(psi_gpu, energy_gpu, D_gpu, gamma_gpu, E_sat_gpu, g_0_gpu, self.com.h,
-                                              self.com.tau)
+                                              self.com.tau, self.noise_amplitude)
 
                 # Копирование данных с GPU на CPU в конце итерации, с использованием pinned memory
                 self.numerical_solution[n + 1] = psi_gpu.cpu().numpy()
@@ -437,7 +474,7 @@ class Solver:
                 # Выполнение на NumPy
                 self.numerical_solution[n + 1] = ssfm_order2(self.numerical_solution[n], self.energy[:, n], self.D,
                                                              self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h,
-                                                             self.com.tau)
+                                                             self.com.tau, self.noise_amplitude)
 
             if self.use_gpu:
                 for k in range(self.eq.size):
@@ -463,6 +500,12 @@ class Solver:
             finalize_plot()
 
     def get_analytical_solution(self):
+        # TODO: Надо бы как-то корректно обработать случаи, когда есть аналитическое решение, а когда нет
+        #  (для разных импульсов в зависимости от параметров волокна)
+        if ((any([pulse != gain_loss_soliton for pulse in self.pulses]) or
+             self.eq.core_configuration != CoreConfig.empty_ring) and
+                self.eq.coupling_coefficient != 0.0):
+            raise RuntimeError("Does not exist correctly analytical solution for this case yet")
         self.analytical_solution = np.zeros((self.com.N + 1, self.eq.size, self.com.M), dtype=complex)
 
         for n, z_val in enumerate(self.z):
@@ -495,68 +538,134 @@ class Solver:
         self.calculate_error()
         self.plot_error()
 
-    def convert_to_dimensionless(self, fiber_length, coupling_coefficient, gamma, beta2, g_0, P_sat):
+    def set_reflective_index_perturbations(self, perturbation_arr):
         """
-        Функция приводит размерные параметры к безразмерному виду
+        Функция изменяет матрицу связей на диагонали
         """
-        pass
+        self.linear_coeffs_array += np.diag(perturbation_arr)
 
-    def convert_to_dimensional(self, coupling_coefficient, gamma, beta2):
-        """ Функция приводит безразмерное решение к размерному виду
+    def convert_to_dimensionless(self, coupling_coefficient, gamma, beta2,
+                                 reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
+        """
+        Функция приводит размерное решение к безразмерному виду
+        Примечание:
+        reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
+        reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
+        reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
         Параметры:
             coupling_coefficient [1/cm]
             gamma [1/(W*m)]
             beta2 [ps^2/km]
-        Изменяются величины:
-            t, T1, T2, tau [ps]
-            z, L1, L2, h [m]
-            numerical_solution [W^(1/2)]
-            peak_power [W]
-            energy [J]
+        """
+        if ((self.eq.core_configuration is not CoreConfig.hexagonal) or
+                (self.eq.core_configuration is not CoreConfig.empty_ring)):
+            raise RuntimeError("Converting to dimensionless now is unsupported for this core configuration")
+
+        time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
+        power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
+        length_scale = (1e-2 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
+        energy_scale = power_scale * time_scale
+
+        self.com.T1 /= time_scale  # [1]
+        self.com.T2 /= time_scale  # [1]
+        self.com.tau /= time_scale  # [1]
+        self.t /= time_scale  # [1]
+        self.omega *= time_scale  # [1]
+        self.omega2 *= time_scale ** 2  # [1]
+
+        self.com.L1 /= length_scale  # [1]
+        self.com.L2 /= length_scale  # [1]
+        self.com.h /= length_scale  # [1]
+        self.z /= length_scale  # [1]
+
+        self.eq.beta2 = np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
+        self.eq.gamma = 1.0 if gamma != 0.0 else 0.0  # [1]
+        self.eq.E_sat /= energy_scale  # [1]
+        self.eq.alpha /= coupling_coefficient*1e5  # [1]
+        self.eq.g_0 /= coupling_coefficient*1e2  # [1]
+        self.calculate_D_matrix()
+
+        self.__measure_flag = False
+        self.eq.coupling_coefficient = 1.0  # [1]
+        self.set_configuration()
+
+        self.numerical_solution /= sqrt(power_scale)  # [1]
+        self.analytical_solution /= sqrt(power_scale)  # [1]
+        self.absolute_error /= sqrt(power_scale)  # [1]
+        self.C_norm /= sqrt(power_scale)  # [1]
+        self.peak_power /= power_scale  # [1]
+        self.energy /= energy_scale  # [1]
+        self.L2_norm /= energy_scale  # [1]
+
+        self.nonlinear_cubic_coeffs_array *= 1.0  # TODO: Что это за коэффициент?
+        self.eq.linear_coefficient *= 1.0  # TODO: Что это за коэффициент?
+        self.eq.linear_gain_coefficient *= 1.0  # TODO: Что это за коэффициент?
+
+
+    def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
+                                 reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
+        """ Функция приводит безразмерное решение к размерному виду
+        Примечание:
+        reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
+        reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
+        reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
+        Параметры:
+            coupling_coefficient [1/cm]
+            gamma [1/(W*m)]
+            beta2 [ps^2/km]
          """
 
         if self.eq.core_configuration is CoreConfig.ring_with_center:
             self_coefficient = 2
-        elif self.eq.core_configuration is CoreConfig.square:
-            self_coefficient = 4
         elif self.eq.core_configuration is CoreConfig.hexagonal:
             self_coefficient = 6
         else:
             raise RuntimeError('Unsupportable MCF configuration')
 
-        L = 1 / coupling_coefficient * 1e-2  # [m]
-        self.com.L1 *= L
-        self.com.L2 *= L
-        self.com.h *= L
-        self.z *= L
+        if ((self.eq.core_configuration is not CoreConfig.hexagonal) or
+                (self.eq.core_configuration is not CoreConfig.empty_ring)):
+            raise RuntimeError("Converting to dimensionless now is unsupported for this core configuration")
 
-        T = np.sqrt(np.fabs(beta2) / (2 * coupling_coefficient * 1e+5))  # [ps]
-        self.com.T1 *= T
-        self.com.T2 *= T
-        self.com.tau *= T
-        self.t *= T
+        time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
+        power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
+        length_scale = (1e-2 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
+        energy_scale = power_scale * time_scale
 
-        P = coupling_coefficient * 1e+2 / gamma  # [W]
-        K = np.exp(1j * self_coefficient * self.z[:, np.newaxis]) * np.sqrt(P)  # [W^(1/2)]
-        K = K[:, np.newaxis, :]
-        E = T * P  # [pJ]
+        self.com.T1 *= time_scale  # [ps]
+        self.com.T2 *= time_scale  # [ps]
+        self.com.tau *= time_scale  # [ps]
+        self.t *= time_scale  # [ps]
+        self.omega /= time_scale  # [THz]
+        self.omega2 /= time_scale**2  # [THz^2]
 
-        print("C =", coupling_coefficient, "1/cm")
-        print("L =", L, "m")
-        print("T =", T, "ps")
-        print("P =", P, "W")
-        print("E =", E, "pJ")
+        self.com.L1 *= length_scale  # [m]
+        self.com.L2 *= length_scale  # [m]
+        self.com.h *= length_scale  # [m]
+        self.z *= length_scale  # [m]
 
-        self.numerical_solution *= K
-        self.peak_power *= P
-        self.energy *= E
-
-        self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
-        self.eq.gamma = gamma  # [1/(W*m)]
         self.eq.beta2 = beta2  # [ps^2/km]
-        self.eq.alpha = self.eq.alpha * coupling_coefficient  # [1/cm]
-        self.eq.g_0 = self.eq.g_0 * coupling_coefficient  # [1/cm]
-        self.eq.E_sat = self.eq.E_sat * E  # [pJ]
+        self.eq.gamma = gamma  # [1/(W*m)]
+        self.eq.E_sat *= energy_scale  # [pJ]
+        self.eq.alpha *= coupling_coefficient*1e5  # [1/km]
+        self.eq.g_0 *= coupling_coefficient*1e2  # [1/m]
+        self.calculate_D_matrix()
+
+        self.__measure_flag = True
+        self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
+        self.set_configuration()
+
+        self.numerical_solution *= sqrt(power_scale)  # [sqrt(W)]
+        self.analytical_solution *= sqrt(power_scale)  # [sqrt(W)]
+        self.absolute_error *= sqrt(power_scale)  # [sqrt(W)]
+        self.C_norm *= sqrt(power_scale)  # [sqrt(W)]
+        self.peak_power *= power_scale  # [W]
+        self.energy *= energy_scale  # [pJ]
+        self.L2_norm *= energy_scale  # [pJ]
+
+        self.nonlinear_cubic_coeffs_array *= 1.0  # TODO: Что это за коэффициент?
+        self.eq.linear_coefficient *= 1.0  # TODO: Что это за коэффициент?
+        self.eq.linear_gain_coefficient *= 1.0  # TODO: Что это за коэффициент?
+
 
     def find_stationary_solution(self, lambda_val, max_iter=200, tol=1e-11, plot_graphs=False, update_interval=0.01, yscale='linear'):
         self.numerical_solution[0] = find_stationary_solution(self.numerical_solution[0],
