@@ -44,9 +44,10 @@ def mcf_resonator_simulation():
     g_0 = 10  # коэффициент ненасыщенного усиления [1/m]
     P_sat = 40 * 5e-4  # мощность насыщения [W]
     E_sat = P_sat * time_width  # энергия насыщения [pJ]
+    noise_amplitude = 1e-2 / computational_params.N  # уровень белого равномерного шума, добавляемого на каждом шаге
     equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
-                                         coupling_coefficient=c_coef, E_sat=E_sat, g_0=g_0,
-                                         alpha=0.0, beta2=0.0, gamma=0.0)
+                                         coupling_coefficient=c_coef, E_sat=E_sat, g_0=g_0, alpha=0.0,
+                                         beta2=0.0, gamma=0.0, noise_amplitude=noise_amplitude)
 
     # параметры граничных условий
     Delta = 6*pi  # полуширина решёток
@@ -54,9 +55,7 @@ def mcf_resonator_simulation():
     delta_arr = np.linspace(-24*pi, 24*pi, equation_params.size)  # отстройки пиков отражения от несущей частоты
     Frensel_refl = 0.2
 
-    noise_amplitude = 1e-4 / computational_params.N  # уровень аддитивного белого равномерного шума на каждом шаге
-    solver = Solver(computational_params, equation_params, measure_flag=True, noise_amplitude=noise_amplitude,
-                    pulses=zero_pulse, use_gpu=False)
+    solver = Solver(computational_params, equation_params, measure_flag=True, pulses=zero_pulse, use_gpu=False)
 
     perturbation_scale = 1e-6  # порядок отклонений коэффициента преломления (в сумме у них должен быть ноль)
     perturbation_array = np.random.uniform(-perturbation_scale, perturbation_scale, equation_params.size)

@@ -55,38 +55,62 @@ def coupling_step(psi, Dmat_disp_free):
     return res_psi
 
 
-def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau, noise_amplitude=None):
+def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau, damp_length=0.0, noise_amplitude=0.0):
     """ Реализация схемы расщепления """
-    damping_length = 0.1  # TODO: условия на эту переменную всегда выполняются, может надо убрать блоки "if" ?
     num = len(psi)
     for i in range(num):
-        if g_0[i] != 0:  # нет усиления
+        if g_0[i] != 0.0:  # нет усиления
             current_energy[i] = get_energy_rectangles(psi[i], tau)
     nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
 
-    if damping_length != 0:
-        psi = apply_absorbing_boundary(psi, damping_length=damping_length)  # TODO: Зачем это нужно?
+    if damp_length != 0.0:
+        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
 
     psi = fft(psi, axis=1)
     psi = linear_step(psi, D)
     psi = ifft(psi, axis=1)
 
-    if damping_length != 0:
-        psi = apply_absorbing_boundary(psi, damping_length=damping_length)
+    if damp_length != 0.0:
+        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
 
     for i in range(num):
-        if g_0[i] != 0:
+        if g_0[i] != 0.0:
             current_energy[i] = get_energy_rectangles(psi[i], tau)
     nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
 
-    if damping_length != 0:
-        psi = apply_absorbing_boundary(psi, damping_length=damping_length)
+    if damp_length != 0.0:
+        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
 
-    if noise_amplitude is not None:
+    if noise_amplitude != 0.0:
         current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
                          1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
         psi += current_noise
     return psi
+
+
+def ssfm_for_resonator_nocos(forward_psi, backward_psi, current_energy, D,
+                             gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
+    """ Реализация схемы расщепления для резонатора без учёта взаимодействия несущих частот прямой и обратно волн """
+    num = len(forward_psi)
+    for i in range(num):
+        if g_0[i] != 0.0:  # нет усиления
+            current_energy[i] = get_energy_rectangles(forward_psi[i], tau)
+    nonlinear_step(forward_psi, gamma, E_sat, g_0, current_energy, h/2)
+
+    forward_psi = fft(forward_psi, axis=1)
+    forward_psi = linear_step(forward_psi, D)
+    forward_psi = ifft(forward_psi, axis=1)
+
+    for i in range(num):
+        if g_0[i] != 0.0:
+            current_energy[i] = get_energy_rectangles(forward_psi[i], tau)
+    nonlinear_step(forward_psi, gamma, E_sat, g_0, current_energy, h/2)
+
+    if noise_amplitude != 0.0:
+        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, forward_psi.shape) +
+                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, forward_psi.shape))
+        forward_psi += current_noise
+    return forward_psi
 
 
 def ssfm_order2_2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):

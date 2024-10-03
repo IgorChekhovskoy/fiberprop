@@ -32,6 +32,7 @@ class ComputationalParameters:
 
     h: float = field(init=False, default=0.0)
     tau: float = field(init=False, default=0.0)
+    damp_length: float = 0.0
 
     def __post_init__(self):
         if self.N > 0:
@@ -54,6 +55,7 @@ class ComputationalParameters:
         print('\"M\" -- количество шагов по времени, целое число;')
         print('\"L1, L2\" -- границы расчётной области по эволюционной переменной [m];')
         print('\"T1, T2\" -- границы расчётной области по времени [ps].\n')
+        print('\"damp_length\" -- доля узлов временной сетки, на которых по краям действует условие поглощения [1].\n')
 
 @dataclass
 class CoreConfig(Enum):
@@ -78,8 +80,7 @@ class EquationParameters:
     alpha: Union[float, np.ndarray, list] = 0.0
     g_0: Union[float, np.ndarray, list] = 0.0
     coupling_coefficient: Union[float, np.ndarray, list] = 1.0
-    linear_coefficient: Union[float, np.ndarray, list] = 0.0
-    linear_gain_coefficient: Union[float, np.ndarray, list] = 0.0
+    noise_amplitude: float = 0.0  # амплитуда аддитивного белого шума (на каждом шаге)
 
     def __post_init__(self):
         # Преобразование скалярных параметров и списков в массивы одинаковых значений
@@ -107,10 +108,6 @@ class EquationParameters:
             self.coupling_coefficient = np.array(self.coupling_coefficient, dtype=float)
             if self.coupling_coefficient.ndim == 0:
                 self.coupling_coefficient = np.full(self.size, self.coupling_coefficient, dtype=float)
-        # if isinstance(self.linear_coefficient, (int, float)):
-        #     self.linear_coefficient = np.full(self.size, self.linear_coefficient, dtype=float)
-        # if isinstance(self.linear_gain_coefficient, (int, float)):
-        #     self.linear_gain_coefficient = np.full(self.size, self.linear_gain_coefficient, dtype=float)
 
     @staticmethod
     def get_info():
@@ -128,6 +125,8 @@ class EquationParameters:
         print('\"alpha\" -- коэффициент потерь [1/km];')
         print('\"g_0\" -- ненасыщенное усиление [1/m];')
         print('\"coupling_coefficient\" -- коэффициент линейных связей [1/cm].\n')
+        print('\"noise_amplitude\" -- амплитуда аддитивного белого равномерного шума, '
+              'добавляемого на каждом шаге [sqrt(W/2)].\n')
 
         print('При решении время имеет размерность [ps],\n',
               'расстояние имеет размерность [m],\n',
@@ -205,11 +204,10 @@ def print_matrix(matrix, name='matrix'):
 
 class Solver:
 
-    def __init__(self, com: ComputationalParameters, eq: EquationParameters, measure_flag=False, noise_amplitude=None,
+    def __init__(self, com: ComputationalParameters, eq: EquationParameters, measure_flag=False,
                  pulses=gain_loss_soliton, pulse_params_list=None, use_gpu=False, precision='float64'):
         self.com = com
         self.eq = eq
-        self.noise_amplitude = noise_amplitude  # амплитуда аддитивного белого шума (на каждом шаге)
         self.__measure_flag = measure_flag  # размерная или безразмерная задача
         self.use_gpu = use_gpu and USE_TORCH  # Устанавливаем режим GPU только если PyTorch доступен
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
@@ -317,7 +315,7 @@ class Solver:
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
         self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
 
-        central_coef = 0.0 if self.__measure_flag else 1.0  # у безразмерной задачи на диагонали должны быть нули
+        central_coef = 0.0 if self.__measure_flag else 1.0  # у размерной задачи на диагонали должны быть нули
         if self.eq.core_configuration is CoreConfig.ring_with_center:
             for j in range(1, self.eq.size):
                 self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
@@ -367,9 +365,6 @@ class Solver:
                             if abs(self.mask_array[j].number_2d_x - self.mask_array[k].number_2d_x) == 1 and \
                                     abs(self.mask_array[j].number_2d_y - self.mask_array[k].number_2d_y) == 1:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
-
-        # for j in range(self.eq.size):
-        #     self.linear_coeffs_array[j][j] += self.eq.linear_coefficient[j] - 1j * self.eq.linear_gain_coefficient[j]
 
         print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
@@ -465,7 +460,7 @@ class Solver:
             if self.use_gpu:
                 # Выполнение на PyTorch
                 psi_gpu = ssfm_order2_pytorch(psi_gpu, energy_gpu, D_gpu, gamma_gpu, E_sat_gpu, g_0_gpu, self.com.h,
-                                              self.com.tau, self.noise_amplitude)
+                                              self.com.tau, self.eq.noise_amplitude)
 
                 # Копирование данных с GPU на CPU в конце итерации, с использованием pinned memory
                 self.numerical_solution[n + 1] = psi_gpu.cpu().numpy()
@@ -474,7 +469,7 @@ class Solver:
                 # Выполнение на NumPy
                 self.numerical_solution[n + 1] = ssfm_order2(self.numerical_solution[n], self.energy[:, n], self.D,
                                                              self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h,
-                                                             self.com.tau, self.noise_amplitude)
+                                                             self.com.tau, self.com.damp_length, self.eq.noise_amplitude)
 
             if self.use_gpu:
                 for k in range(self.eq.size):
@@ -542,6 +537,8 @@ class Solver:
         """
         Функция изменяет матрицу связей на диагонали
         """
+        if not self.__measure_flag:
+            raise RuntimeError("You can set perturbations of the reflective indexes only in dimensional case")
         self.linear_coeffs_array += np.diag(perturbation_arr)
 
     def convert_to_dimensionless(self, coupling_coefficient, gamma, beta2,
@@ -587,7 +584,7 @@ class Solver:
 
         self.__measure_flag = False
         self.eq.coupling_coefficient = 1.0  # [1]
-        self.set_configuration()
+        self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
 
         self.numerical_solution /= sqrt(power_scale)  # [1]
         self.analytical_solution /= sqrt(power_scale)  # [1]
@@ -596,10 +593,6 @@ class Solver:
         self.peak_power /= power_scale  # [1]
         self.energy /= energy_scale  # [1]
         self.L2_norm /= energy_scale  # [1]
-
-        self.nonlinear_cubic_coeffs_array *= 1.0  # TODO: Что это за коэффициент?
-        self.eq.linear_coefficient *= 1.0  # TODO: Что это за коэффициент?
-        self.eq.linear_gain_coefficient *= 1.0  # TODO: Что это за коэффициент?
 
 
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
@@ -652,7 +645,7 @@ class Solver:
 
         self.__measure_flag = True
         self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
-        self.set_configuration()
+        self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
 
         self.numerical_solution *= sqrt(power_scale)  # [sqrt(W)]
         self.analytical_solution *= sqrt(power_scale)  # [sqrt(W)]
@@ -661,10 +654,6 @@ class Solver:
         self.peak_power *= power_scale  # [W]
         self.energy *= energy_scale  # [pJ]
         self.L2_norm *= energy_scale  # [pJ]
-
-        self.nonlinear_cubic_coeffs_array *= 1.0  # TODO: Что это за коэффициент?
-        self.eq.linear_coefficient *= 1.0  # TODO: Что это за коэффициент?
-        self.eq.linear_gain_coefficient *= 1.0  # TODO: Что это за коэффициент?
 
 
     def find_stationary_solution(self, lambda_val, max_iter=200, tol=1e-11, plot_graphs=False, update_interval=0.01, yscale='linear'):
