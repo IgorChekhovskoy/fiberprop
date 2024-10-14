@@ -1,6 +1,5 @@
 # from .coupling_coefficient import *
 
-from .dimensionless import *
 from .drawing import *
 from .matrices import *
 from .propagation import *

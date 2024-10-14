@@ -4,8 +4,9 @@ import numpy as np
 import copy
 import time
 
+from fiberprop.solver import CoreConfig
 from fiberprop.coupling_coefficient.base_functions import get_coupling_coefficients, get_lp_mode
-from fiberprop.coupling_coefficient.fiber import Fiber, CoreConfiguration, FiberMaterial
+from fiberprop.coupling_coefficient.fiber import Fiber, FiberMaterial
 from fiberprop.coupling_coefficient.light import Light
 
 
@@ -26,7 +27,7 @@ def example_of_coefficients_calculation():
     light.lambda0 = lambda0
 
     fiber = Fiber()
-    fiber.core_configuration = CoreConfiguration.HEXAGONAL
+    fiber.core_configuration = CoreConfig.hexagonal
     fiber.core_count = 7
     fiber.core_radius = 2.95
     fiber.cladding_diameter = 125.0

@@ -1,3 +1,4 @@
+from fiberprop.solver import CoreConfig
 import multiprocessing
 from enum import Enum
 import math
@@ -7,35 +8,26 @@ import numpy as np
 from .light import Light
 
 
-class CoreConfiguration(Enum):
-    RING_WITH_CENTRAL = 0
-    RING = 1
-    SQUARE = 2
-    HEXAGONAL = 3
-    DUAL_CORE = 4
-    NOT_SET = 5
-
-
 class FiberMaterial(Enum):
-    BK7 = 0
+    not_set = 0
     SIO2 = 1
     GEO2 = 2
     SIO2_AND_GEO2_ALLOY = 3
     GREK_FOR_CORE = 4
-    NOT_SET = 5
+    BK7 = 5
 
 
 class Fiber:
     """ Параметры волокна """
     # Параметры конфигурации
-    _core_configuration = CoreConfiguration.NOT_SET
+    _core_configuration = CoreConfig.not_set
     _core_count = 0
     _cladding_diameter = 0.0
     _core_radius = 0.0
     _distance_to_fiber_center = 0.0
 
     # Параметры материала волокна
-    _core_material = FiberMaterial.NOT_SET
+    _core_material = FiberMaterial.not_set
     _material_concentration = 0.0
     _n_cladding = 0.0
     _delta_n_core = 0.0
@@ -75,7 +67,7 @@ class Fiber:
 
     @property
     def core_configuration(self):
-        if self._core_configuration == CoreConfiguration.NOT_SET:
+        if self._core_configuration is CoreConfig.not_set:
             raise RuntimeError('Core configuration not set')
         return self._core_configuration
 
@@ -105,7 +97,7 @@ class Fiber:
 
     @property
     def core_material(self):
-        if self._core_material == FiberMaterial.NOT_SET:
+        if self._core_material is FiberMaterial.not_set:
             raise RuntimeError('Core material not set')
         return self._core_material
 
@@ -118,16 +110,16 @@ class Fiber:
     def get_sellmeier_coefficients(self):
         """ Возвращает коэффициенты Зельмейера для различных материалов волокна """
         res = []
-        if self.core_material == FiberMaterial.BK7:
+        if self.core_material is FiberMaterial.BK7:
             B = [1.03961212, 0.231792344, 1.01046945]
             C = [np.sqrt(6.00069867e-3), np.sqrt(2.00179144e-2), np.sqrt(1.03560653e+2)]
-        elif self.core_material == FiberMaterial.SIO2:
+        elif self.core_material is FiberMaterial.SIO2:
             B = [0.69616630, 0.40794260, 0.89747940]
             C = [0.68404300e-1, 0.11624140, 0.98961610e+1]
-        elif self.core_material == FiberMaterial.GEO2:
+        elif self.core_material is FiberMaterial.GEO2:
             B = [0.80686642, 0.71815848, 0.85416831]
             C = [0.68972606e-1, 0.15396605, 0.11841931e+2]
-        elif self.core_material == FiberMaterial.SIO2_AND_GEO2_ALLOY:
+        elif self.core_material is FiberMaterial.SIO2_AND_GEO2_ALLOY:
             X = self.material_concentration
             B = [0.69616630 + X * (0.80686642 - 0.69616630),
                  0.40794260 + X * (0.71815848 - 0.40794260),
@@ -135,7 +127,7 @@ class Fiber:
             C = [0.68404300e-1 + X * (0.68972606e-1 - 0.68404300e-1),
                  0.11624140 + X * (0.15396605 - 0.11624140),
                  0.11841931e+2 + X * (0.11841931e+2 - 0.11841931e+2)]
-        elif self.core_material == FiberMaterial.GREK_FOR_CORE:
+        elif self.core_material is FiberMaterial.GREK_FOR_CORE:
             B = [0.711040, 0.451885, 0.704048]
             C = [0.064270, 0.129408, 9.425478]
         else:
@@ -188,7 +180,7 @@ class Fiber:
 
     @core_configuration.setter
     def core_configuration(self, arg):
-        if not isinstance(arg, CoreConfiguration):
+        if not isinstance(arg, CoreConfig):
             raise TypeError('Core configuration should be of type FiberConfig')
         self._core_configuration = arg
 

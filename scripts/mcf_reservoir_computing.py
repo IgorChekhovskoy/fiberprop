@@ -1,7 +1,7 @@
 from importlib import reload
 
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
-from fiberprop.coupling_coefficient import Fiber, Light, CoreConfiguration, FiberMaterial, get_coupling_coefficients
+from fiberprop.coupling_coefficient import Fiber, Light, FiberMaterial, get_coupling_coefficients
 from fiberprop import propagation
 from fiberprop import ssfm_mcf
 
@@ -91,7 +91,7 @@ def test_mcf_nn_reservoir_computing():
     light.lambda0 = lambda0
 
     fiber = Fiber()
-    fiber.core_configuration = CoreConfiguration.HEXAGONAL  # solver.eq.core_configuration
+    fiber.core_configuration = solver.eq.core_configuration
     fiber.core_count = solver.eq.size
     fiber.core_radius = 2.95
     fiber.cladding_diameter = 125.0

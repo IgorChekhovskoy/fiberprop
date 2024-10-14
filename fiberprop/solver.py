@@ -59,11 +59,13 @@ class ComputationalParameters:
 
 @dataclass
 class CoreConfig(Enum):
-    ring_with_center: int = 0  # 1d круговая с центральной сердцевиной
+    not_set: int = 0  # конфигурация не задана
     empty_ring: int = 1  # 1d круговая без центральной сердцевиной
     square: int = 2  # 2d квадратная решетка
     hexagonal: int = 3  # 2d гексагональная решетка
     manakov_eq: int = 4  # уравнения Манакова
+    dual_core: int = 5  # два ядра
+    ring_with_center: int = 6  # 1d круговая с центральной сердцевиной
 
 @dataclass
 class EquationParameters:
@@ -215,7 +217,9 @@ class Solver:
         self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
         self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
 
-        if (not self.__measure_flag) and (eq.coupling_coefficient != 1.0 or eq.coupling_coefficient != 0.0):
+        dimensionless_valid_coefs = {0.0, 1.0}
+        valid_condition = all([eq.coupling_coefficient[i] in dimensionless_valid_coefs for i in range(eq.size)])
+        if (not self.__measure_flag) and not valid_condition:
             raise RuntimeError("In dimensionless problem coupling_coefficient can be equal only 1.0 or 0.0 !!!")
 
         print("use_gpu =", self.use_gpu)
@@ -498,7 +502,7 @@ class Solver:
         # TODO: Надо бы как-то корректно обработать случаи, когда есть аналитическое решение, а когда нет
         #  (для разных импульсов в зависимости от параметров волокна)
         if ((any([pulse != gain_loss_soliton for pulse in self.pulses]) or
-             self.eq.core_configuration != CoreConfig.empty_ring) and
+             self.eq.core_configuration is not CoreConfig.empty_ring) and
                 self.eq.coupling_coefficient != 0.0):
             raise RuntimeError("Does not exist correctly analytical solution for this case yet")
         self.analytical_solution = np.zeros((self.com.N + 1, self.eq.size, self.com.M), dtype=complex)
@@ -522,6 +526,7 @@ class Solver:
         print('L2 norm =\t', self.L2_norm)
 
     def plot_error(self):
+        T, Z = np.meshgrid(self.t, self.z)
         plot3D(self.z, self.t, self.absolute_error, 'абсолютная_ошибка-case1')
         plot2D(self.z, self.absolute_error[:, self.com.M // 2] / abs(
             self.analytical_solution[:, self.eq.size // 2, self.com.M // 2]),
@@ -554,9 +559,12 @@ class Solver:
             gamma [1/(W*m)]
             beta2 [ps^2/km]
         """
-        if ((self.eq.core_configuration is not CoreConfig.hexagonal) or
-                (self.eq.core_configuration is not CoreConfig.empty_ring)):
-            raise RuntimeError("Converting to dimensionless now is unsupported for this core configuration")
+        if self.eq.core_configuration is CoreConfig.empty_ring:
+            self_coefficient = 2
+        elif self.eq.core_configuration is CoreConfig.hexagonal:
+            self_coefficient = 6
+        else:
+            raise RuntimeError('Unsupportable MCF configuration')
 
         time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
         power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
@@ -566,37 +574,39 @@ class Solver:
         self.com.T1 /= time_scale  # [1]
         self.com.T2 /= time_scale  # [1]
         self.com.tau /= time_scale  # [1]
-        self.t /= time_scale  # [1]
-        self.omega *= time_scale  # [1]
-        self.omega2 *= time_scale ** 2  # [1]
+        if self.t is not None: self.t /= time_scale  # [1]
+        if self.omega is not None: self.omega *= time_scale  # [1]
+        if self.omega2 is not None: self.omega2 *= time_scale ** 2  # [1]
 
         self.com.L1 /= length_scale  # [1]
         self.com.L2 /= length_scale  # [1]
         self.com.h /= length_scale  # [1]
-        self.z /= length_scale  # [1]
+        if self.z is not None: self.z /= length_scale  # [1]
 
         self.eq.beta2 = np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
         self.eq.gamma = 1.0 if gamma != 0.0 else 0.0  # [1]
         self.eq.E_sat /= energy_scale  # [1]
         self.eq.alpha /= coupling_coefficient*1e5  # [1]
         self.eq.g_0 /= coupling_coefficient*1e2  # [1]
-        self.calculate_D_matrix()
-
-        self.__measure_flag = False
         self.eq.coupling_coefficient = 1.0  # [1]
+        self.__measure_flag = False
+        self.eq.__post_init__()
+        self.calculate_D_matrix()
         self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
 
-        self.numerical_solution /= sqrt(power_scale)  # [1]
-        self.analytical_solution /= sqrt(power_scale)  # [1]
-        self.absolute_error /= sqrt(power_scale)  # [1]
-        self.C_norm /= sqrt(power_scale)  # [1]
-        self.peak_power /= power_scale  # [1]
-        self.energy /= energy_scale  # [1]
-        self.L2_norm /= energy_scale  # [1]
+        cores = np.arange(self.eq.size, dtype=float)
+        _, Zn, Tn = np.meshgrid(cores, self.z, self.t)  # [1], нормированные расчётные сетки по t по z
+        if self.numerical_solution is not None: self.numerical_solution /= sqrt(power_scale) * np.exp(1j*Zn*self_coefficient)  # [1]
+        if self.analytical_solution is not None: self.analytical_solution /= sqrt(power_scale) * np.exp(1j*Zn*self_coefficient)  # [1]
+        if self.absolute_error is not None: self.absolute_error /= sqrt(power_scale)  # [1]
+        if self.C_norm is not None: self.C_norm /= sqrt(power_scale)  # [1]
+        if self.peak_power is not None: self.peak_power /= power_scale  # [1]
+        if self.energy is not None: self.energy /= energy_scale  # [1]
+        if self.L2_norm is not None: self.L2_norm /= energy_scale  # [1]
 
 
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
-                                 reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
+                               reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
         """ Функция приводит безразмерное решение к размерному виду
         Примечание:
         reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
@@ -607,17 +617,12 @@ class Solver:
             gamma [1/(W*m)]
             beta2 [ps^2/km]
          """
-
-        if self.eq.core_configuration is CoreConfig.ring_with_center:
+        if self.eq.core_configuration is CoreConfig.empty_ring:
             self_coefficient = 2
         elif self.eq.core_configuration is CoreConfig.hexagonal:
             self_coefficient = 6
         else:
             raise RuntimeError('Unsupportable MCF configuration')
-
-        if ((self.eq.core_configuration is not CoreConfig.hexagonal) or
-                (self.eq.core_configuration is not CoreConfig.empty_ring)):
-            raise RuntimeError("Converting to dimensionless now is unsupported for this core configuration")
 
         time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
         power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
@@ -627,33 +632,35 @@ class Solver:
         self.com.T1 *= time_scale  # [ps]
         self.com.T2 *= time_scale  # [ps]
         self.com.tau *= time_scale  # [ps]
-        self.t *= time_scale  # [ps]
-        self.omega /= time_scale  # [THz]
-        self.omega2 /= time_scale**2  # [THz^2]
+        if self.t is not None: self.t *= time_scale  # [ps]
+        if self.omega is not None: self.omega /= time_scale  # [THz]
+        if self.omega2 is not None: self.omega2 /= time_scale**2  # [THz^2]
 
         self.com.L1 *= length_scale  # [m]
         self.com.L2 *= length_scale  # [m]
         self.com.h *= length_scale  # [m]
-        self.z *= length_scale  # [m]
+        if self.z is not None: self.z *= length_scale  # [m]
 
         self.eq.beta2 = beta2  # [ps^2/km]
         self.eq.gamma = gamma  # [1/(W*m)]
         self.eq.E_sat *= energy_scale  # [pJ]
         self.eq.alpha *= coupling_coefficient*1e5  # [1/km]
         self.eq.g_0 *= coupling_coefficient*1e2  # [1/m]
-        self.calculate_D_matrix()
-
-        self.__measure_flag = True
         self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
+        self.__measure_flag = True
+        self.eq.__post_init__()
+        self.calculate_D_matrix()
         self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
 
-        self.numerical_solution *= sqrt(power_scale)  # [sqrt(W)]
-        self.analytical_solution *= sqrt(power_scale)  # [sqrt(W)]
-        self.absolute_error *= sqrt(power_scale)  # [sqrt(W)]
-        self.C_norm *= sqrt(power_scale)  # [sqrt(W)]
-        self.peak_power *= power_scale  # [W]
-        self.energy *= energy_scale  # [pJ]
-        self.L2_norm *= energy_scale  # [pJ]
+        cores = np.arange(self.eq.size, dtype=float)
+        _, Zn, Tn = np.meshgrid(cores, self.z/length_scale, self.t/time_scale)  # [1], нормированные расчётные сетки по t по z
+        if self.numerical_solution is not None: self.numerical_solution *= sqrt(power_scale) * np.exp(1j*Zn*self_coefficient)  # [sqrt(W)]
+        if self.analytical_solution is not None: self.analytical_solution *= sqrt(power_scale) * np.exp(1j*Zn*self_coefficient)  # [sqrt(W)]
+        if self.absolute_error is not None: self.absolute_error *= sqrt(power_scale)  # [sqrt(W)]
+        if self.C_norm is not None: self.C_norm *= sqrt(power_scale)  # [sqrt(W)]
+        if self.peak_power is not None: self.peak_power *= power_scale  # [W]
+        if self.energy is not None: self.energy *= energy_scale  # [pJ]
+        if self.L2_norm is not None: self.L2_norm *= energy_scale  # [pJ]
 
 
     def find_stationary_solution(self, lambda_val, max_iter=200, tol=1e-11, plot_graphs=False, update_interval=0.01, yscale='linear'):

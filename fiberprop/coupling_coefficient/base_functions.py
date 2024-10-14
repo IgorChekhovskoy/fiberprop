@@ -1,9 +1,9 @@
+from fiberprop.solver import CoreConfig
 import numpy as np
 import scipy.integrate as si
 import scipy.special as sp
 import multiprocessing
 import math
-from fiberprop.coupling_coefficient.fiber import CoreConfiguration
 
 # Корни функции Бесселя. Первый индекс - порядок функции Бесселя (J0, J1, J2 или J3).
 # Второй - номер корня минус один.
@@ -78,12 +78,12 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, proc_num=1):
     distance_to_fiber_center = fiber.distance_to_fiber_center
     core_center_coords = []
 
-    if fiber.core_configuration == CoreConfiguration.RING:
+    if fiber.core_configuration is CoreConfig.empty_ring:
         for i in range(core_count):
             phi = 2.0 * math.pi * i / core_count
             coords = (distance_to_fiber_center * math.cos(phi), distance_to_fiber_center * math.sin(phi))
             core_center_coords.append(coords)
-    elif fiber.core_configuration == CoreConfiguration.HEXAGONAL:
+    elif fiber.core_configuration is CoreConfig.hexagonal:
         delta_x = 0.0
         delta_y = 0.0
         core_center_coords.append((delta_x, delta_y))
@@ -92,7 +92,7 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, proc_num=1):
             x_coord = distance_to_fiber_center * math.cos(phi) + delta_x
             y_coord = distance_to_fiber_center * math.sin(phi) + delta_y
             core_center_coords.append((x_coord, y_coord))
-    elif fiber.core_configuration == CoreConfiguration.DUAL_CORE:
+    elif fiber.core_configuration is CoreConfig.dual_core:
         coup_mat = get_coupling_coeff_2_core_fiber(fiber, light)
         return coup_mat
     else:
