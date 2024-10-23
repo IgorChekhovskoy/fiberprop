@@ -1,3 +1,5 @@
+import copy
+
 from scipy.fft import fft, ifft
 from .pulses import *
 
@@ -88,29 +90,76 @@ def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau, damp_length=0
     return psi
 
 
-def ssfm_for_resonator_nocos(forward_psi, backward_psi, current_energy, D,
-                             gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
-    """ Реализация схемы расщепления для резонатора без учёта взаимодействия несущих частот прямой и обратно волн """
-    num = len(forward_psi)
+def Newton_method(func, func_der, prev_val, epsilon=1e-3):
+    """
+    Метод Ньютона для отыскания нуля монотонной функции
+    """
+    new_val = np.infty
+    while abs(new_val - prev_val) > epsilon:
+        curr_val = copy.deepcopy(new_val)
+        new_val = prev_val - func(prev_val) / func_der(prev_val)
+        prev_val = curr_val
+    return new_val
+
+
+def nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, step):
+    """ Нелинейный оператор (Керр и насыщение), метод первого порядка """
+    local_g = g_0 * (2*E_sat + E_total) / (E_sat + E_total)
+    P_0 = np.abs(psi)**2
+    P = P_0 * np.exp(local_g * step)
+    phi = np.angle(psi) - P_0 * gamma/local_g + P * gamma/local_g
+    psi = np.sqrt(P) * np.exp(1j * phi)
+    return psi
+
+
+def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
+    """ Реализация схемы расщепления для резонатора без учёта взаимодействия несущих частот прямой и обратной волн """
+    num = len(psi)
     for i in range(num):
         if g_0[i] != 0.0:  # нет усиления
-            current_energy[i] = get_energy_rectangles(forward_psi[i], tau)
-    nonlinear_step(forward_psi, gamma, E_sat, g_0, current_energy, h/2)
+            energy_forward[i] = get_energy_rectangles(psi[i], tau)
 
-    forward_psi = fft(forward_psi, axis=1)
-    forward_psi = linear_step(forward_psi, D)
-    forward_psi = ifft(forward_psi, axis=1)
+    E_total = energy_forward + energy_backward
+    psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
+
+    psi = fft(psi, axis=1)
+    psi = linear_step(psi, D)
+    psi = ifft(psi, axis=1)
 
     for i in range(num):
         if g_0[i] != 0.0:
-            current_energy[i] = get_energy_rectangles(forward_psi[i], tau)
-    nonlinear_step(forward_psi, gamma, E_sat, g_0, current_energy, h/2)
+            energy_forward[i] = get_energy_rectangles(psi[i], tau)
+
+    E_total = energy_forward + energy_backward
+    psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
 
     if noise_amplitude != 0.0:
-        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, forward_psi.shape) +
-                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, forward_psi.shape))
-        forward_psi += current_noise
-    return forward_psi
+        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
+                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
+        psi += current_noise
+    return psi
+
+
+def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
+    """ Реализация схемы расщепления для резонатора с учётом взаимодействия несущих частот прямой и обратной волн """
+    E_total = get_energy_simpson(abs(psi_forward)**2 + abs(psi_backward)**2 +
+                                 2*(psi_forward.conjugate() * psi_backward).real,
+                                 tau)
+    psi_forward = nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
+
+    psi_forward = fft(psi_forward, axis=1)
+    psi_forward = linear_step(psi_forward, D)
+    psi_forward = ifft(psi_forward, axis=1)
+
+    E_total = get_energy_simpson(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
+                                 2 * (psi_forward.conjugate() * psi_backward).real,
+                                 tau)
+    psi_forward = nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
+    if noise_amplitude != 0.0:
+        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi_forward.shape) +
+                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi_forward.shape))
+        psi_forward += current_noise
+    return psi_forward
 
 
 def ssfm_order2_2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):

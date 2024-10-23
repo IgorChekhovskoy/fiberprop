@@ -1,3 +1,5 @@
+import copy
+
 from tqdm import trange
 from scipy.fft import fftfreq
 from dataclasses import dataclass, field
@@ -8,7 +10,7 @@ from enum import Enum
 from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
 from .pulses import gain_loss_soliton
 from .drawing import *
-from .ssfm_mcf import ssfm_order2, get_energy_rectangles
+from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos
 from .stationary_solution_solver import find_stationary_solution
 
 try:
@@ -493,6 +495,70 @@ class Solver:
         if self.use_gpu:
             self.numerical_solution[-1] = psi_gpu.cpu().numpy()
             self.energy[:, -1] = energy_gpu.cpu().numpy()
+
+        # Закрытие интерактивного режима после завершения симуляции
+        if print_modulus:
+            finalize_plot()
+
+    def run_resonator_simulation_nocos(self, backward_energy, print_modulus=False, print_interval=10):
+        """
+        Без учёта взаимодействия частот прямой и обратной волн.
+        в перспективе для более высокого порядка можно добавить флаг
+        """
+        if self.D is None:
+            self.calculate_D_matrix()
+
+        # Инициализация графика, если нужно
+        if print_modulus:
+            fig, ax, line = init_modulus_plot()
+
+        for n in trange(self.com.N):
+            # Выполнение на NumPy
+            self.numerical_solution[n + 1] = ssfm_order1_resonator_nocos(self.numerical_solution[n], self.energy[:, n], backward_energy[:, n],
+                                                                         self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0,
+                                                                         self.com.h, self.com.tau, self.eq.noise_amplitude)
+
+            for k in range(self.eq.size):
+                self.energy[k][n + 1] = get_energy_rectangles(self.numerical_solution[n + 1][k], self.com.tau)
+
+            for k in range(self.eq.size):
+                self.peak_power[k][n + 1] = np.max(np.abs(self.numerical_solution[n + 1][k]) ** 2)
+
+            # Обновление графика через каждые `print_interval` шагов, если включен флаг `print_modulus`
+            if print_modulus and (n + 1) % print_interval == 0:
+                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
+
+        # Закрытие интерактивного режима после завершения симуляции
+        if print_modulus:
+            finalize_plot()
+
+    def run_resonator_simulation_fullcos(self, backward_solution, print_modulus=False, print_interval=10):
+        """
+        С учётом взаимодействия частот прямой и обратной волн.
+        в перспективе для более высокого порядка можно добавить флаг
+        """
+        if self.D is None:
+            self.calculate_D_matrix()
+
+        # Инициализация графика, если нужно
+        if print_modulus:
+            fig, ax, line = init_modulus_plot()
+
+        for n in trange(self.com.N):
+            # Выполнение на NumPy
+            self.numerical_solution[n + 1] = ssfm_order1_resonator_fullcos(self.numerical_solution[n], backward_solution[:, n],
+                                                                           self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0,
+                                                                           self.com.h, self.com.tau, self.eq.noise_amplitude)
+
+            for k in range(self.eq.size):
+                self.energy[k][n + 1] = get_energy_rectangles(self.numerical_solution[n + 1][k], self.com.tau)
+
+            for k in range(self.eq.size):
+                self.peak_power[k][n + 1] = np.max(np.abs(self.numerical_solution[n + 1][k]) ** 2)
+
+            # Обновление графика через каждые `print_interval` шагов, если включен флаг `print_modulus`
+            if print_modulus and (n + 1) % print_interval == 0:
+                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
 
         # Закрытие интерактивного режима после завершения симуляции
         if print_modulus:

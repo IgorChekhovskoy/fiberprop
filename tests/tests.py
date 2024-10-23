@@ -61,7 +61,7 @@ def test_case2(plot=True):
         z = np.linspace(L1, L2, N+1)
         name = 'поле_мощности-case2'
         power_field = abs(numerical_solution[num//2])**2
-        plot3D(z, t, power_field, name)
+        plot3D_plotly(t, z, power_field, name)
     return numerical_solution
 
 
@@ -164,3 +164,7 @@ def test_case_MCF_2core(N, M, num, beta2, gamma, E_sat, alpha, g_0, L1, L2, T1, 
         power_field = abs(numerical_solution[num // 2]) ** 2
         plot3D(Z_grid, T_grid, power_field, name)
     return numerical_solution
+
+
+if __name__ == '__main__':
+    test_case2()

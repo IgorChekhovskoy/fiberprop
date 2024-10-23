@@ -1,3 +1,5 @@
+import copy
+
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 
 from fiberprop.propagation import *
@@ -17,13 +19,29 @@ def right_condition(solver, pulses, Delta, phi_arr, delta_arr):
     return new_pulses
 
 
-def make_iteration(solver, Delta, phi_arr, delta_arr, Frensel_refl):
+def make_iteration(solver, Delta, phi_arr, delta_arr, Frensel_refl, cos_flag='no_cos'):
     """
     Итерация без учёта взаимодействия волн в рамках усиления
     """
-    # TODO: распространение, правое условие, распространение, левон условие
-    #  (надо добавить изменения в нелинейность и в усиление, сумму прямой и обратной волн)
-    pass
+    if cos_flag == 'no_cos':
+        ref_array = copy.deepcopy(solver.energy)
+    elif cos_flag == 'full_cos':
+        ref_array = copy.deepcopy(solver.numerical_solution)
+    else:
+        raise ValueError('cos_flag must be \"no_cos\" or \"full_cos\"')
+    solver.run_resonator_simulation_nocos(ref_array, print_modulus=False, print_interval=10)
+
+    solver.numerical_solution[-1] = right_condition(solver, solver.numerical_solution[-1], Delta, phi_arr, delta_arr)
+
+    if cos_flag == 'no_cos':
+        ref_array = copy.deepcopy(solver.energy)[:, ::-1]
+    else:
+        ref_array = copy.deepcopy(solver.numerical_solution)[:, ::-1]
+    solver.numerical_solution = solver.numerical_solution[::-1]
+    solver.run_resonator_simulation_nocos(ref_array, print_modulus=False, print_interval=10)
+
+    solver.numerical_solution[-1] = left_condition(solver.numerical_solution[-1], Frensel_refl)
+    solver.numerical_solution = solver.numerical_solution[::-1]
 
 
 def mcf_resonator_simulation():
