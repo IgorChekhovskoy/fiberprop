@@ -1,5 +1,3 @@
-import copy
-
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 
 from fiberprop.propagation import *
@@ -66,6 +64,8 @@ def mcf_resonator_simulation():
     equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
                                          coupling_coefficient=c_coef, E_sat=E_sat, g_0=g_0, alpha=0.0,
                                          beta2=0.0, gamma=0.0, noise_amplitude=noise_amplitude)
+    # TODO: не работает, потому что в случае beta2 = 0 матрица D является квадратной, а должна быть одномерным массивом
+    #  (надо обработать)
 
     # параметры граничных условий
     Delta = 6*pi  # полуширина решёток
@@ -84,28 +84,40 @@ def mcf_resonator_simulation():
 
     solver.convert_to_dimensionless(coupling_coefficient=c_coef, beta2=0.0, gamma=0.0)  # обезразмериваем
 
-    N_iter = 1000  # количество итераций в резонаторе
-    counter = 0
-    while counter < N_iter:
+    N_iter = 1000 - 1  # количество итераций в резонаторе
+    for _ in trange(N_iter):
         make_iteration(solver, Delta, phi_arr, delta_arr, Frensel_refl)
 
     solver.convert_to_dimensional(coupling_coefficient=c_coef, beta2=0.0, gamma=0.0)  # возвращаем размерность
+    old_solution = copy.deepcopy(solver.numerical_solution)
+    old_energy = copy.deepcopy(solver.energy)
+    solver.convert_to_dimensionless(coupling_coefficient=c_coef, beta2=0.0, gamma=0.0)
+    make_iteration(solver, Delta, phi_arr, delta_arr, Frensel_refl)
+    solver.convert_to_dimensional(coupling_coefficient=c_coef, beta2=0.0, gamma=0.0)
+    current_solution = copy.deepcopy(solver.numerical_solution)
+    current_energy = copy.deepcopy(solver.energy)
 
-    # TODO: графики строятся пока непоказательные (просто какие-то)
-    energies = [solver.energy[i, :] for i in range(solver.eq.size)]
-    names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, energies, title_text='Динамика энергии',
-                  names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
+    chosen_core = 2
+    my_energies = {f'{N_iter}-iteration': old_energy[chosen_core, :],
+                   f'{N_iter+1}-iteration': current_energy[chosen_core, :]}
+    plot2D_dict(solver.z, my_energies, xlabel='z, m', ylabel='E, pJ')
 
-    peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
-    names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
-    plot2D_plotly(solver.z, peak_powers, title_text='Динамика пиковой мощности',
-                  names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
+    my_spectrum_phase = {f'{N_iter}-iteration': np.angle(fft(old_solution[0, chosen_core, :])),
+                         f'{N_iter + 1}-iteration': np.angle(fft(current_solution[0, chosen_core, :]))}
+    plot2D_dict(solver.omega/(2*pi), my_spectrum_phase, xlabel='$\\omega / (2 \\pi)$', ylabel='phase($A^-_2 (\\omega, z=0)$)')
 
-    plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][3]) ** 2,
-                             np.abs(solver.numerical_solution[solver.com.N][3]) ** 2],
-                  title_text='Сравнение профиля импульса в начале и в конце',
-                  names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
+    my_spectrum_magnitude = {f'{N_iter + 1}-iteration: {idx}-core': abs(fft(current_solution[0, chosen_core, :]))
+                             for idx in range(solver.eq.size)}
+    plot2D_dict(solver.omega/(2*pi), my_spectrum_magnitude, xlabel='$\\omega / (2 \\pi)$', ylabel='$|A^-_2 (\\omega, z=0)|$')
+
+    all_spectrum_magnitudes = {f'{N_iter}-iteration': abs(fft(old_solution[0, chosen_core, :])),
+                         f'{N_iter + 1}-iteration': abs(fft(current_solution[0, chosen_core, :]))}
+    plot2D_multicore(solver.omega/(2*pi), all_spectrum_magnitudes, xlabel='$\\omega / (2 \\pi)$',
+                ylabel='$|A^-_n (\\omega, z=0)|$')
+
+    all_magnitudes = {f'{N_iter + 1}-iteration: {idx}-core': abs(current_solution[:, idx, solver.com.M//2+1])**2
+                  for idx in range(solver.eq.size)}
+    plot2D_multicore(solver.z, all_magnitudes, xlabel='z, m', ylabel='$|A^-_n (t=0, z)|$')
 
 
 if __name__ == '__main__':

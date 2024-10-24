@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import numpy as np
+from sympy import false
 
 
 def plot3D(z, t, field, name, filename=None, file_format='png', yscale='linear'):
@@ -138,3 +139,93 @@ def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_te
     else:
         fig.show()
         print('plot2D_plotly: \tDone')
+
+
+def plot2D_dict(x_arr, func_dict, xlabel='x', ylabel='y', title='', log_scale=false):
+    """ Функция строит и выводит набор двумерных графиков на одном рисунке по словарю """
+    fig = plt.figure(figsize=(9, 6), frameon=True)
+    plt.style.use('ggplot')
+    plt.rcParams['mathtext.fontset'] = 'cm'
+    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.size'] = 15
+    plt.rcParams['text.color'] = 'black'
+    plt.rcParams['xtick.color'] = 'black'
+    plt.rcParams['ytick.color'] = 'black'
+    plt.rcParams['axes.labelcolor'] = 'black'
+    ax = fig.add_subplot(111)
+
+    ax.spines['bottom'].set_color('black')
+    ax.spines['top'].set_color('black')
+    ax.spines['right'].set_color('black')
+    ax.spines['left'].set_color('black')
+
+    ax.set(facecolor='w')
+    ax.grid('axis = "both"', color='gray')
+
+    ax.set_xlabel(xlabel, labelpad=-10)
+    ax.set_ylabel(ylabel, labelpad=-10)
+    ax.set_title(title)
+
+    colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k']  # Красный, зеленый, синий и т.д.
+    markers = ['o', 's', 'D', '^', 'v', '<', '>']  # Круг, квадрат, ромб и т.д.
+    line_theme = zip(colors, markers)
+
+    if log_scale:
+        for i, line_label in enumerate(func_dict):
+            color, marker = line_theme[i]
+            ax.semilogy(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
+                        linewidth=2, label=line_label)
+    else:
+        for i, line_label in enumerate(func_dict):
+            color, marker = line_theme[i]
+            ax.plot(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
+                    linewidth=2, label=line_label)
+
+    ax.legend(loc=2)
+    plt.show()
+    plt.close(fig)
+    print('plot2D_dict: \tDone')
+    return
+
+
+def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel=''):
+    ncols = 2
+    nrows = len(func_dict)//ncols if (len(func_dict)%ncols == 0) else (len(func_dict)//ncols + 1)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(10, 12), frameon=True)
+    plt.style.use('ggplot')
+    plt.rcParams['mathtext.fontset'] = 'cm'
+    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.size'] = 15
+    plt.rcParams['text.color'] = 'black'
+    plt.rcParams['xtick.color'] = 'black'
+    plt.rcParams['ytick.color'] = 'black'
+    plt.rcParams['axes.labelcolor'] = 'black'
+
+    axs.spines['bottom'].set_color('black')
+    axs.spines['top'].set_color('black')
+    axs.spines['right'].set_color('black')
+    axs.spines['left'].set_color('black')
+
+    axs.set(facecolor='w')
+    axs.grid('axis = "both"', color='gray')
+
+    axs.set_xlabel(xlabel, labelpad=-10)
+    axs.set_xlabel(ylabel, labelpad=-10)
+
+    axs = axs.flatten()
+    for i, label in enumerate(func_dict):
+        axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
+        axs[i].set_xlabel(xlabel)
+        axs[i].set_ylabel(ylabel)
+        axs[i].legend()
+        axs[i].grid()
+
+    if not (len(func_dict)%ncols == 0):
+        empty_num = nrows * ncols - len(func_dict)
+        for i in range(empty_num):
+            fig.delaxes(axs[-1 - i])
+
+    plt.show()
+    plt.close(fig)
+    print('plot2D_multicore: \tDone')
+    return

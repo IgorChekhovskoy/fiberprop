@@ -104,12 +104,13 @@ def Newton_method(func, func_der, prev_val, epsilon=1e-3):
 
 def nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, step):
     """ Нелинейный оператор (Керр и насыщение), метод первого порядка """
-    local_g = g_0 * (2*E_sat + E_total) / (E_sat + E_total)
-    P_0 = np.abs(psi)**2
-    P = P_0 * np.exp(local_g * step)
-    phi = np.angle(psi) - P_0 * gamma/local_g + P * gamma/local_g
-    psi = np.sqrt(P) * np.exp(1j * phi)
-    return psi
+    n = len(psi)
+    for i in range(n):
+        local_g = g_0[i] * (2*E_sat[i] + E_total[i]) / (E_sat[i] + E_total[i])
+        P_0 = np.abs(psi[i])**2
+        P = P_0 * np.exp(local_g * step)
+        phi = np.angle(psi[i]) - P_0 * gamma[i]/local_g + P * gamma[i]/local_g
+        psi[i] = np.sqrt(P) * np.exp(1j * phi)
 
 
 def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
@@ -120,7 +121,7 @@ def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, 
             energy_forward[i] = get_energy_rectangles(psi[i], tau)
 
     E_total = energy_forward + energy_backward
-    psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
+    nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
 
     psi = fft(psi, axis=1)
     psi = linear_step(psi, D)
@@ -131,7 +132,7 @@ def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, 
             energy_forward[i] = get_energy_rectangles(psi[i], tau)
 
     E_total = energy_forward + energy_backward
-    psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
+    nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
 
     if noise_amplitude != 0.0:
         current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
@@ -145,7 +146,7 @@ def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_
     E_total = get_energy_simpson(abs(psi_forward)**2 + abs(psi_backward)**2 +
                                  2*(psi_forward.conjugate() * psi_backward).real,
                                  tau)
-    psi_forward = nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
+    nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
 
     psi_forward = fft(psi_forward, axis=1)
     psi_forward = linear_step(psi_forward, D)
@@ -154,7 +155,7 @@ def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_
     E_total = get_energy_simpson(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
                                  2 * (psi_forward.conjugate() * psi_backward).real,
                                  tau)
-    psi_forward = nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
+    nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
     if noise_amplitude != 0.0:
         current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi_forward.shape) +
                          1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi_forward.shape))
