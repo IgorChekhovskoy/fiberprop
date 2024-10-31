@@ -1,5 +1,6 @@
 import copy
 
+import numpy as np
 from tqdm import trange
 from scipy.fft import fftfreq
 from dataclasses import dataclass, field
@@ -426,9 +427,11 @@ class Solver:
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
 
     def calculate_D_matrix(self):
-        if all(self.eq.beta2) == 0.0:
-            self.D = create_simple_dispersion_free_matrix(self.linear_coeffs_array, self.eq.alpha, self.eq.g_0,
-                                                          self.com.h)
+        if all(self.eq.beta2 == 0.0):
+            single_matrix = create_simple_dispersion_free_matrix(self.linear_coeffs_array, self.eq.alpha,
+                                                                 self.eq.g_0, self.com.h)
+            flat_mat = single_matrix.flatten()
+            self.D = np.full((self.com.M, self.eq.size**2), flat_mat).T
         else:
             self.D = get_pade_exponential2(create_freq_matrix(self.linear_coeffs_array, self.eq.beta2,
                                                               self.eq.alpha, self.eq.g_0,
@@ -512,7 +515,7 @@ class Solver:
         if print_modulus:
             fig, ax, line = init_modulus_plot()
 
-        for n in trange(self.com.N):
+        for n in range(self.com.N):
             # Выполнение на NumPy
             self.numerical_solution[n + 1] = ssfm_order1_resonator_nocos(self.numerical_solution[n], self.energy[:, n], backward_energy[:, n],
                                                                          self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0,
@@ -654,11 +657,21 @@ class Solver:
         self.eq.E_sat /= energy_scale  # [1]
         self.eq.alpha /= coupling_coefficient*1e5  # [1]
         self.eq.g_0 /= coupling_coefficient*1e2  # [1]
+        dimensional_coupling_coefficient = self.eq.coupling_coefficient
         self.eq.coupling_coefficient = 1.0  # [1]
         self.__measure_flag = False
         self.eq.__post_init__()
         self.calculate_D_matrix()
-        self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
+
+        self.linear_coeffs_array /= dimensional_coupling_coefficient
+        self.linear_coeffs_array += np.diag(np.full(self.eq.size, -self_coefficient))
+        print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
+
+        self.get_neighbors()
+        if gamma != 0.0:  # Пока нет реализации для уравнений Манакова
+            self.nonlinear_cubic_coeffs_array /= self.nonlinear_cubic_coeffs_array
+        else:
+            self.nonlinear_cubic_coeffs_array = np.zeros_like(self.nonlinear_cubic_coeffs_array)
 
         cores = np.arange(self.eq.size, dtype=float)
         _, Zn, Tn = np.meshgrid(cores, self.z, self.t)  # [1], нормированные расчётные сетки по t по z
@@ -716,7 +729,13 @@ class Solver:
         self.__measure_flag = True
         self.eq.__post_init__()
         self.calculate_D_matrix()
-        self.set_configuration()  # здесь обновляются nonlinear_cubic_coeffs_array и linear_coeffs_array
+
+        self.linear_coeffs_array -= np.diag(np.full(self.eq.size, -self_coefficient))
+        self.linear_coeffs_array *= coupling_coefficient  # Пока нет реализации для уравнений Манакова
+        print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
+
+        self.get_neighbors()
+        self.nonlinear_cubic_coeffs_array *= gamma
 
         cores = np.arange(self.eq.size, dtype=float)
         _, Zn, Tn = np.meshgrid(cores, self.z/length_scale, self.t/time_scale)  # [1], нормированные расчётные сетки по t по z

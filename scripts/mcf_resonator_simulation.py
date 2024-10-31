@@ -79,7 +79,7 @@ def mcf_resonator_simulation():
     perturbation_array = np.random.uniform(-perturbation_scale, perturbation_scale, equation_params.size)
     central_idx = equation_params.size//2
     perturbation_array[central_idx] = 0.0
-    perturbation_array[central_idx] = -1.0 * np.sum(perturbation_array)
+    perturbation_array[central_idx] = - np.sum(perturbation_array)
     solver.set_reflective_index_perturbations(perturbation_array * k)
 
     solver.convert_to_dimensionless(coupling_coefficient=c_coef, beta2=0.0, gamma=0.0)  # обезразмериваем

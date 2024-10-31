@@ -168,16 +168,15 @@ def plot2D_dict(x_arr, func_dict, xlabel='x', ylabel='y', title='', log_scale=fa
 
     colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k']  # Красный, зеленый, синий и т.д.
     markers = ['o', 's', 'D', '^', 'v', '<', '>']  # Круг, квадрат, ромб и т.д.
-    line_theme = zip(colors, markers)
 
     if log_scale:
         for i, line_label in enumerate(func_dict):
-            color, marker = line_theme[i]
+            color, marker = colors[i], markers[i]
             ax.semilogy(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
                         linewidth=2, label=line_label)
     else:
         for i, line_label in enumerate(func_dict):
-            color, marker = line_theme[i]
+            color, marker = colors[i], markers[i]
             ax.plot(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
                     linewidth=2, label=line_label)
 
