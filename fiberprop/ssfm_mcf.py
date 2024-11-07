@@ -4,7 +4,7 @@ from scipy.fft import fft, ifft
 from .pulses import *
 
 
-def get_energy_simpson(arr_func, time_step):
+def get_simpson_integral(arr_func, time_step):
     """ Возвращает величину энергии (интеграл считается по формуле Симпсона) """
     n = len(arr_func)
 
@@ -143,18 +143,18 @@ def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, 
 
 def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
     """ Реализация схемы расщепления для резонатора с учётом взаимодействия несущих частот прямой и обратной волн """
-    E_total = get_energy_simpson(abs(psi_forward)**2 + abs(psi_backward)**2 +
-                                 2*(psi_forward.conjugate() * psi_backward).real,
-                                 tau)
+    E_total = get_simpson_integral(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
+                                   2 * (psi_forward.conjugate() * psi_backward).real,
+                                   tau)
     nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
 
     psi_forward = fft(psi_forward, axis=1)
     psi_forward = linear_step(psi_forward, D)
     psi_forward = ifft(psi_forward, axis=1)
 
-    E_total = get_energy_simpson(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
-                                 2 * (psi_forward.conjugate() * psi_backward).real,
-                                 tau)
+    E_total = get_simpson_integral(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
+                                   2 * (psi_forward.conjugate() * psi_backward).real,
+                                   tau)
     nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
     if noise_amplitude != 0.0:
         current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi_forward.shape) +

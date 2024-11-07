@@ -190,28 +190,25 @@ def plot2D_dict(x_arr, func_dict, xlabel='x', ylabel='y', title='', log_scale=fa
 def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel=''):
     ncols = 2
     nrows = len(func_dict)//ncols if (len(func_dict)%ncols == 0) else (len(func_dict)//ncols + 1)
-    fig, axs = plt.subplots(nrows, ncols, figsize=(10, 12), frameon=True)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, nrows*6), frameon=True)
     plt.style.use('ggplot')
     plt.rcParams['mathtext.fontset'] = 'cm'
     plt.rcParams['font.family'] = 'Times New Roman'
-    plt.rcParams['font.size'] = 15
+    plt.rcParams['font.size'] = 10
     plt.rcParams['text.color'] = 'black'
     plt.rcParams['xtick.color'] = 'black'
     plt.rcParams['ytick.color'] = 'black'
     plt.rcParams['axes.labelcolor'] = 'black'
 
-    axs.spines['bottom'].set_color('black')
-    axs.spines['top'].set_color('black')
-    axs.spines['right'].set_color('black')
-    axs.spines['left'].set_color('black')
-
-    axs.set(facecolor='w')
-    axs.grid('axis = "both"', color='gray')
-
-    axs.set_xlabel(xlabel, labelpad=-10)
-    axs.set_xlabel(ylabel, labelpad=-10)
-
     axs = axs.flatten()
+    for ax in axs:
+        ax.spines['bottom'].set_color('black')
+        ax.spines['top'].set_color('black')
+        ax.spines['right'].set_color('black')
+        ax.spines['left'].set_color('black')
+        ax.set(facecolor='w')
+        ax.grid('axis = "both"', color='gray')
+
     for i, label in enumerate(func_dict):
         axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
         axs[i].set_xlabel(xlabel)
@@ -227,4 +224,3 @@ def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel=''):
     plt.show()
     plt.close(fig)
     print('plot2D_multicore: \tDone')
-    return

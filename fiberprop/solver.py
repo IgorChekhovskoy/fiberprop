@@ -616,7 +616,8 @@ class Solver:
         self.linear_coeffs_array += np.diag(perturbation_arr)
 
     def convert_to_dimensionless(self, coupling_coefficient, gamma, beta2,
-                                 reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
+                                 reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
+                                 print_flag=True):
         """
         Функция приводит размерное решение к безразмерному виду
         Примечание:
@@ -665,7 +666,8 @@ class Solver:
 
         self.linear_coeffs_array /= dimensional_coupling_coefficient
         self.linear_coeffs_array += np.diag(np.full(self.eq.size, -self_coefficient))
-        print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
+        if print_flag:
+            print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
         self.get_neighbors()
         if gamma != 0.0:  # Пока нет реализации для уравнений Манакова
@@ -685,7 +687,8 @@ class Solver:
 
 
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
-                               reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1):
+                               reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
+                               print_flag=True):
         """ Функция приводит безразмерное решение к размерному виду
         Примечание:
         reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
@@ -732,7 +735,8 @@ class Solver:
 
         self.linear_coeffs_array -= np.diag(np.full(self.eq.size, -self_coefficient))
         self.linear_coeffs_array *= coupling_coefficient  # Пока нет реализации для уравнений Манакова
-        print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
+        if print_flag:
+            print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
         self.get_neighbors()
         self.nonlinear_cubic_coeffs_array *= gamma

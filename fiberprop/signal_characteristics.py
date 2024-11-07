@@ -2,7 +2,7 @@ from matplotlib import pyplot as plt
 from scipy.signal import find_peaks
 import numpy as np
 
-from fiberprop.ssfm_mcf import get_energy_simpson
+from fiberprop.ssfm_mcf import get_simpson_integral
 
 
 def VolumetricPowerField(dirName, Z, T, A, B):
@@ -60,11 +60,11 @@ def EnergyEvo(dirName, A, B, n, M, N, step, z1, z2):
     z = np.arange(N)
     for i in range(n + 1):
         if i == n:
-            F = lambda x: get_energy_simpson(P_single[x], step)
+            F = lambda x: get_simpson_integral(P_single[x], step)
             E_z = np.vectorize(F)(z)
             asw.append(E_z / 1e6)
             continue
-        F = lambda x: get_energy_simpson(P[i][x], step)
+        F = lambda x: get_simpson_integral(P[i][x], step)
         E_z = np.vectorize(F)(z)
         asw.append(E_z / 1e6)
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -643,7 +643,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     texts = []
     sumPow = 0.0
     for i in range(num):
-        energy = get_energy_simpson(P[i][outId], t_step)
+        energy = get_simpson_integral(P[i][outId], t_step)
         meanPower = energy/(t2-t1)
         sumPow += meanPower
     if config == 'ring':
@@ -651,7 +651,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * i / (num)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = get_energy_simpson(P[i][outId], t_step)
+            energy = get_simpson_integral(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} fiberprop:\n{round(value, 1)}%'
@@ -659,7 +659,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
     elif config == 'ring_with_central':
         point = (0, 0)
         points.append(point)
-        energy = get_energy_simpson(P[0][outId], t_step)
+        energy = get_simpson_integral(P[0][outId], t_step)
         meanPower = energy / (t2 - t1)
         value = 100 * meanPower / sumPow  # в процентах
         text = f'0 fiberprop:\n{round(value, 1)}%'
@@ -668,7 +668,7 @@ def PowerDistribution(dirName, A, N, M, num, t_step, t1, t2, z1, z2, outZ, confi
             phi = 2 * np.pi * (i - 1) / (num - 1)
             point = (-R * np.cos(phi), R * np.sin(phi))
             points.append(point)
-            energy = get_energy_simpson(P[i][outId], t_step)
+            energy = get_simpson_integral(P[i][outId], t_step)
             meanPower = energy / (t2 - t1)
             value = 100 * meanPower / sumPow  # в процентах
             text = f'{i} fiberprop:\n{round(value, 1)}%'
