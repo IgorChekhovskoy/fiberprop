@@ -1,16 +1,8 @@
-from importlib import reload
-
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 from fiberprop.coupling_coefficient import Fiber, Light, FiberMaterial, get_coupling_coefficients
 
-from fiberprop import propagation
-from fiberprop import ssfm_mcf
-
-reload(propagation)
-reload(ssfm_mcf)
-
-from fiberprop.propagation import *
-from fiberprop.ssfm_mcf import *
+from fiberprop.drawing import *
+from fiberprop.pulses import gaussian_pulse
 
 
 def test_mcf_compression():

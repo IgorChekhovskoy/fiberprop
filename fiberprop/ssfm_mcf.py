@@ -1,11 +1,12 @@
 import copy
 
+from numba import njit
 from scipy.fft import fft, ifft
 from .pulses import *
 
 
 def get_simpson_integral(arr_func, time_step):
-    """ Возвращает величину энергии (интеграл считается по формуле Симпсона) """
+    """ Возвращает величину интеграла по формуле Симпсона """
     n = len(arr_func)
 
     if n % 2 == 0:
@@ -15,7 +16,18 @@ def get_simpson_integral(arr_func, time_step):
 
     return summ * time_step / 3
 
+@njit(inline='always', cache=True)
+def get_energy_Simpson(arr_func, time_step):
+    """ Возвращает величину энергии (интеграл считается по формуле Симпсона) """
+    power_arr = np.abs(arr_func)**2
+    n = len(arr_func)
+    summ = power_arr[n - 2] + 4*power_arr[n-1] + power_arr[0]
+    for i in range(1, n - 1, 2):
+        summ += power_arr[i - 1] + 4*power_arr[i] + power_arr[i + 1]
+    return summ * time_step / 3
 
+
+@njit(inline='always', cache=True)
 def get_energy_rectangles(arr_func, time_step):
     """ Возвращает величину энергии (интеграл считается по формуле левых прямоугольников) """
     return np.sum(np.abs(arr_func)**2) * time_step
@@ -41,6 +53,7 @@ def nonlinear_step(psi, gamma, E_sat, g_0, current_energy, step):
         psi[i] = np.sqrt(P) * np.exp(1j * phi)
 
 
+@njit
 def linear_step(psi, Dmat):
     """ Линейный оператор (связи, дисперсия и потери) """
     n = len(psi)
@@ -102,43 +115,44 @@ def Newton_method(func, func_der, prev_val, epsilon=1e-3):
     return new_val
 
 
+@njit(inline='always', cache=True)
 def nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, step):
     """ Нелинейный оператор (Керр и насыщение), метод первого порядка """
     n = len(psi)
+    new_psi = np.empty_like(psi)
     for i in range(n):
         local_g = g_0[i] * (2*E_sat[i] + E_total[i]) / (E_sat[i] + E_total[i])
         P_0 = np.abs(psi[i])**2
         P = P_0 * np.exp(local_g * step)
         phi = np.angle(psi[i]) - P_0 * gamma[i]/local_g + P * gamma[i]/local_g
-        psi[i] = np.sqrt(P) * np.exp(1j * phi)
+        new_psi[i] = np.sqrt(P) * np.exp(1j * phi)
+    return new_psi
 
 
+@njit(inline='always')
 def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):
     """ Реализация схемы расщепления для резонатора без учёта взаимодействия несущих частот прямой и обратной волн """
-    num = len(psi)
-    for i in range(num):
-        if g_0[i] != 0.0:  # нет усиления
-            energy_forward[i] = get_energy_rectangles(psi[i], tau)
-
+    energy_forward = np.copy(energy_forward)  # copy.deepcopy(energy_forward)
     E_total = energy_forward + energy_backward
-    nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
+    new_psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
 
-    psi = fft(psi, axis=1)
-    psi = linear_step(psi, D)
-    psi = ifft(psi, axis=1)
+    new_psi = fft(new_psi, axis=1)
+    new_psi = linear_step(new_psi, D)
+    new_psi = ifft(new_psi, axis=1)
 
+    num, _ = psi.shape
     for i in range(num):
         if g_0[i] != 0.0:
-            energy_forward[i] = get_energy_rectangles(psi[i], tau)
+            energy_forward[i] = get_energy_Simpson(new_psi[i], tau)
 
     E_total = energy_forward + energy_backward
-    nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
+    new_psi = nonlinear_step_order1_resonator(new_psi, gamma, E_sat, g_0, E_total, h/2)
 
     if noise_amplitude != 0.0:
         current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
                          1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
-        psi += current_noise
-    return psi
+        new_psi += current_noise
+    return new_psi
 
 
 def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_0, h, tau, noise_amplitude=0.0):

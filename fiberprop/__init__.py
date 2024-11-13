@@ -2,7 +2,6 @@
 
 from .drawing import *
 from .matrices import *
-from .propagation import *
 from .pulses import *
 from .signal_characteristics import *
 from .spectrum_characteristics import *

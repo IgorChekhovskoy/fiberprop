@@ -2,17 +2,10 @@ from importlib import reload
 
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 from fiberprop.coupling_coefficient import Fiber, Light, FiberMaterial, get_coupling_coefficients
-from fiberprop import propagation
-from fiberprop import ssfm_mcf
-
-reload(propagation)
-from fiberprop.propagation import *
-
-reload(ssfm_mcf)
-from fiberprop.ssfm_mcf import *
+from fiberprop.drawing import *
 
 try:
-    from fiberprop import ssfm_mcf_pytorch, ssfm_mcf, propagation
+    from fiberprop import ssfm_mcf_pytorch, ssfm_mcf
 
     reload(ssfm_mcf_pytorch)
     from fiberprop.ssfm_mcf_pytorch import *

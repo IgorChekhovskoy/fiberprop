@@ -1,7 +1,7 @@
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
 from fiberprop.coupling_coefficient import Fiber, Light, FiberMaterial, get_coupling_coefficients
- 
-from fiberprop.propagation import *
+
+from fiberprop.drawing import *
 from fiberprop.ssfm_mcf import *
 
 

@@ -1,4 +1,3 @@
-from fiberprop.propagation import *
 from fiberprop.drawing import *
 from fiberprop.matrices import get_ring_coupling_matrix
 from fiberprop.pulses import fundamental_soliton, gain_loss_soliton

@@ -141,8 +141,81 @@ def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_te
         print('plot2D_plotly: \tDone')
 
 
-def plot2D_dict(x_arr, func_dict, xlabel='x', ylabel='y', title='', log_scale=false):
+def plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale=False, marker_flag=True):
+    colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k']  # Красный, зеленый, синий и т.д.
+    markers = ['o', 's', 'D', '^', 'v', '<', '>']  # Круг, квадрат, ромб и т.д.
+
+    if log_scale:
+        for i, line_label in enumerate(func_dict):
+            color, marker = colors[i], markers[i]
+            marker = marker if marker_flag else ''
+            ax.semilogy(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
+                        linewidth=2, label=line_label)
+    else:
+        for i, line_label in enumerate(func_dict):
+            color, marker = colors[i], markers[i]
+            marker = marker if marker_flag else ''
+            ax.plot(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
+                    linewidth=2, label=line_label)
+    ax.legend(loc=2)
+
+
+def plot2D_dict(x_arr, func_dict, y_min=0, y_max=10, xlabel='x', ylabel='y', title='', log_scale=False, marker_flag=True):
     """ Функция строит и выводит набор двумерных графиков на одном рисунке по словарю """
+    fig, ax = create_single_ax(xlabel, ylabel, y_min, y_max, title)
+    plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale, marker_flag)
+    plt.show()
+    plt.close(fig)
+    print('plot2D_dict: \tDone')
+
+
+def plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict):
+    for i, label in enumerate(func_dict):
+        axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
+        axs[i].legend()
+
+
+def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=4.2):
+    fig, axs = create_multicore_axs(len(func_dict), xlabel, ylabel, y_min, y_max)
+    plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict)
+    plt.show()
+    plt.close(fig)
+    print('plot2D_multicore: \tDone')
+
+
+def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max):
+    ncols = 2
+    nrows = axs_num // ncols if (axs_num % ncols == 0) else (axs_num // ncols + 1)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, nrows * 6), frameon=True)
+    plt.style.use('ggplot')
+    plt.rcParams['mathtext.fontset'] = 'cm'
+    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['text.color'] = 'black'
+    plt.rcParams['xtick.color'] = 'black'
+    plt.rcParams['ytick.color'] = 'black'
+    plt.rcParams['axes.labelcolor'] = 'black'
+
+    axs = axs.flatten()
+    for ax in axs:
+        ax.spines['bottom'].set_color('black')
+        ax.spines['top'].set_color('black')
+        ax.spines['right'].set_color('black')
+        ax.spines['left'].set_color('black')
+        ax.set(facecolor='w')
+        ax.grid('axis = "both"', color='gray')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(y_min, y_max)
+
+    if not (axs_num % ncols == 0):
+        empty_num = nrows * ncols - axs_num
+        for i in range(empty_num):
+            fig.delaxes(axs[-1 - i])
+    return fig, axs
+
+
+def create_single_ax(xlabel, ylabel, y_min, y_max, title=''):
     fig = plt.figure(figsize=(9, 6), frameon=True)
     plt.style.use('ggplot')
     plt.rcParams['mathtext.fontset'] = 'cm'
@@ -162,65 +235,8 @@ def plot2D_dict(x_arr, func_dict, xlabel='x', ylabel='y', title='', log_scale=fa
     ax.set(facecolor='w')
     ax.grid('axis = "both"', color='gray')
 
-    ax.set_xlabel(xlabel, labelpad=-10)
-    ax.set_ylabel(ylabel, labelpad=-10)
     ax.set_title(title)
-
-    colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k']  # Красный, зеленый, синий и т.д.
-    markers = ['o', 's', 'D', '^', 'v', '<', '>']  # Круг, квадрат, ромб и т.д.
-
-    if log_scale:
-        for i, line_label in enumerate(func_dict):
-            color, marker = colors[i], markers[i]
-            ax.semilogy(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
-                        linewidth=2, label=line_label)
-    else:
-        for i, line_label in enumerate(func_dict):
-            color, marker = colors[i], markers[i]
-            ax.plot(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
-                    linewidth=2, label=line_label)
-
-    ax.legend(loc=2)
-    plt.show()
-    plt.close(fig)
-    print('plot2D_dict: \tDone')
-    return
-
-
-def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel=''):
-    ncols = 2
-    nrows = len(func_dict)//ncols if (len(func_dict)%ncols == 0) else (len(func_dict)//ncols + 1)
-    fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, nrows*6), frameon=True)
-    plt.style.use('ggplot')
-    plt.rcParams['mathtext.fontset'] = 'cm'
-    plt.rcParams['font.family'] = 'Times New Roman'
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['text.color'] = 'black'
-    plt.rcParams['xtick.color'] = 'black'
-    plt.rcParams['ytick.color'] = 'black'
-    plt.rcParams['axes.labelcolor'] = 'black'
-
-    axs = axs.flatten()
-    for ax in axs:
-        ax.spines['bottom'].set_color('black')
-        ax.spines['top'].set_color('black')
-        ax.spines['right'].set_color('black')
-        ax.spines['left'].set_color('black')
-        ax.set(facecolor='w')
-        ax.grid('axis = "both"', color='gray')
-
-    for i, label in enumerate(func_dict):
-        axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
-        axs[i].set_xlabel(xlabel)
-        axs[i].set_ylabel(ylabel)
-        axs[i].legend()
-        axs[i].grid()
-
-    if not (len(func_dict)%ncols == 0):
-        empty_num = nrows * ncols - len(func_dict)
-        for i in range(empty_num):
-            fig.delaxes(axs[-1 - i])
-
-    plt.show()
-    plt.close(fig)
-    print('plot2D_multicore: \tDone')
+    ax.set_xlabel(xlabel, labelpad=5)
+    ax.set_ylabel(ylabel, labelpad=5)
+    ax.set_ylim(y_min, y_max)
+    return fig, ax

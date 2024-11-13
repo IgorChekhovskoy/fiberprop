@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from typing import Union
 from math import sqrt, pi
 from enum import Enum
+from numba import njit
 
 from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
 from .pulses import gain_loss_soliton
 from .drawing import *
-from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos
+from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos, get_energy_Simpson
 from .stationary_solution_solver import find_stationary_solution
 
 try:
@@ -124,12 +125,12 @@ class EquationParameters:
         print('\"size\" -- количество сердцевин в MCF, целое число;')
         print('\"ring_number\" -- количество коаксиальных колец в MCF ?, вещественное число.\n')
 
-        print('\"beta2\" -- коэффициент дисперсии групповых скоростей [ps^2/km];')
+        print('\"beta2\" -- коэффициент дисперсии групповых скоростей [ps^2/m];')
         print('\"gamma\" -- коэффициент нелинейности Керра [1/(W*m)];')
         print('\"E_sat\" -- энергия насыщения [pJ];')
-        print('\"alpha\" -- коэффициент потерь [1/km];')
+        print('\"alpha\" -- коэффициент потерь [1/m];')
         print('\"g_0\" -- ненасыщенное усиление [1/m];')
-        print('\"coupling_coefficient\" -- коэффициент линейных связей [1/cm].\n')
+        print('\"coupling_coefficient\" -- коэффициент линейных связей [1/m].\n')
         print('\"noise_amplitude\" -- амплитуда аддитивного белого равномерного шума, '
               'добавляемого на каждом шаге [sqrt(W/2)].\n')
 
@@ -421,7 +422,7 @@ class Solver:
                                                                   key, val in pulse_params.items()})
 
         for k in range(self.eq.size):
-            self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
+            self.energy[k][0] = get_energy_Simpson(self.numerical_solution[0][k], self.com.tau)
 
         for k in range(self.eq.size):
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
@@ -503,7 +504,7 @@ class Solver:
         if print_modulus:
             finalize_plot()
 
-    def run_resonator_simulation_nocos(self, backward_energy, print_modulus=False, print_interval=10):
+    def run_resonator_simulation_nocos(self, backward_energy):
         """
         Без учёта взаимодействия частот прямой и обратной волн.
         в перспективе для более высокого порядка можно добавить флаг
@@ -511,29 +512,9 @@ class Solver:
         if self.D is None:
             self.calculate_D_matrix()
 
-        # Инициализация графика, если нужно
-        if print_modulus:
-            fig, ax, line = init_modulus_plot()
-
-        for n in range(self.com.N):
-            # Выполнение на NumPy
-            self.numerical_solution[n + 1] = ssfm_order1_resonator_nocos(self.numerical_solution[n], self.energy[:, n], backward_energy[:, n],
-                                                                         self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0,
-                                                                         self.com.h, self.com.tau, self.eq.noise_amplitude)
-
-            for k in range(self.eq.size):
-                self.energy[k][n + 1] = get_energy_rectangles(self.numerical_solution[n + 1][k], self.com.tau)
-
-            for k in range(self.eq.size):
-                self.peak_power[k][n + 1] = np.max(np.abs(self.numerical_solution[n + 1][k]) ** 2)
-
-            # Обновление графика через каждые `print_interval` шагов, если включен флаг `print_modulus`
-            if print_modulus and (n + 1) % print_interval == 0:
-                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
-
-        # Закрытие интерактивного режима после завершения симуляции
-        if print_modulus:
-            finalize_plot()
+        fast_nocos_resonator_run(self.com.N, self.eq.size, self.numerical_solution, self.energy, backward_energy,
+                                 self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h, self.com.tau,
+                                 self.eq.noise_amplitude)
 
     def run_resonator_simulation_fullcos(self, backward_solution, print_modulus=False, print_interval=10):
         """
@@ -636,9 +617,9 @@ class Solver:
         else:
             raise RuntimeError('Unsupportable MCF configuration')
 
-        time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
-        power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
-        length_scale = (1e-2 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
+        time_scale = sqrt(0.5*abs(beta2) / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
+        power_scale = (coupling_coefficient / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
+        length_scale = (1 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
         energy_scale = power_scale * time_scale
 
         self.com.T1 /= time_scale  # [1]
@@ -656,8 +637,8 @@ class Solver:
         self.eq.beta2 = np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
         self.eq.gamma = 1.0 if gamma != 0.0 else 0.0  # [1]
         self.eq.E_sat /= energy_scale  # [1]
-        self.eq.alpha /= coupling_coefficient*1e5  # [1]
-        self.eq.g_0 /= coupling_coefficient*1e2  # [1]
+        self.eq.alpha /= coupling_coefficient  # [1]
+        self.eq.g_0 /= coupling_coefficient  # [1]
         dimensional_coupling_coefficient = self.eq.coupling_coefficient
         self.eq.coupling_coefficient = 1.0  # [1]
         self.__measure_flag = False
@@ -697,7 +678,7 @@ class Solver:
         Параметры:
             coupling_coefficient [1/cm]
             gamma [1/(W*m)]
-            beta2 [ps^2/km]
+            beta2 [ps^2/m]
          """
         if self.eq.core_configuration is CoreConfig.empty_ring:
             self_coefficient = 2
@@ -706,9 +687,9 @@ class Solver:
         else:
             raise RuntimeError('Unsupportable MCF configuration')
 
-        time_scale = sqrt(0.5*abs(beta2)*1e-5 / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
-        power_scale = (coupling_coefficient*1e2 / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
-        length_scale = (1e-2 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
+        time_scale = sqrt(0.5*abs(beta2) / coupling_coefficient) if beta2 != 0.0 else reserve_time_scale  # [ps]
+        power_scale = (coupling_coefficient / gamma) if gamma != 0.0 else reserve_power_scale  # [W]
+        length_scale = (1 / coupling_coefficient) if coupling_coefficient != 0.0 else reserve_length_scale  # [m]
         energy_scale = power_scale * time_scale
 
         self.com.T1 *= time_scale  # [ps]
@@ -723,11 +704,11 @@ class Solver:
         self.com.h *= length_scale  # [m]
         if self.z is not None: self.z *= length_scale  # [m]
 
-        self.eq.beta2 = beta2  # [ps^2/km]
+        self.eq.beta2 = beta2  # [ps^2/m]
         self.eq.gamma = gamma  # [1/(W*m)]
         self.eq.E_sat *= energy_scale  # [pJ]
-        self.eq.alpha *= coupling_coefficient*1e5  # [1/km]
-        self.eq.g_0 *= coupling_coefficient*1e2  # [1/m]
+        self.eq.alpha *= coupling_coefficient  # [1/m]
+        self.eq.g_0 *= coupling_coefficient  # [1/m]
         self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
         self.__measure_flag = True
         self.eq.__post_init__()
@@ -795,3 +776,16 @@ def update_modulus_plot(fig, ax, line, data, n):
 def finalize_plot():
     plt.ioff()
     plt.show()
+
+
+@njit(inline='always')
+def fast_nocos_resonator_run(N, eq_size, numsol_array, self_energy, backward_energy,
+                             D_mat, gamma, E_sat, g_0, h, tau, noise_amplitude):
+    for k in range(eq_size):
+        self_energy[k][0] = get_energy_Simpson(numsol_array[0][k], tau)
+    for n in range(N):
+        numsol_array[n + 1] = ssfm_order1_resonator_nocos(numsol_array[n], self_energy[:, n], backward_energy[:, n],
+                                                          D_mat, gamma, E_sat, g_0,
+                                                          h, tau, noise_amplitude)
+        for j in range(eq_size):
+            self_energy[j][n + 1] = get_energy_Simpson(numsol_array[n + 1][j], tau)

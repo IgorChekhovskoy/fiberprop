@@ -1,4 +1,4 @@
-from fiberprop.propagation import *
+from fiberprop.solver import *
 
 
 def test_equation_parameters_initialization_with_scalars():
