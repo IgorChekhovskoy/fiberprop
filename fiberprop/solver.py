@@ -12,7 +12,7 @@ from numba import njit
 from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
 from .pulses import gain_loss_soliton
 from .drawing import *
-from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos, get_energy_Simpson
+from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos
 from .stationary_solution_solver import find_stationary_solution
 
 try:
@@ -422,7 +422,7 @@ class Solver:
                                                                   key, val in pulse_params.items()})
 
         for k in range(self.eq.size):
-            self.energy[k][0] = get_energy_Simpson(self.numerical_solution[0][k], self.com.tau)
+            self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
 
         for k in range(self.eq.size):
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
@@ -782,10 +782,10 @@ def finalize_plot():
 def fast_nocos_resonator_run(N, eq_size, numsol_array, self_energy, backward_energy,
                              D_mat, gamma, E_sat, g_0, h, tau, noise_amplitude):
     for k in range(eq_size):
-        self_energy[k][0] = get_energy_Simpson(numsol_array[0][k], tau)
+        self_energy[k][0] = get_energy_rectangles(numsol_array[0][k], tau)
     for n in range(N):
         numsol_array[n + 1] = ssfm_order1_resonator_nocos(numsol_array[n], self_energy[:, n], backward_energy[:, n],
                                                           D_mat, gamma, E_sat, g_0,
                                                           h, tau, noise_amplitude)
         for j in range(eq_size):
-            self_energy[j][n + 1] = get_energy_Simpson(numsol_array[n + 1][j], tau)
+            self_energy[j][n + 1] = get_energy_rectangles(numsol_array[n + 1][j], tau)
