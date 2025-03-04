@@ -210,21 +210,16 @@ def print_matrix(matrix, name='matrix'):
 
 class Solver:
 
-    def __init__(self, com: ComputationalParameters, eq: EquationParameters, measure_flag=False,
+    def __init__(self, com: ComputationalParameters, eq: EquationParameters, use_dimensional=False,
                  pulses=gain_loss_soliton, pulse_params_list=None, use_gpu=False, precision='float64'):
         self.com = com
         self.eq = eq
-        self.__measure_flag = measure_flag  # размерная или безразмерная задача
+        self.use_dimensional = use_dimensional  # безразмерная или размерная задача
         self.use_gpu = use_gpu and USE_TORCH  # Устанавливаем режим GPU только если PyTorch доступен
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         self.precision = precision
         self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
         self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
-
-        dimensionless_valid_coefs = {0.0, 1.0}
-        valid_condition = all([eq.coupling_coefficient[i] in dimensionless_valid_coefs for i in range(eq.size)])
-        if (not self.__measure_flag) and not valid_condition:
-            raise RuntimeError("In dimensionless problem coupling_coefficient can be equal only 1.0 or 0.0 !!!")
 
         print("use_gpu =", self.use_gpu)
 
@@ -323,7 +318,7 @@ class Solver:
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
         self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
 
-        central_coef = 0.0 if self.__measure_flag else 1.0  # у размерной задачи на диагонали должны быть нули
+        central_coef = 0.0 if self.use_dimensional else 1.0  # у размерной задачи на диагонали должны быть нули
         if self.eq.core_configuration is CoreConfig.ring_with_center:
             for j in range(1, self.eq.size):
                 self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
@@ -592,13 +587,13 @@ class Solver:
         """
         Функция изменяет матрицу связей на диагонали
         """
-        if not self.__measure_flag:
+        if not self.use_dimensional:
             raise RuntimeError("You can set perturbations of the reflective indexes only in dimensional case")
         self.linear_coeffs_array += np.diag(perturbation_arr)
 
     def convert_to_dimensionless(self, coupling_coefficient, gamma, beta2,
                                  reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
-                                 print_flag=True):
+                                 print_linear_coeffs_array=True):
         """
         Функция приводит размерное решение к безразмерному виду
         Примечание:
@@ -641,13 +636,13 @@ class Solver:
         self.eq.g_0 /= coupling_coefficient  # [1]
         dimensional_coupling_coefficient = self.eq.coupling_coefficient
         self.eq.coupling_coefficient = 1.0  # [1]
-        self.__measure_flag = False
+        self.use_dimensional = False
         self.eq.__post_init__()
         self.calculate_D_matrix()
 
         self.linear_coeffs_array /= dimensional_coupling_coefficient
         self.linear_coeffs_array += np.diag(np.full(self.eq.size, -self_coefficient))
-        if print_flag:
+        if print_linear_coeffs_array:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
         self.get_neighbors()
@@ -669,7 +664,7 @@ class Solver:
 
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
                                reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
-                               print_flag=True):
+                               print_linear_coeffs_array=True):
         """ Функция приводит безразмерное решение к размерному виду
         Примечание:
         reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
@@ -710,13 +705,13 @@ class Solver:
         self.eq.alpha *= coupling_coefficient  # [1/m]
         self.eq.g_0 *= coupling_coefficient  # [1/m]
         self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
-        self.__measure_flag = True
+        self.use_dimensional = True
         self.eq.__post_init__()
         self.calculate_D_matrix()
 
         self.linear_coeffs_array -= np.diag(np.full(self.eq.size, -self_coefficient))
         self.linear_coeffs_array *= coupling_coefficient  # Пока нет реализации для уравнений Манакова
-        if print_flag:
+        if print_linear_coeffs_array:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
         self.get_neighbors()

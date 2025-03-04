@@ -1,6 +1,5 @@
 import torch
 import torch.fft as fft
-import numpy as np
 
 
 def get_energy_rectangles_pytorch(arr_func, time_step):
@@ -61,7 +60,7 @@ def ssfm_order2_pytorch(psi, current_energy, D, gamma, E_sat, g_0, h, tau, noise
     nonlinear_step_pytorch(psi, gamma, E_sat, g_0, current_energy, h / 2)
 
     if noise_amplitude != 0.0:
-        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
-                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
+        current_noise = (torch.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
+                         1j*torch.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
         psi += current_noise
     return psi
