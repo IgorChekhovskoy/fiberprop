@@ -204,7 +204,7 @@ class Fiber:
 
     @core_radius.setter
     def core_radius(self, arg):
-        if not isinstance(arg, float):
+        if not isinstance(arg, float) and not isinstance(arg, int):
             raise TypeError('Core radius should be float')
         self._core_radius = arg
 
@@ -279,6 +279,11 @@ class Fiber:
         return dbdwA * 1e+9
 
     def get_beta2(self, light):
+        """
+
+        :param light:
+        :return: beta2 [(ps^2)/km]
+        """
         light_copy = copy.deepcopy(light)
         fiber_copy = copy.deepcopy(self)
         lambda0 = light_copy.lambda0

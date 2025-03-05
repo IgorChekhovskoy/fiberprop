@@ -72,7 +72,7 @@ def int_integral(fiber, light, core_center_coords, core_indexes, x, y):
 
 
 def get_coupling_coefficients(fiber, light, eps=1e-3, proc_num=1):
-    """ Первый выход - матрица связей [1/cm], второй выход - матрица ожидаемых абсолютных ошибок [1/cm] """
+    """ Первый выход - матрица связей [1/m], второй выход - матрица ожидаемых абсолютных ошибок [1/m] """
     R = 0.5 * fiber.cladding_diameter
     core_count = fiber.core_count
     distance_to_fiber_center = fiber.distance_to_fiber_center
@@ -143,7 +143,7 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, proc_num=1):
             error_mat[m][p] = (full_err_up_est - full_err_low_est) * 1e+4 / 2
             error_mat[p][m] = (full_err_up_est - full_err_low_est) * 1e+4 / 2
 
-    return coup_mat, error_mat
+    return coup_mat * 1e+2, error_mat * 1e+2
 
 
 def get_coupling_coeff_2_core_fiber(fiber, light):

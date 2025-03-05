@@ -1,6 +1,3 @@
-import copy
-
-import numpy as np
 from tqdm import trange
 from scipy.fft import fftfreq
 from dataclasses import dataclass, field
@@ -10,25 +7,46 @@ from enum import Enum
 from numba import njit
 
 from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
-from .pulses import gain_loss_soliton
+from .pulses import zero_pulse
 from .drawing import *
 from .ssfm_mcf import ssfm_order2, get_energy_rectangles, ssfm_order1_resonator_nocos, ssfm_order1_resonator_fullcos
 from .stationary_solution_solver import find_stationary_solution
 
 try:
     import torch
-
-    USE_TORCH = True
-    from ssfm_mcf_pytorch import get_energy_rectangles_pytorch, nonlinear_step_pytorch, linear_step_pytorch, \
-        ssfm_order2_pytorch
+    is_torch_available = True
 except ImportError:
-    USE_TORCH = False
+    is_torch_available = False
 
+from .ssfm_mcf_pytorch import get_energy_rectangles_pytorch, ssfm_order2_pytorch
 
 @dataclass
 class ComputationalParameters:
-    N: int = 0  # количество шагов, а не точек
-    M: int = 0  # количество учитываемых точек по времени
+    """
+        Класс для хранения вычислительных параметров моделирования.
+
+        Определяет сеточные параметры и физические границы расчетной области.
+
+        Атрибуты:
+        ::
+            N (int): Количество шагов по эволюционной переменной (не точек)
+            M (int): Количество точек временной сетки
+            L1 (float): Начало расчетной области по эволюционной переменной [m]
+            L2 (float): Конец расчетной области по эволюционной переменной [m]
+            T1 (float): Начало временного окна [ps]
+            T2 (float): Конец временного окна [ps]
+            damp_length (float): Доля узлов с поглощающими условиями на краях [безразмерная]
+
+        Вычисляемые атрибуты:
+        ::
+            h (float): Шаг по эволюционной переменной [m], вычисляется как (L2-L1)/N
+            tau (float): Шаг по времени [ps], вычисляется как (T2-T1)/M
+
+        Пример использования:
+            >>> params = ComputationalParameters(N=1000, M=512, L1=0.0, L2=1.0, T1=-10.0, T2=10.0)
+        """
+    N: int = 0
+    M: int = 0
     L1: float = 0.0
     L2: float = 0.0
     T1: float = 0.0
@@ -61,21 +79,67 @@ class ComputationalParameters:
         print('\"T1, T2\" -- границы расчётной области по времени [ps].\n')
         print('\"damp_length\" -- доля узлов временной сетки, на которых по краям действует условие поглощения [1].\n')
 
+
 @dataclass
 class CoreConfig(Enum):
-    not_set: int = 0  # конфигурация не задана
-    empty_ring: int = 1  # 1d круговая без центральной сердцевиной
-    square: int = 2  # 2d квадратная решетка
-    hexagonal: int = 3  # 2d гексагональная решетка
-    manakov_eq: int = 4  # уравнения Манакова
-    dual_core: int = 5  # два ядра
-    ring_with_center: int = 6  # 1d круговая с центральной сердцевиной
+    """
+    Перечисление возможных конфигураций сердцевин.
+
+    Варианты:
+    ::
+        not_set (0): Конфигурация не определена (значение по умолчанию)
+        empty_ring (1): 1D круговая конфигурация без центральной сердцевины
+        square (2): 2D квадратная решётка сердцевин
+        hexagonal (3): 2D гексагональная (шестиугольная) решётка сердцевин
+        manakov_eq (4): Модель с уравнениями Манакова (учёт поляризационных эффектов)
+        dual_core (5): Двухсердцевинная конфигурация
+        ring_with_center (6): 1D комбинированная конфигурация (кольцо + центральная сердцевина)
+    """
+    not_set: int = 0
+    empty_ring: int = 1
+    square: int = 2
+    hexagonal: int = 3
+    manakov_eq: int = 4
+    dual_core: int = 5
+    ring_with_center: int = 6
 
 @dataclass
 class EquationParameters:
-    """ core_configuration - конфигурация сердцевин в MCF (тип CoreConfig)
-        ring_number - число колец для 2d конфигураций. Радиус, ограничивающий некоторое число колец в 2d конфигурациях
-        """
+    """
+    Класс для хранения физических параметров уравнений моделирования.
+
+    Содержит параметры, определяющие свойства оптического волокна/резонатора и условия моделирования.
+
+    Атрибуты:
+    ::
+        core_configuration (CoreConfig): Конфигурация сердцевин (из перечисления CoreConfig)
+        size (int): Количество сердцевин в мультисердцевинном волокне
+        ring_number (float): Количество коаксиальных колец для 2D конфигураций
+
+        beta2 (float | np.ndarray | list): Коэффициент дисперсии групповых скоростей [ps²/m]
+        gamma (float | np.ndarray | list): Коэффициент нелинейности Керра [1/(W·m)]
+        E_sat (float | np.ndarray | list): Энергия насыщения [pJ]
+        alpha (float | np.ndarray | list): Коэффициент потерь [1/m]
+        g_0 (float | np.ndarray | list): Ненасыщенное усиление [1/m]
+        coupling_coefficient (float | np.ndarray | list): Коэффициент связи между сердцевинами [1/m]
+        noise_amplitude (float): Амплитуда аддитивного белого шума  [sqrt(W/2)]
+
+    Особенности:
+    ::
+        - Параметры beta2, gamma, E_sat, alpha, g_0 и coupling_coefficient могут быть заданы как:
+          * Скаляр - одинаковое значение для всех сердцевин
+          * Список/массив - индивидуальные значения для каждой сердцевины
+        - При инициализации скалярные значения автоматически преобразуются в массивы
+
+    Пример использования:
+        >>> eq_params = EquationParameters(
+        ...     core_configuration=CoreConfig.hexagonal,
+        ...     size=7,
+        ...     beta2=-20.5,  # Общее значение для всех сердцевин
+        ...     gamma=[1.2, 1.3, 1.4, 1.3, 1.2, 1.1, 1.0],  # Индивидуальные значения
+        ...     coupling_coefficient=0.5
+        ... )
+    """
     core_configuration: CoreConfig
     size: int = 1
     ring_number: float = 0
@@ -208,20 +272,104 @@ def print_matrix(matrix, name='matrix'):
     print('\n')
 
 
+def make_eq_mask_from_eq_size(eq_size, core_configuration):
+    length = eq_size
+    temp_array_size = int(2.0 * (1.0 + 3.0 * length * (length + 1.0)))
+    temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
+    center = temp_array_size // 2
+
+    if core_configuration is CoreConfig.ring_with_center:
+        for i in range(eq_size + 1):
+            temp_array[0][i] = True
+
+    elif ((core_configuration is CoreConfig.empty_ring) or
+          (core_configuration is CoreConfig.manakov_eq)):
+        for i in range(eq_size):
+            temp_array[0][i] = True
+
+    print_temp_array(temp_array_size, temp_array)
+
+    mask_array = []
+    index_1d = 0
+    for i in range(temp_array_size):
+        for j in range(temp_array_size):
+            if temp_array[i][j]:
+                mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
+                index_1d += 1
+
+    return index_1d, mask_array
+
+
+def make_eq_mask_from_ring_number(ring_number, core_configuration):
+    length = int(ring_number)
+    temp_array_size = int(2.0 * (1.0 + 3.0 * length * (length + 1.0)))
+    temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
+    center = temp_array_size // 2
+
+    if core_configuration is CoreConfig.square:
+        for i in range(temp_array_size):
+            for j in range(temp_array_size):
+                if (i - center) ** 2 + (j - center) ** 2 <= ring_number ** 2 + 1e-13:
+                    temp_array[i][j] = True
+
+    elif core_configuration is CoreConfig.hexagonal:
+        h_i = 1.0
+        h_j = 1.0 / sqrt(3.0)
+        for i in range(temp_array_size):
+            for j in range(temp_array_size):
+                if (h_i * (i - center)) ** 2 + (
+                        h_j * (j - center)) ** 2 <= ring_number ** 2 * 4.0 / 3.0 + 1e-10 and \
+                        (i + j - 2 * center) % 2 == 0:
+                    temp_array[i][j] = True
+
+    print_temp_array(temp_array_size, temp_array)
+
+    mask_array = []
+    index_1d = 0
+    for i in range(temp_array_size):
+        for j in range(temp_array_size):
+            if temp_array[i][j]:
+                mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
+                index_1d += 1
+
+    return index_1d, mask_array
+
+
 class Solver:
 
-    def __init__(self, com: ComputationalParameters, eq: EquationParameters, use_dimensional=False,
-                 pulses=gain_loss_soliton, pulse_params_list=None, use_gpu=False, precision='float64'):
+    def __init__(
+            self,
+            com: ComputationalParameters,
+            eq: EquationParameters,
+            use_dimensional=False,
+            pulses=zero_pulse,
+            pulse_params_list=None,
+            # initial_condition: np.ndarray = None,
+            use_gpu=False,
+            use_torch=False,
+            precision='float64'
+    ):
         self.com = com
         self.eq = eq
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
-        self.use_gpu = use_gpu and USE_TORCH  # Устанавливаем режим GPU только если PyTorch доступен
-        self.device = torch.device('cuda' if self.use_gpu else 'cpu')
+        self.use_gpu = use_gpu and is_torch_available  # Устанавливаем режим GPU только если PyTorch доступен
+        self.use_torch = (use_torch and is_torch_available) or (self.use_gpu and is_torch_available)
+        self.device = None
+        if self.use_torch:
+            self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         self.precision = precision
         self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
         self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
 
-        print("use_gpu =", self.use_gpu)
+        if self.use_gpu:
+            print("Using GPU", end=' ')
+        else:
+            print("Using CPU", end=' ')
+
+        if self.use_torch:
+            print("with PyTorch")
+        else:
+            print("with NumPy")
 
         # Ensure pulses and pulse_params_list are lists or apply them to all equations
         if not isinstance(pulses, list):
@@ -262,49 +410,6 @@ class Solver:
         self.set_configuration()
         self.initialize_arrays()
 
-    def make_eq_mask(self):
-        length = max(int(self.eq.ring_number), self.eq.size)
-        temp_array_size = int(2.0 * (1.0 + 3.0 * length * (length + 1.0)))
-        temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
-        center = temp_array_size // 2
-
-        if self.eq.core_configuration is CoreConfig.ring_with_center:
-            for i in range(self.eq.size + 1):
-                temp_array[0][i] = True
-
-        elif ((self.eq.core_configuration is CoreConfig.empty_ring) or
-              (self.eq.core_configuration is CoreConfig.manakov_eq)):
-            for i in range(self.eq.size):
-                temp_array[0][i] = True
-
-        elif self.eq.core_configuration is CoreConfig.square:
-            for i in range(temp_array_size):
-                for j in range(temp_array_size):
-                    if (i - center) ** 2 + (j - center) ** 2 <= self.eq.ring_number ** 2 + 1e-13:
-                        temp_array[i][j] = True
-
-        elif self.eq.core_configuration is CoreConfig.hexagonal:
-            h_i = 1.0
-            h_j = 1.0 / sqrt(3.0)
-            for i in range(temp_array_size):
-                for j in range(temp_array_size):
-                    if (h_i * (i - center)) ** 2 + (
-                            h_j * (j - center)) ** 2 <= self.eq.ring_number ** 2 * 4.0 / 3.0 + 1e-10 and \
-                            (i + j - 2 * center) % 2 == 0:
-                        temp_array[i][j] = True
-
-        print_temp_array(temp_array_size, temp_array)
-
-        self.mask_array = []
-        index_1d = 0
-        for i in range(temp_array_size):
-            for j in range(temp_array_size):
-                if temp_array[i][j]:
-                    self.mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
-                    index_1d += 1
-
-        return index_1d
-
     def set_configuration(self):
         if type(self.eq.core_configuration) is not CoreConfig:
             raise ValueError("Non-existent fiberprop configuration!")
@@ -312,7 +417,13 @@ class Solver:
         if self.eq.ring_number < 0:
             raise ValueError("ring_number must be positive or zero!")
 
-        self.eq.size = self.make_eq_mask()
+        if (self.eq.core_configuration is CoreConfig.ring_with_center or
+                self.eq.core_configuration is CoreConfig.empty_ring):
+            self.eq.size, self.mask_array = make_eq_mask_from_eq_size(self.eq.size, self.eq.core_configuration)
+
+        if (self.eq.core_configuration is CoreConfig.square or
+                self.eq.core_configuration is CoreConfig.hexagonal):
+            self.eq.size, self.mask_array = make_eq_mask_from_ring_number(self.eq.ring_number, self.eq.core_configuration)
 
         # Initialize arrays
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
@@ -448,7 +559,7 @@ class Solver:
         if self.D is None:
             self.calculate_D_matrix()
         # TODO: Может выделить случай use_gpu в отдельную функцию?
-        if self.use_gpu:
+        if self.use_torch:
             # Инициализация тензоров на GPU с использованием to()
             psi_gpu = torch.tensor(self.numerical_solution[0], dtype=self.ctype).to(self.device, non_blocking=True)
             energy_gpu = torch.tensor(self.energy[:, 0], dtype=self.dtype).to(self.device, non_blocking=True)
@@ -462,7 +573,7 @@ class Solver:
             fig, ax, line = init_modulus_plot(yscale=yscale)
 
         for n in trange(self.com.N):
-            if self.use_gpu:
+            if self.use_torch:
                 # Выполнение на PyTorch
                 psi_gpu = ssfm_order2_pytorch(psi_gpu, energy_gpu, D_gpu, gamma_gpu, E_sat_gpu, g_0_gpu, self.com.h,
                                               self.com.tau, self.eq.noise_amplitude)
@@ -476,7 +587,7 @@ class Solver:
                                                              self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h,
                                                              self.com.tau, self.com.damp_length, self.eq.noise_amplitude)
 
-            if self.use_gpu:
+            if self.use_torch:
                 for k in range(self.eq.size):
                     energy_gpu[k] = get_energy_rectangles_pytorch(psi_gpu[k], self.com.tau)
                 self.energy[:, n + 1] = energy_gpu.cpu().numpy()
@@ -491,7 +602,7 @@ class Solver:
             if print_modulus and (n + 1) % print_interval == 0:
                 update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
 
-        if self.use_gpu:
+        if self.use_torch:
             self.numerical_solution[-1] = psi_gpu.cpu().numpy()
             self.energy[:, -1] = energy_gpu.cpu().numpy()
 
@@ -546,7 +657,7 @@ class Solver:
     def get_analytical_solution(self):
         # TODO: Надо бы как-то корректно обработать случаи, когда есть аналитическое решение, а когда нет
         #  (для разных импульсов в зависимости от параметров волокна)
-        if ((any([pulse != gain_loss_soliton for pulse in self.pulses]) or
+        if ((any([pulse != zero_pulse for pulse in self.pulses]) or
              self.eq.core_configuration is not CoreConfig.empty_ring) and
                 self.eq.coupling_coefficient != 0.0):
             raise RuntimeError("Does not exist correctly analytical solution for this case yet")
@@ -595,16 +706,26 @@ class Solver:
                                  reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
                                  print_linear_coeffs_array=True):
         """
-        Функция приводит размерное решение к безразмерному виду
+        Функция приводит размерное уравнение
+
+         i dU/dz - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0
+
+         к безразмерному виду
+
+        i dU/dz + d^2U/dt^2 + |U|^2 U = 0.
+
         Примечание:
-        reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
-        reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
-        reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
+        ::
+            reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
+            reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
+            reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
         Параметры:
-            coupling_coefficient [1/cm]
+        ::
+            coupling_coefficient [1/m]
             gamma [1/(W*m)]
-            beta2 [ps^2/km]
+            beta2 [ps^2/m]
         """
+
         if self.eq.core_configuration is CoreConfig.empty_ring:
             self_coefficient = 2
         elif self.eq.core_configuration is CoreConfig.hexagonal:
@@ -629,7 +750,7 @@ class Solver:
         self.com.h /= length_scale  # [1]
         if self.z is not None: self.z /= length_scale  # [1]
 
-        self.eq.beta2 = np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
+        self.eq.beta2 = 2 * np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
         self.eq.gamma = 1.0 if gamma != 0.0 else 0.0  # [1]
         self.eq.E_sat /= energy_scale  # [1]
         self.eq.alpha /= coupling_coefficient  # [1]
@@ -647,7 +768,7 @@ class Solver:
 
         self.get_neighbors()
         if gamma != 0.0:  # Пока нет реализации для уравнений Манакова
-            self.nonlinear_cubic_coeffs_array /= self.nonlinear_cubic_coeffs_array
+            self.nonlinear_cubic_coeffs_array = np.where(self.nonlinear_cubic_coeffs_array != 0, 1.0, self.nonlinear_cubic_coeffs_array)
         else:
             self.nonlinear_cubic_coeffs_array = np.zeros_like(self.nonlinear_cubic_coeffs_array)
 
@@ -665,16 +786,26 @@ class Solver:
     def convert_to_dimensional(self, coupling_coefficient, gamma, beta2,
                                reserve_power_scale=1, reserve_time_scale=1, reserve_length_scale=1,
                                print_linear_coeffs_array=True):
-        """ Функция приводит безразмерное решение к размерному виду
+        """ Функция приводит безразмерное уравнение
+
+         i dU/dz + d^2U/dt^2 + |U|^2 U = 0
+
+         к размерному виду
+
+         i dU/dz - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0.
+
         Примечание:
-        reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
-        reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
-        reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
+        ::
+            reserve_time_scale -- масштаб по времени, если дисперсия равна нулю;
+            reserve_length_scale -- масштаб по длине, если коэффициент связи равен нулю;
+            reserve_power_scale -- масштаб мощности на периферии, если нелинейность равна нулю.
         Параметры:
-            coupling_coefficient [1/cm]
+        ::
+            coupling_coefficient [1/m]
             gamma [1/(W*m)]
             beta2 [ps^2/m]
          """
+
         if self.eq.core_configuration is CoreConfig.empty_ring:
             self_coefficient = 2
         elif self.eq.core_configuration is CoreConfig.hexagonal:
@@ -704,7 +835,7 @@ class Solver:
         self.eq.E_sat *= energy_scale  # [pJ]
         self.eq.alpha *= coupling_coefficient  # [1/m]
         self.eq.g_0 *= coupling_coefficient  # [1/m]
-        self.eq.coupling_coefficient = coupling_coefficient  # [1/cm]
+        self.eq.coupling_coefficient = coupling_coefficient  # [1/m]
         self.use_dimensional = True
         self.eq.__post_init__()
         self.calculate_D_matrix()

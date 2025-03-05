@@ -66,8 +66,8 @@ def mcf_compression():
     coupling_coefficient_estimated_error = err_mat[0][1]
 
     print(f'Lambda = {fiber.distance_to_fiber_center * 2.0} mkm')
-    print(f'k = {couping_coefficient} +- {coupling_coefficient_estimated_error} 1/cm')
-    print(f'L = {0.5 * np.pi / couping_coefficient} cm \n')
+    print(f'k = {couping_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
+    print(f'L = {0.5 * np.pi / couping_coefficient} m \n')
 
     gamma, gamma_error = fiber.get_gamma(light, eps=1e-2)
     print(f'Gamma = {gamma} +- {gamma_error} 1/(W*m)')

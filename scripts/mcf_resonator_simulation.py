@@ -88,7 +88,7 @@ def mcf_resonator_simulation():
     # delta_arr = np.array([4, 8, -12, -4, 0, -8, 12], dtype=float) * 2*pi
     Frensel_refl = 0.2
 
-    solver = Solver(computational_params, equation_params, measure_flag=True, pulses=zero_pulse, use_gpu=False)
+    solver = Solver(computational_params, equation_params, use_dimensional=True, pulses=zero_pulse, use_gpu=False)
 
     # perturbation_scale = 1e-6  # порядок отклонений коэффициента преломления (в сумме у них должен быть ноль)
     # perturbation_array = np.random.uniform(-perturbation_scale, perturbation_scale, equation_params.size)
