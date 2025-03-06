@@ -12,7 +12,7 @@ def test_stationary_solution_solver_conservative_mcf():
     beta2 = -2
 
     computational_params = ComputationalParameters(N=2000, M=2 ** 13, L1=0, L2=10, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=beta2, gamma=1)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_count=1, beta2=beta2, gamma=1)
 
     solver = Solver(computational_params, equation_params,
                     pulses=fundamental_soliton, pulse_params_list=[

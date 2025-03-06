@@ -10,12 +10,12 @@ def test_mcf_compression_dimensionless():
     PRA 2016, Fig.10, 91.6% combining, 6.37 compression
     """
     computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=0, L2=1.78, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, ring_count=1, beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
 
     solver = Solver(computational_params, equation_params,
                     pulses=gaussian_pulse, pulse_params_list={"p": 0.687, "tau": 1.775},
                     use_gpu=True, use_torch=True)
-
+    
     solver.run_numerical_simulation()
 
     energies = [solver.energy[i, :] for i in range(solver.eq.size)]
@@ -105,7 +105,7 @@ def test_mcf_compression_dimensionless_to_dimensional():
     PRA 2016, Fig.10, 91.6% combining, 6.37 compression
     """
     computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=0, L2=1.78, T1=-30, T2=30)
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1, beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_count=1, beta2=-2.0, gamma=1.0, E_sat=0.0, alpha=0.0, g_0=0.0)
 
     solver = Solver(computational_params, equation_params,
                     pulses=gaussian_pulse, pulse_params_list={"p": 0.687, "tau": 1.775},
@@ -165,7 +165,7 @@ def test_mcf_compression_dimensional():
 
     computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T)
 
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_count=1,
                                          coupling_coefficient=coupling_coefficient, beta2=beta2, gamma=gamma,
                                          E_sat=0.0, alpha=0.0, g_0=0.0)
 
@@ -221,7 +221,7 @@ def test_mcf_compression_dimensional_to_dimensionless():
 
     computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T)
 
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_number=1,
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_count=1,
                                          coupling_coefficient=coupling_coefficient, beta2=beta2, gamma=gamma,
                                          E_sat=0.0, alpha=0.0, g_0=0.0)
 
@@ -256,8 +256,8 @@ def test_mcf_compression_dimensional_to_dimensionless():
 
 
 if __name__ == '__main__':
-    # test_mcf_compression_dimensionless()
-    test_mcf_compression_dimensionless_to_dimensional()
+    test_mcf_compression_dimensionless()
+    # test_mcf_compression_dimensionless_to_dimensional()
 
     # test_mcf_compression_dimensional()
     # test_mcf_compression_dimensional_to_dimensionless()

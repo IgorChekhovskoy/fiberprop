@@ -114,7 +114,8 @@ class EquationParameters:
     ::
         core_configuration (CoreConfig): Конфигурация сердцевин (из перечисления CoreConfig)
         size (int): Количество сердцевин в мультисердцевинном волокне
-        ring_number (float): Количество коаксиальных колец для 2D конфигураций
+        ring_count (float): Количество коаксиальных колец для 2D конфигураций
+        display_debug_info (bool): Выводить отладочную информацию
 
         beta2 (float | np.ndarray | list): Коэффициент дисперсии групповых скоростей [ps²/m]
         gamma (float | np.ndarray | list): Коэффициент нелинейности Керра [1/(W·m)]
@@ -142,7 +143,10 @@ class EquationParameters:
     """
     core_configuration: CoreConfig
     size: int = 1
-    ring_number: float = 0
+    ring_count: float = 0
+    display_debug_info: bool = True
+
+    mask_array = None
 
     beta2: Union[float, np.ndarray, list] = -1.0
     gamma: Union[float, np.ndarray, list] = 1.0
@@ -153,6 +157,21 @@ class EquationParameters:
     noise_amplitude: float = 0.0  # амплитуда аддитивного белого шума (на каждом шаге)
 
     def __post_init__(self):
+
+        if type(self.core_configuration) is not CoreConfig:
+            raise ValueError("Non-existent fiberprop configuration!")
+
+        if self.ring_count < 0:
+            raise ValueError("ring_count must be positive or zero!")
+
+        if self.core_configuration is CoreConfig.square or self.core_configuration is CoreConfig.hexagonal:
+            self.size = get_core_count(self.core_configuration, self.ring_count)
+
+        if self.display_debug_info:
+            print("eq.size =", self.size)
+
+        self.make_eq_mask()
+
         # Преобразование скалярных параметров и списков в массивы одинаковых значений
         if isinstance(self.beta2, (int, float, list)):
             self.beta2 = np.array(self.beta2, dtype=float)
@@ -179,6 +198,48 @@ class EquationParameters:
             if self.coupling_coefficient.ndim == 0:
                 self.coupling_coefficient = np.full(self.size, self.coupling_coefficient, dtype=float)
 
+    def make_eq_mask(self):
+        temp_array_size = int((1.0 + self.size * (self.size + 1.0)))
+        temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
+        center = temp_array_size // 2
+
+        if self.core_configuration is CoreConfig.ring_with_center:
+            for i in range(self.size + 1):
+                temp_array[0][i] = True
+
+        elif ((self.core_configuration is CoreConfig.empty_ring) or
+              (self.core_configuration is CoreConfig.manakov_eq)):
+            for i in range(self.size):
+                temp_array[0][i] = True
+
+        elif self.core_configuration is CoreConfig.square:
+            for i in range(temp_array_size):
+                for j in range(temp_array_size):
+                    if (i - center) ** 2 + (j - center) ** 2 <= self.ring_count ** 2 + 1e-13:
+                        temp_array[i][j] = True
+
+        elif self.core_configuration is CoreConfig.hexagonal:
+            h_i = 1.0
+            h_j = 1.0 / sqrt(3.0)
+            for i in range(temp_array_size):
+                for j in range(temp_array_size):
+                    if (h_i * (i - center)) ** 2 + (
+                            h_j * (j - center)) ** 2 <= self.ring_count ** 2 * 4.0 / 3.0 + 1e-10 and \
+                            (i + j - 2 * center) % 2 == 0:
+                        temp_array[i][j] = True
+
+        if self.display_debug_info:
+            print_temp_array(temp_array_size, temp_array)
+
+        self.mask_array = []
+        index_1d = 0
+        for i in range(temp_array_size):
+            for j in range(temp_array_size):
+                if temp_array[i][j]:
+                    self.mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
+                    index_1d += 1
+        # print("core count = ", index_1d)
+
     @staticmethod
     def get_info():
         """
@@ -187,7 +248,7 @@ class EquationParameters:
         print('\n\nEquationParameters:')
         print('\"core_configuration\" -- конфигурация MCF, объект класса \"CoreConfig\";')
         print('\"size\" -- количество сердцевин в MCF, целое число;')
-        print('\"ring_number\" -- количество коаксиальных колец в MCF ?, вещественное число.\n')
+        print('\"ring_count\" -- количество коаксиальных колец в MCF ?, вещественное число.\n')
 
         print('\"beta2\" -- коэффициент дисперсии групповых скоростей [ps^2/m];')
         print('\"gamma\" -- коэффициент нелинейности Керра [1/(W*m)];')
@@ -272,70 +333,129 @@ def print_matrix(matrix, name='matrix'):
     print('\n')
 
 
-def make_eq_mask_from_eq_size(eq_size, core_configuration):
-    length = eq_size
-    temp_array_size = int(2.0 * (1.0 + 3.0 * length * (length + 1.0)))
-    temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
-    center = temp_array_size // 2
+def get_core_count(core_configuration, ring_count: float) -> int:
+    """
+    Определяет количество сердцевин (core_count) в зависимости от номера кольца (ring_count).
 
-    if core_configuration is CoreConfig.ring_with_center:
-        for i in range(eq_size + 1):
-            temp_array[0][i] = True
+    Параметры:
+        core_configuration (CoreConfig): конфигурация расположения сердцевин
+        ring_count (float): Номер кольца (должен быть >= 0)
 
-    elif ((core_configuration is CoreConfig.empty_ring) or
-          (core_configuration is CoreConfig.manakov_eq)):
-        for i in range(eq_size):
-            temp_array[0][i] = True
+    Возвращает:
+        int: Количество сердцевин
 
-    print_temp_array(temp_array_size, temp_array)
-
-    mask_array = []
-    index_1d = 0
-    for i in range(temp_array_size):
-        for j in range(temp_array_size):
-            if temp_array[i][j]:
-                mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
-                index_1d += 1
-
-    return index_1d, mask_array
-
-
-def make_eq_mask_from_ring_number(ring_number, core_configuration):
-    length = int(ring_number)
-    temp_array_size = int(2.0 * (1.0 + 3.0 * length * (length + 1.0)))
-    temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
-    center = temp_array_size // 2
+    Исключения:
+        ValueError: Если ring_count отрицательный или слишком большой
+    """
+    if ring_count < 0:
+        raise ValueError("Номер кольца не может быть отрицательным")
 
     if core_configuration is CoreConfig.square:
-        for i in range(temp_array_size):
-            for j in range(temp_array_size):
-                if (i - center) ** 2 + (j - center) ** 2 <= ring_number ** 2 + 1e-13:
-                    temp_array[i][j] = True
-
+        return 0 # TODO
     elif core_configuration is CoreConfig.hexagonal:
-        h_i = 1.0
-        h_j = 1.0 / sqrt(3.0)
-        for i in range(temp_array_size):
-            for j in range(temp_array_size):
-                if (h_i * (i - center)) ** 2 + (
-                        h_j * (j - center)) ** 2 <= ring_number ** 2 * 4.0 / 3.0 + 1e-10 and \
-                        (i + j - 2 * center) % 2 == 0:
-                    temp_array[i][j] = True
+        sqrt3 = np.sqrt(3)  # ≈ 1.732
+        sqrt7 = np.sqrt(7)  # ≈ 2.645
+        sqrt12 = np.sqrt(12)  # ≈ 3.464
+        sqrt13 = np.sqrt(13)
 
-    print_temp_array(temp_array_size, temp_array)
-
-    mask_array = []
-    index_1d = 0
-    for i in range(temp_array_size):
-        for j in range(temp_array_size):
-            if temp_array[i][j]:
-                mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
-                index_1d += 1
-
-    return index_1d, mask_array
+        if 0 <= ring_count < 1:
+            return 1
+        elif 1 <= ring_count < sqrt3:
+            return 7
+        elif sqrt3 <= ring_count < 2:
+            return 13
+        elif 2 <= ring_count < sqrt7:
+            return 19
+        elif sqrt7 <= ring_count < 3:
+            return 31
+        elif 3 <= ring_count < sqrt12:
+            return 37
+        elif sqrt12 <= ring_count < sqrt13:
+            return 43
+        else:
+            raise ValueError("Тебе куда столько ядер? Солить будешь?")
+    return 0
 
 
 class Solver:
+    """
+        Основной класс для моделирования распространения сигнала в многосердцевинном волокне (multicore fiber -- MCF).
+
+        Решает уравнения типа нелинейного уравнения Шрёдингера с учетом:
+            - Дисперсии
+            - Нелинейности Керра
+            - Линейных связей между сердцевинами
+            - Потерь/усиления
+            - Шумовых эффектов
+
+        Поддерживает как CPU (NumPy, PyTorch), так и GPU (PyTorch) вычисления.
+
+        Параметры:
+        ----------
+            com : ComputationalParameters
+                Вычислительные параметры (сетка, шаги и т.д.)
+            eq : EquationParameters
+                Физические параметры уравнений
+            use_dimensional : bool, optional
+                Использовать размерные величины (по умолчанию False)
+            pulses : callable или list[callable], optional
+                Функция(и) для генерации начальных импульсов
+            pulse_params_list : dict или list[dict], optional
+                Параметры для функций импульсов
+            initial_condition : np.ndarray, optional
+                Предварительно вычисленное начальное условие формы (equation_size, M). Нужно задавать на выбор либо
+                pulses, либо initial_condition.
+            use_gpu : bool, optional
+                Использовать GPU для вычислений (требует PyTorch)
+            use_torch : bool, optional
+                Использовать PyTorch вместо NumPy
+            precision : str, optional
+                Точность вычислений: 'float32' или 'float64'
+            display_debug_info : bool, optional
+                Вывести отладочную информацию
+
+        Атрибуты:
+        ---------
+            numerical_solution : np.ndarray
+                3D массив решения формы (N+1, equation_size, M)
+            energy : np.ndarray
+                Энергия в каждой сердцевине по длине (equation_size, N+1)
+            peak_power : np.ndarray
+                Пиковая мощность в каждой сердцевине (equation_size, N+1)
+            analytical_solution : np.ndarray
+                Аналитическое решение (если доступно)
+
+        Основные методы:
+        ----------------
+            run_numerical_simulation()     : Основной метод для запуска моделирования
+            run_resonator_simulation_*()   : Методы для резонаторных конфигураций
+            calculate_error()              : Расчет ошибки относительно аналитического решения
+            convert_to_dimensionless()     : Нормировка уравнений к безразмерному виду
+            find_stationary_solution()     : Поиск стационарных решений
+
+        Примеры использования:
+        ----------------------
+        # Инициализация с аналитическими импульсами
+            solver = Solver(
+                com_params,
+                eq_params,
+                pulses=sech_pulse,
+                pulse_params_list={'A': [1.0, 0.9, 1.1], 't0': 0}
+            )
+
+        # Инициализация с готовым начальным условием
+            custom_initial = np.random.randn(7, 8192) + 1j*np.random.randn(7, 8192)
+            solver = Solver(
+                com_params,
+                eq_params,
+                initial_condition=custom_initial,
+                use_torch=True
+            )
+
+        # Запуск симуляции и визуализация
+            solver.run_numerical_simulation(print_modulus=True)
+            solver.plot_error()
+        """
 
     def __init__(
             self,
@@ -344,10 +464,11 @@ class Solver:
             use_dimensional=False,
             pulses=zero_pulse,
             pulse_params_list=None,
-            # initial_condition: np.ndarray = None,
+            initial_condition: np.ndarray = None,
             use_gpu=False,
             use_torch=False,
-            precision='float64'
+            precision='float64',
+            display_debug_info=True
     ):
         self.com = com
         self.eq = eq
@@ -361,15 +482,23 @@ class Solver:
         self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
         self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
 
-        if self.use_gpu:
-            print("Using GPU", end=' ')
-        else:
-            print("Using CPU", end=' ')
+        self.display_debug_info = display_debug_info
 
-        if self.use_torch:
-            print("with PyTorch")
-        else:
-            print("with NumPy")
+        if self.display_debug_info:
+            if self.use_gpu:
+                print("Using GPU", end=' ')
+            else:
+                print("Using CPU", end=' ')
+
+            if self.use_torch:
+                print("with PyTorch")
+            else:
+                print("with NumPy")
+
+        self.linear_coeffs_array = None
+        self.nonlinear_cubic_coeffs_array = None
+
+        self.set_configuration()
 
         # Ensure pulses and pulse_params_list are lists or apply them to all equations
         if not isinstance(pulses, list):
@@ -403,27 +532,17 @@ class Solver:
         self.L2_norm = None
         self.analytical_solution = None
 
-        self.linear_coeffs_array = None
-        self.nonlinear_cubic_coeffs_array = None
-        self.mask_array = None
-
-        self.set_configuration()
+        # Инициализация массивов
         self.initialize_arrays()
 
+        # Обработка начальных условий
+        if initial_condition is not None:
+            self.validate_initial_condition(initial_condition)
+            self.apply_initial_condition(initial_condition)
+        else:
+            self.initialize_with_pulses(pulses, pulse_params_list)
+
     def set_configuration(self):
-        if type(self.eq.core_configuration) is not CoreConfig:
-            raise ValueError("Non-existent fiberprop configuration!")
-
-        if self.eq.ring_number < 0:
-            raise ValueError("ring_number must be positive or zero!")
-
-        if (self.eq.core_configuration is CoreConfig.ring_with_center or
-                self.eq.core_configuration is CoreConfig.empty_ring):
-            self.eq.size, self.mask_array = make_eq_mask_from_eq_size(self.eq.size, self.eq.core_configuration)
-
-        if (self.eq.core_configuration is CoreConfig.square or
-                self.eq.core_configuration is CoreConfig.hexagonal):
-            self.eq.size, self.mask_array = make_eq_mask_from_ring_number(self.eq.ring_number, self.eq.core_configuration)
 
         # Initialize arrays
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
@@ -459,11 +578,11 @@ class Solver:
                 for j in range(self.eq.size):
                     for k in range(self.eq.size):
                         if j != k:
-                            if abs(self.mask_array[j].number_2d_x - self.mask_array[k].number_2d_x) == 1 and \
-                                    self.mask_array[j].number_2d_y == self.mask_array[k].number_2d_y:
+                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
+                                    self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
-                            if abs(self.mask_array[j].number_2d_y - self.mask_array[k].number_2d_y) == 1 and \
-                                    self.mask_array[j].number_2d_x == self.mask_array[k].number_2d_x:
+                            if abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1 and \
+                                    self.eq.mask_array[j].number_2d_x == self.eq.mask_array[k].number_2d_x:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
 
         elif self.eq.core_configuration is CoreConfig.hexagonal:
@@ -473,14 +592,15 @@ class Solver:
                 for j in range(self.eq.size):
                     for k in range(self.eq.size):
                         if j != k:
-                            if abs(self.mask_array[j].number_2d_x - self.mask_array[k].number_2d_x) == 2 and \
-                                    self.mask_array[j].number_2d_y == self.mask_array[k].number_2d_y:
+                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 2 and \
+                                    self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
-                            if abs(self.mask_array[j].number_2d_x - self.mask_array[k].number_2d_x) == 1 and \
-                                    abs(self.mask_array[j].number_2d_y - self.mask_array[k].number_2d_y) == 1:
+                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
+                                    abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1:
                                 self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
 
-        print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
+        if self.display_debug_info:
+            print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
         self.get_neighbors()
 
@@ -499,12 +619,13 @@ class Solver:
 
     def get_neighbors(self):
         for j in range(self.eq.size):
-            self.mask_array[j].neighbors.clear()
+            self.eq.mask_array[j].neighbors.clear()
             for k in range(self.eq.size):
                 if (self.linear_coeffs_array[j][k].real != 0 or self.linear_coeffs_array[j][k].imag != 0) and j != k:
-                    self.mask_array[j].neighbors.append(k)
+                    self.eq.mask_array[j].neighbors.append(k)
 
     def initialize_arrays(self):
+        """Создает пустые массивы для хранения результатов"""
         self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False)
         self.z = np.linspace(self.com.L1, self.com.L2, self.com.N + 1)
         self.omega = fftfreq(self.com.M, self.com.tau) * 2 * pi
@@ -514,23 +635,58 @@ class Solver:
         self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
         self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
 
+    def validate_initial_condition(self, initial_condition: np.ndarray):
+        """Проверяет корректность начального условия"""
+        if not isinstance(initial_condition, np.ndarray):
+            raise TypeError("Initial condition must be a numpy array")
+
+        expected_shape = (self.eq.size, self.com.M)
+        if initial_condition.shape != expected_shape:
+            raise ValueError(
+                f"Invalid initial condition shape: {initial_condition.shape}. "
+                f"Expected: {expected_shape}"
+            )
+
+    def apply_initial_condition(self, initial_condition: np.ndarray):
+        """Применяет заданное начальное условие"""
+        # Конвертируем в комплексный тип если нужно
+        self.numerical_solution[0] = initial_condition.astype(complex)
+
+        # Рассчитываем начальную энергию и мощность
+        for k in range(self.eq.size):
+            self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
+            self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
+
+    def initialize_with_pulses(self, pulses, pulse_params_list):
+        """Инициализация с помощью функций-генераторов импульсов"""
+        if not isinstance(pulses, list):
+            self.pulses = [pulses] * self.eq.size
+        else:
+            self.pulses = pulses
+
+        if pulse_params_list is None:
+            self.pulse_params_list = [{}] * self.eq.size
+        elif not isinstance(pulse_params_list, list):
+            self.pulse_params_list = [pulse_params_list] * self.eq.size
+        else:
+            self.pulse_params_list = pulse_params_list
+
+        if len(self.pulses) != self.eq.size:
+            raise ValueError("Number of pulse functions must match the number of equations")
+        if len(self.pulse_params_list) != self.eq.size:
+            raise ValueError("Number of pulse parameter dictionaries must match the number of equations")
+
         for k in range(self.eq.size):
             pulse_params = self.filter_params(self.pulses[k], self.pulse_params_list[k])
             if 'z' in self.pulses[k].__code__.co_varnames:
-                self.numerical_solution[0][k] = self.pulses[k](t=self.t, z=0,
-                                                               **{key: val[k] if isinstance(val, np.ndarray) else val
-                                                                  for
-                                                                  key, val in pulse_params.items()})
+                self.numerical_solution[0][k] = self.pulses[k](
+                    t=self.t, z=0, **pulse_params
+                )
             else:
-                self.numerical_solution[0][k] = self.pulses[k](t=self.t,
-                                                               **{key: val[k] if isinstance(val, np.ndarray) else val
-                                                                  for
-                                                                  key, val in pulse_params.items()})
+                self.numerical_solution[0][k] = self.pulses[k](t=self.t, **pulse_params)
 
         for k in range(self.eq.size):
             self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
-
-        for k in range(self.eq.size):
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
 
     def calculate_D_matrix(self):
@@ -866,7 +1022,7 @@ class Solver:
                                                               self.nonlinear_cubic_coeffs_array,
                                                               -self.eq.beta2 * 0.5,
                                                               self.omega2,
-                                                              self.mask_array,
+                                                              self.eq.mask_array,
                                                               self.eq.E_sat, self.eq.alpha, self.eq.g_0,
                                                               lambda_val,
                                                               max_iter=max_iter, tol=tol,
