@@ -1,11 +1,11 @@
-from fiberprop.solver import CoreConfig
-import multiprocessing
-from enum import Enum
 import math
 import copy
 import numpy as np
+import multiprocessing
+from enum import Enum
 
 from .light import Light
+from fiberprop.solver import CoreConfig, EquationParameters
 
 
 class FiberMaterial(Enum):
@@ -20,8 +20,11 @@ class FiberMaterial(Enum):
 class Fiber:
     """ Параметры волокна """
     # Параметры конфигурации
+    _eq = None
+
     _core_configuration = CoreConfig.not_set
     _core_count = 0
+    _ring_count = 0
     _cladding_diameter = 0.0
     _core_radius = 0.0
     _distance_to_fiber_center = 0.0
@@ -78,8 +81,23 @@ class Fiber:
         return self._core_count
 
     @property
+    def ring_count(self):
+        if self._ring_count == 0:
+            raise RuntimeError('Number of core ring for 2d configurations not set')
+        return self._ring_count
+
+    @property
+    def eq(self):
+        if self._eq is None:
+            raise RuntimeError('Equation not set')
+        return self._eq
+
+    @property
     def distance_to_fiber_center(self):
-        if self._distance_to_fiber_center == 0.0:
+        if isinstance(self._distance_to_fiber_center, (list, np.ndarray)):
+            if len(self._distance_to_fiber_center) == 0:
+                raise RuntimeError('Distance to fiber center not set')
+        elif self._distance_to_fiber_center == 0.0:
             raise RuntimeError('Distance to fiber center not set')
         return self._distance_to_fiber_center
 
@@ -190,10 +208,29 @@ class Fiber:
             raise TypeError('Core count should be integer')
         self._core_count = arg
 
+        if self._eq is None:
+            self._eq = EquationParameters(self._core_configuration, size=self._core_count)
+            self._ring_count = self._eq.ring_count
+
+    @ring_count.setter
+    def ring_count(self, arg):
+        if not isinstance(arg, int) and not isinstance(arg, float):
+            raise TypeError('Ring count should be integer or float')
+        self._ring_count = arg
+
+        if self._eq is None:
+            self._eq = EquationParameters(self._core_configuration, ring_count=self._ring_count)
+            self._core_count = self._eq.size
+
     @distance_to_fiber_center.setter
     def distance_to_fiber_center(self, arg):
-        if not isinstance(arg, float):
-            raise TypeError('Distance to fiber center should be float')
+        if not isinstance(arg, float) and not isinstance(arg, list) and not isinstance(arg, np.ndarray):
+            raise TypeError('Distance to fiber center should be float, list or np.ndarray')
+        if isinstance(arg, list) or isinstance(arg, np.ndarray):
+            if len(arg) != self._ring_count + 1:
+                raise TypeError('Length of distance to fiber center should be equal to ring_count + 1. Set the ring_count first!')
+        else:
+            arg = [arg]
         self._distance_to_fiber_center = arg
 
     @delta_n_core.setter

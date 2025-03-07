@@ -51,7 +51,7 @@ def example_of_coefficients_calculation():
 
     couping_coefficient = coup_mat[0][1]
     coupling_coefficient_estimated_error = err_mat[0][1]
-    print(f'Lambda = {fiber.distance_to_fiber_center * 2.0} mkm')
+    print(f'Lambda = {fiber.distance_to_fiber_center[0] * 2.0} mkm')
     print(f'k = {couping_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
     print(f'L = {0.5 * np.pi / couping_coefficient} m \n')
 
@@ -105,7 +105,7 @@ def test1():
     print(f'b = {beta}')
 
     coeffs = get_coupling_coefficients(fiber, light, 1e-6, 4)[0]
-    print(f'Lambda = {fiber.distance_to_fiber_center * 2.0} mkm \n')
+    print(f'Lambda = {fiber.distance_to_fiber_center[0] * 2.0} mkm \n')
 
     print(f'k1 = {coeffs[0][1]} 1/m')
     print(f'L1 = {0.5 * np.pi / (coeffs[0][1])} m')
@@ -121,7 +121,7 @@ def get_coupling_of_distance(fiber, light, d, couplings):
     couplings.resize(N, refcheck=False)
 
     for i in range(N):
-        fiber.distance_to_fiber_center = 0.5 * fiber.core_radius * d[i]
+        fiber.distance_to_fiber_center[0] = 0.5 * fiber.core_radius * d[i]
         coeffs = get_coupling_coefficients(fiber, light, 1e-6, 4)[0]
         couplings[i] = coeffs[0][1]
         print(f'i = {i}')
@@ -146,7 +146,7 @@ def get_C_of_R_and_d(fiber, light, r1, r2, d1, d2, N):
         gamma = fiber.get_gamma(light, 1e-6)  # [1/(W*m)]
         b2 = fiber.get_beta2(light)  # [(ps^2)/km]
         for j in range(N + 1):
-            fiber.distance_to_fiber_center = 0.5 * (d[j] * r[i])
+            fiber.distance_to_fiber_center[0] = 0.5 * (d[j] * r[i])
             coeffs = get_coupling_coefficients(fiber, light, 1e-6, 4)
             couplings[i * (N + 1) + j] = coeffs[0][1]  # [1/m]
 

@@ -144,7 +144,7 @@ class EquationParameters:
     core_configuration: CoreConfig
     size: int = 1
     ring_count: float = 0
-    display_debug_info: bool = True
+    display_debug_info: bool = False
 
     mask_array = None
 
@@ -468,7 +468,7 @@ class Solver:
             use_gpu=False,
             use_torch=False,
             precision='float64',
-            display_debug_info=True
+            display_debug_info=False
     ):
         self.com = com
         self.eq = eq

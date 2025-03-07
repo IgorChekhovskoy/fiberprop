@@ -53,30 +53,30 @@ def mcf_nn_reservoir_computing(fiber_length_dimensionless=5,
 
     fiber = Fiber()
     fiber.core_configuration = CoreConfig.hexagonal
-    fiber.core_count = eq_size
-    # fiber.ring_count = layer_count
+    # fiber.core_count = eq_size
+    fiber.ring_count = layer_count
     fiber.core_radius = core_radius
     fiber.cladding_diameter = 125.0 # [mkm]
     fiber.n2 = 3.2
-    fiber.distance_to_fiber_center = 17.3 # [mkm]
+    fiber.distance_to_fiber_center = layer_radii_array # [mkm]
     fiber.NA = 0.125
     fiber.core_material = FiberMaterial.SIO2
     fiber.material_concentration = 0.038
     fiber.set_refractive_indexes_by_lambda(lambda0)
 
     t1 = time()
-    coup_mat, err_mat = get_coupling_coefficients(fiber, light, eps=1e-2)
+    coupling_matrix, error_matrix = get_coupling_coefficients(fiber, light, eps=1e-4, display_debug_info=display_debug_info)
 
     if display_debug_info:
         print("get_coupling_coefficients time =", time() - t1, " seconds")
 
-        print_matrix(coup_mat)
+        print_matrix(coupling_matrix)
 
-    coupling_coefficient = coup_mat[0][1]
-    coupling_coefficient_estimated_error = err_mat[0][1]
+    coupling_coefficient = coupling_matrix[int(eq_size/2)][int(eq_size/2 + 1)]
+    coupling_coefficient_estimated_error = error_matrix[int(eq_size/2)][int(eq_size/2 + 1)]
 
     if display_debug_info:
-        print(f'Lambda = {fiber.distance_to_fiber_center * 2.0} mkm')
+        print(f'Lambda = {fiber.distance_to_fiber_center[0] * 2.0} mkm')
         print(f'k = {coupling_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
         print(f'L = {0.5 * np.pi / coupling_coefficient} m \n')
 
@@ -121,6 +121,9 @@ def mcf_nn_reservoir_computing(fiber_length_dimensionless=5,
     solver = Solver(computational_params, equation_params, initial_condition=data_in,
                     use_dimensional=True, use_gpu=use_gpu, use_torch=True, display_debug_info=display_debug_info)
 
+    solver.linear_coeffs_array = coupling_matrix
+    print_matrix(solver.linear_coeffs_array, "linear_coeffs_array")
+
     solver.run_numerical_simulation()
 
     if display_plots:
@@ -143,13 +146,24 @@ def mcf_nn_reservoir_computing(fiber_length_dimensionless=5,
 
 if __name__ == '__main__':
 
-    layer_count = 1
+    layer_count = 2
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
 
-    layer_radii_array = np.zeros(layer_count)
-    for i in range(layer_count):
-        layer_radii_array[i] = i + 1 # [mkm]
+    # layer 0 - центральная сердцевина
+    # layer 1 - первый круг из 6 сердцевин
+    # layer 2 - второй "круг" из 12 сердцевин, расстояние от которых до центра разное
+    # ...
+    layer_radii_array = np.zeros(layer_count + 1)
+    for i in range(layer_count + 1):
+        if i == 0:
+            layer_radii_array[i] = 0 # [mkm]
+        if i == 1:
+            layer_radii_array[i] = 17.3 # [mkm]
+        if i == 2:
+            layer_radii_array[i] = 50 # [mkm]
+
+        # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
 
     g0_array = np.zeros(core_count)
     for i in range(core_count):
@@ -175,7 +189,7 @@ if __name__ == '__main__':
                                           step_number_per_dimensionless_distance = 500,
                                           layer_count=layer_count,
                                           layer_radii_array=layer_radii_array,  # [mkm]
-                                          core_radius=4,  # [mkm]
+                                          core_radius=4.1,  # [mkm]
                                           g0_array=g0_array,  # [1/m]
                                           psat_array=psat_array,  # [W]
                                           data_in=data_in,  # [sqrt(W)]
