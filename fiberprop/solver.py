@@ -3,9 +3,9 @@ from scipy.fft import fftfreq
 from dataclasses import dataclass, field
 from typing import Union
 from math import sqrt, pi
-from enum import Enum
 from numba import njit
 
+from .fiber_geometry import make_eq_mask, CoreConfig, get_core_count
 from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
 from .pulses import zero_pulse
 from .drawing import *
@@ -18,7 +18,7 @@ try:
 except ImportError:
     is_torch_available = False
 
-from .ssfm_mcf_pytorch import get_energy_rectangles_pytorch, ssfm_order2_pytorch
+from .ssfm_mcf_pytorch import ssfm_order2_pytorch
 
 @dataclass
 class ComputationalParameters:
@@ -81,29 +81,6 @@ class ComputationalParameters:
 
 
 @dataclass
-class CoreConfig(Enum):
-    """
-    Перечисление возможных конфигураций сердцевин.
-
-    Варианты:
-    ::
-        not_set (0): Конфигурация не определена (значение по умолчанию)
-        empty_ring (1): 1D круговая конфигурация без центральной сердцевины
-        square (2): 2D квадратная решётка сердцевин
-        hexagonal (3): 2D гексагональная (шестиугольная) решётка сердцевин
-        manakov_eq (4): Модель с уравнениями Манакова (учёт поляризационных эффектов)
-        dual_core (5): Двухсердцевинная конфигурация
-        ring_with_center (6): 1D комбинированная конфигурация (кольцо + центральная сердцевина)
-    """
-    not_set: int = 0
-    empty_ring: int = 1
-    square: int = 2
-    hexagonal: int = 3
-    manakov_eq: int = 4
-    dual_core: int = 5
-    ring_with_center: int = 6
-
-@dataclass
 class EquationParameters:
     """
     Класс для хранения физических параметров уравнений моделирования.
@@ -117,6 +94,7 @@ class EquationParameters:
         ring_count (float): Количество коаксиальных колец для 2D конфигураций
         display_debug_info (bool): Выводить отладочную информацию
 
+        beta1 (float | np.ndarray | list): Коэффициент групповой задержки [ps/m]
         beta2 (float | np.ndarray | list): Коэффициент дисперсии групповых скоростей [ps²/m]
         gamma (float | np.ndarray | list): Коэффициент нелинейности Керра [1/(W·m)]
         E_sat (float | np.ndarray | list): Энергия насыщения [pJ]
@@ -127,7 +105,7 @@ class EquationParameters:
 
     Особенности:
     ::
-        - Параметры beta2, gamma, E_sat, alpha, g_0 и coupling_coefficient могут быть заданы как:
+        - Параметры beta1, beta2, gamma, E_sat, alpha, g_0 и coupling_coefficient могут быть заданы как:
           * Скаляр - одинаковое значение для всех сердцевин
           * Список/массив - индивидуальные значения для каждой сердцевины
         - При инициализации скалярные значения автоматически преобразуются в массивы
@@ -148,6 +126,7 @@ class EquationParameters:
 
     mask_array = None
 
+    beta1: Union[float, np.ndarray, list] = 0.0
     beta2: Union[float, np.ndarray, list] = -1.0
     gamma: Union[float, np.ndarray, list] = 1.0
     E_sat: Union[float, np.ndarray, list] = 1.0
@@ -170,9 +149,18 @@ class EquationParameters:
         if self.display_debug_info:
             print("eq.size =", self.size)
 
-        self.make_eq_mask()
+        self.mask_array = make_eq_mask(
+            core_configuration=self.core_configuration,
+            size=self.size,
+            ring_count=self.ring_count,
+            display_debug_info=self.display_debug_info
+        )
 
         # Преобразование скалярных параметров и списков в массивы одинаковых значений
+        if isinstance(self.beta1, (int, float, list)):
+            self.beta1 = np.array(self.beta1, dtype=float)
+            if self.beta1.ndim == 0:
+                self.beta1 = np.full(self.size, self.beta1, dtype=float)
         if isinstance(self.beta2, (int, float, list)):
             self.beta2 = np.array(self.beta2, dtype=float)
             if self.beta2.ndim == 0:
@@ -198,47 +186,6 @@ class EquationParameters:
             if self.coupling_coefficient.ndim == 0:
                 self.coupling_coefficient = np.full(self.size, self.coupling_coefficient, dtype=float)
 
-    def make_eq_mask(self):
-        temp_array_size = int((1.0 + self.size * (self.size + 1.0)))
-        temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
-        center = temp_array_size // 2
-
-        if self.core_configuration is CoreConfig.ring_with_center:
-            for i in range(self.size + 1):
-                temp_array[0][i] = True
-
-        elif ((self.core_configuration is CoreConfig.empty_ring) or
-              (self.core_configuration is CoreConfig.manakov_eq)):
-            for i in range(self.size):
-                temp_array[0][i] = True
-
-        elif self.core_configuration is CoreConfig.square:
-            for i in range(temp_array_size):
-                for j in range(temp_array_size):
-                    if (i - center) ** 2 + (j - center) ** 2 <= self.ring_count ** 2 + 1e-13:
-                        temp_array[i][j] = True
-
-        elif self.core_configuration is CoreConfig.hexagonal:
-            h_i = 1.0
-            h_j = 1.0 / sqrt(3.0)
-            for i in range(temp_array_size):
-                for j in range(temp_array_size):
-                    if (h_i * (i - center)) ** 2 + (
-                            h_j * (j - center)) ** 2 <= self.ring_count ** 2 * 4.0 / 3.0 + 1e-10 and \
-                            (i + j - 2 * center) % 2 == 0:
-                        temp_array[i][j] = True
-
-        if self.display_debug_info:
-            print_temp_array(temp_array_size, temp_array)
-
-        self.mask_array = []
-        index_1d = 0
-        for i in range(temp_array_size):
-            for j in range(temp_array_size):
-                if temp_array[i][j]:
-                    self.mask_array.append(Mask(index_1d, i - temp_array_size // 2, j - temp_array_size // 2, []))
-                    index_1d += 1
-        # print("core count = ", index_1d)
 
     @staticmethod
     def get_info():
@@ -250,6 +197,7 @@ class EquationParameters:
         print('\"size\" -- количество сердцевин в MCF, целое число;')
         print('\"ring_count\" -- количество коаксиальных колец в MCF ?, вещественное число.\n')
 
+        print('\"beta1\" -- коэффициент групповой задержки [ps/m];')
         print('\"beta2\" -- коэффициент дисперсии групповых скоростей [ps^2/m];')
         print('\"gamma\" -- коэффициент нелинейности Керра [1/(W*m)];')
         print('\"E_sat\" -- энергия насыщения [pJ];')
@@ -264,117 +212,12 @@ class EquationParameters:
               'мощность имеет размерность [W]\n.')
 
 
-@dataclass
-class Mask:
-    """
-        Класс Mask представляет структуру, содержащую информацию о связях между сердцевинами.
-
-        Атрибуты:
-        ----------
-        number_1d : int
-            Номер ядра при одномерной нумерации, т.е. при записи системы в матричной форме.
-        number_2d_x : int
-            Первая координата ядра при двумерной нумерации (например, в гексагональной или квадратной решетке).
-        number_2d_y : int
-            Вторая координата ядра при двумерной нумерации.
-        neighbors : np.ndarray
-            Массив индексов соседних ядер.
-        """
-    number_1d: int
-    number_2d_y: int
-    number_2d_x: int
-    neighbors: np.ndarray
-
-
-def print_temp_array(temp_array_size, temp_array):
-    """
-    Печатает временный массив в консоль.
-
-    Параметры:
-    ----------
-    temp_array_size : int
-        Размер временного массива (предполагается квадратный массив).
-    temp_array : np.ndarray
-        Двумерный массив логических значений (bool), представляющий временный массив.
-    """
-    i_min, j_min = temp_array_size, temp_array_size
-    i_max, j_max = 0, 0
-
-    found = False
-    for i in range(temp_array_size):
-        for j in range(temp_array_size):
-            if temp_array[i][j]:
-                if not found:
-                    i_min, j_min = i, j
-                    i_max, j_max = i, j
-                    found = True
-                else:
-                    if i < i_min: i_min = i
-                    if i > i_max: i_max = i
-                    if j < j_min: j_min = j
-                    if j > j_max: j_max = j
-
-    if not found:
-        print("\n")
-        return
-
-    for i in range(i_min, i_max + 1):
-        for j in range(j_min, j_max + 1):
-            print("0 " if temp_array[i][j] else "  ", end="")
-        print("\n")
-    print("\n")
-
-
 def print_matrix(matrix, name='matrix'):
     """ Функция реализует вывод матрицы в консоль """
     print(f'\n{name}: ')
     for row in matrix:
         print('\t'.join(f'{value: .2f}' for value in row))
     print('\n')
-
-
-def get_core_count(core_configuration, ring_count: float) -> int:
-    """
-    Определяет количество сердцевин (core_count) в зависимости от номера кольца (ring_count).
-
-    Параметры:
-        core_configuration (CoreConfig): конфигурация расположения сердцевин
-        ring_count (float): Номер кольца (должен быть >= 0)
-
-    Возвращает:
-        int: Количество сердцевин
-
-    Исключения:
-        ValueError: Если ring_count отрицательный или слишком большой
-    """
-    if ring_count < 0:
-        raise ValueError("Номер кольца не может быть отрицательным")
-
-    if core_configuration is CoreConfig.square:
-        return 0 # TODO
-    elif core_configuration is CoreConfig.hexagonal:
-        sqrt3 = np.sqrt(3)  # ≈ 1.732
-        sqrt7 = np.sqrt(7)  # ≈ 2.645
-        sqrt12 = np.sqrt(12)  # ≈ 3.464
-        sqrt13 = np.sqrt(13)
-
-        if 0 <= ring_count < 1:
-            return 1
-        elif 1 <= ring_count < sqrt3:
-            return 7
-        elif sqrt3 <= ring_count < 2:
-            return 13
-        elif 2 <= ring_count < sqrt7:
-            return 19
-        elif sqrt7 <= ring_count < 3:
-            return 31
-        elif 3 <= ring_count < sqrt12:
-            return 37
-        elif sqrt12 <= ring_count < sqrt13:
-            return 43
-        else:
-            raise ValueError("Тебе куда столько ядер? Солить будешь?")
-    return 0
 
 
 class Solver:
@@ -453,7 +296,7 @@ class Solver:
             )
 
         # Запуск симуляции и визуализация
-            solver.run_numerical_simulation(print_modulus=True)
+            solver.run_numerical_simulation(draw_modulus=True)
             solver.plot_error()
         """
 
@@ -461,6 +304,7 @@ class Solver:
             self,
             com: ComputationalParameters,
             eq: EquationParameters,
+            stored_steps_count: int | None = None,
             use_dimensional=False,
             pulses=zero_pulse,
             pulse_params_list=None,
@@ -470,6 +314,22 @@ class Solver:
             precision='float64',
             display_debug_info=False
     ):
+        self.exp_2g0h_full = None
+        self.exp_g0h_full = None
+        self.g0_h_full = None
+        self.gamma_h_full = None
+
+        self.exp_2g0h_half = None
+        self.exp_g0h_half = None
+        self.g0_h_half = None
+        self.gamma_h_half = None
+
+        self.E_sat_t = None
+        self.g0_t = None
+
+        self._taper_np = None
+        self._taper_t = None
+
         self.com = com
         self.eq = eq
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
@@ -499,6 +359,8 @@ class Solver:
         self.nonlinear_cubic_coeffs_array = None
 
         self.set_configuration()
+
+        self.has_beta = not (np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0))
 
         # Ensure pulses and pulse_params_list are lists or apply them to all equations
         if not isinstance(pulses, list):
@@ -532,6 +394,12 @@ class Solver:
         self.L2_norm = None
         self.analytical_solution = None
 
+        self.stored_steps_count = (
+            com.N + 1 if stored_steps_count is None
+            else max(2, min(stored_steps_count, com.N + 1))
+        )
+        self._save_every = max(1, round(com.N / (self.stored_steps_count - 1)))
+
         # Инициализация массивов
         self.initialize_arrays()
 
@@ -541,6 +409,8 @@ class Solver:
             self.apply_initial_condition(initial_condition)
         else:
             self.initialize_with_pulses(pulses, pulse_params_list)
+
+        self._prepare_taper()
 
     def set_configuration(self):
 
@@ -602,8 +472,6 @@ class Solver:
         if self.display_debug_info:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
-        self.get_neighbors()
-
         for j in range(self.eq.size):
             for k in range(self.eq.size):
                 if self.eq.core_configuration is CoreConfig.manakov_eq:
@@ -617,13 +485,6 @@ class Solver:
                     else:
                         self.nonlinear_cubic_coeffs_array[j][j] = self.eq.gamma[j]
 
-    def get_neighbors(self):
-        for j in range(self.eq.size):
-            self.eq.mask_array[j].neighbors.clear()
-            for k in range(self.eq.size):
-                if (self.linear_coeffs_array[j][k].real != 0 or self.linear_coeffs_array[j][k].imag != 0) and j != k:
-                    self.eq.mask_array[j].neighbors.append(k)
-
     def initialize_arrays(self):
         """Создает пустые массивы для хранения результатов"""
         self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False)
@@ -631,7 +492,7 @@ class Solver:
         self.omega = fftfreq(self.com.M, self.com.tau) * 2 * pi
         self.omega2 = self.omega ** 2
 
-        self.numerical_solution = np.zeros((self.com.N + 1, self.eq.size, self.com.M), dtype=complex)
+        self.numerical_solution = np.zeros((self.stored_steps_count, self.eq.size, self.com.M), dtype=complex)
         self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
         self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
 
@@ -678,10 +539,12 @@ class Solver:
 
         for k in range(self.eq.size):
             pulse_params = self.filter_params(self.pulses[k], self.pulse_params_list[k])
+
+            pulse_params = {name: (val[k] if isinstance(val, np.ndarray) else val)
+                            for name, val in pulse_params.items()}
+
             if 'z' in self.pulses[k].__code__.co_varnames:
-                self.numerical_solution[0][k] = self.pulses[k](
-                    t=self.t, z=0, **pulse_params
-                )
+                self.numerical_solution[0][k] = self.pulses[k](t=self.t, z=0, **pulse_params)
             else:
                 self.numerical_solution[0][k] = self.pulses[k](t=self.t, **pulse_params)
 
@@ -689,16 +552,128 @@ class Solver:
             self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
             self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
 
-    def calculate_D_matrix(self):
-        if all(self.eq.beta2 == 0.0):
-            single_matrix = create_simple_dispersion_free_matrix(self.linear_coeffs_array, self.eq.alpha,
-                                                                 self.eq.g_0, self.com.h)
-            flat_mat = single_matrix.flatten()
-            self.D = np.full((self.com.M, self.eq.size**2), flat_mat).T
+    # ─── solver.py ─────────────────────────────────────────────
+    def calculate_D_matrix(self) -> None:
+        """
+        Строит дисперсионно-связную матрицу и подготавливает
+        представления, удобные для CPU- и GPU-веток.
+        """
+        n, M = self.eq.size, self.com.M
+
+        # 1) плоская матрица (n², M)
+        if np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0):
+            self.D = create_simple_dispersion_free_matrix(
+                self.linear_coeffs_array, self.eq.alpha,
+                self.eq.g_0, self.com.h
+            )  # (n, n)
         else:
-            self.D = get_pade_exponential2(create_freq_matrix(self.linear_coeffs_array, self.eq.beta2,
-                                                              self.eq.alpha, self.eq.g_0,
-                                                              self.omega, self.com.h))
+            self.D = get_pade_exponential2(
+                create_freq_matrix(
+                    self.linear_coeffs_array,
+                    self.eq.beta1, self.eq.beta2,
+                    self.eq.alpha, self.eq.g_0,
+                    self.omega, self.com.h
+                )
+            )  # (n², M)
+
+            # 2) представление (n, n, M)  — NumPy-view без копии
+            self.D = self.D.reshape(n, n, M)
+
+        # 3) сразу готовим тензор на GPU, если будем считать в torch
+        if self.use_torch:
+            self.D_pytorch = torch.as_tensor(
+                self.D,
+                dtype=self.ctype,
+                device=self.device
+            )
+
+    def prepare_halfstep_constants(self):
+        if self.gamma_h_half is not None:
+            return
+
+            # ── 1. CPU-массивы ───────────────────────────────────────────────
+        half_step = 0.5 * self.com.h
+        self.gamma_h_half = self.eq.gamma * half_step  # (n,)
+        self.g0_h_half = self.eq.g_0 * half_step
+        self.exp_g0h_half = np.exp(self.g0_h_half)
+        self.exp_2g0h_half = np.exp(2.0 * self.g0_h_half)
+
+        # ── 2. PyTorch-тензоры (если используем torch) ───────────────────
+        if self.use_torch:
+            to_t = lambda arr: torch.as_tensor(arr,
+                                               dtype=self.dtype,
+                                               device=self.device)
+
+            self.gamma_h_half_t = to_t(self.gamma_h_half)
+            self.g0_h_half_t = to_t(self.g0_h_half)
+            self.exp_g0h_half_t = to_t(self.exp_g0h_half)
+            self.exp_2g0h_half_t = to_t(self.exp_2g0h_half)
+
+            # Дополнительно кешируем E_sat и g0 на том же устройстве
+            if self.E_sat_t is None:
+                self.E_sat_t = to_t(self.eq.E_sat)
+            if self.g0_t is None:
+                self.g0_t = to_t(self.eq.g_0)
+
+    def _prepare_taper(self):
+        """
+        Создаёт и кэширует одномерную маску taper (cos^6) для
+        поглощающих граничных условий (ABC).
+
+        ▸ Маска рассчитывается **один раз** при инициализации Solver
+          или после изменения self.com.damp_length / self.com.M.
+
+        ▸ Хранится
+            self._taper_np : ndarray(M,)        – для CPU/NumPy
+            self._taper_t  : torch.Tensor(M,)   – для PyTorch-ветки,
+                                                 на том же device, dtype.
+
+        ▸ Алгоритм:
+            1. Доля узлов с поглощением  L = int(M * damp_length).
+            2. Левая/правая кромка — окно cos⁶:
+               taper[i] = cos(π/2 · (L−i)/L)^6,  i = 0…L-1.
+            3. Центр массива заполняется единицами.
+
+        ▸ Если damp_length == 0.0, маска не создаётся (None),
+          а вызовы apply_absorbing_boundary* просто возвращают psi
+          без изменений.
+
+        ▸ После изменения размерности сетки или damp_length
+          вызовите повторно self._prepare_taper().
+
+        Возвращаемое значение: None (побочный эффект — заполнены
+        self._taper_np / self._taper_t).
+        """
+        M = self.com.M
+        Lp = self.com.damp_length  # доля PML
+        if Lp == 0.0:
+            self._taper_np = None
+            self._taper_t = None
+            return
+
+        p = 1  # степень косинуса
+        q = 0  # степень полинома
+        σ = 1.0  # амплитуда затухания
+        κ = 1.0  # фазовый поворот (≈σ)
+        L = int(M * Lp)
+
+        # левая/правая кромка
+        i = np.arange(L, dtype=float)
+        x = (L - i) / L  # 1…0
+        # edge = np.exp(-(σ + 1j * κ) * x ** q)
+        # edge = np.cos(np.pi / 2 * (L - i) / L) ** p
+        cos_part = np.cos(np.pi / 2 * x / 4) ** p
+        exp_part = np.exp(-(σ + 1j * κ) * x ** q)
+        edge = cos_part# * exp_part
+
+        taper = np.ones(M, dtype=np.complex128)
+        taper[:L] = edge
+        taper[M - L:] = edge[::-1]
+
+        self._taper_np = taper
+        if self.use_torch:
+            self._taper_t = torch.as_tensor(
+                taper, dtype=self.ctype, device=self.device)
 
     def filter_params(self, func, pulse_params):
         # Получаем список параметров, которые принимает функция
@@ -710,60 +685,116 @@ class Solver:
         return filtered_params
 
     # Основная функция моделирования
-    def run_numerical_simulation(self, print_modulus=False, print_interval=10, yscale='linear'):
+    def run_numerical_simulation(
+            self,
+            draw_modulus: bool = False,
+            draw_interval: int = 10,
+            save_gif: bool = False,
+            yscale: str = "linear"
+    ):
+        """
+        Основной цикл расчёта.
 
+        • Все вычисления – на GPU (если self.use_torch = True).
+        • Буфер gpu_buffer хранит ≤ draw_interval шагов.
+        • Копирование GPU→CPU выполняется асинхронно (non_blocking=True) одним батчем,
+          когда (n+1) % draw_interval == 0 или в самом конце.
+        • На CPU попадают:
+            – срезы поля psi,
+            – энергия,
+            – пиковая мощность.
+          Формат и значения идентичны прежней версии.
+        """
+
+        # ───── инициализация ────────────────────────────────────────────────────
         if self.D is None:
             self.calculate_D_matrix()
-        # TODO: Может выделить случай use_gpu в отдельную функцию?
-        if self.use_torch:
-            # Инициализация тензоров на GPU с использованием to()
-            psi_gpu = torch.tensor(self.numerical_solution[0], dtype=self.ctype).to(self.device, non_blocking=True)
-            energy_gpu = torch.tensor(self.energy[:, 0], dtype=self.dtype).to(self.device, non_blocking=True)
-            D_gpu = torch.tensor(self.D, dtype=self.ctype).to(self.device, non_blocking=True)
-            gamma_gpu = torch.tensor(self.eq.gamma, dtype=self.dtype).to(self.device, non_blocking=True)
-            E_sat_gpu = torch.tensor(self.eq.E_sat, dtype=self.dtype).to(self.device, non_blocking=True)
-            g_0_gpu = torch.tensor(self.eq.g_0, dtype=self.dtype).to(self.device, non_blocking=True)
+        if self.gamma_h_half is None:
+            self.prepare_halfstep_constants()
 
-        # Инициализация графика, если нужно
-        if print_modulus:
-            fig, ax, line = init_modulus_plot(yscale=yscale)
+        save_every = self._save_every  # шаг между сохранёнными
+        save_idx = 0  # 0-й шаг уже записан
+        tau = self.com.tau
 
-        for n in trange(self.com.N):
-            if self.use_torch:
-                # Выполнение на PyTorch
-                psi_gpu = ssfm_order2_pytorch(psi_gpu, energy_gpu, D_gpu, gamma_gpu, E_sat_gpu, g_0_gpu, self.com.h,
-                                              self.com.tau, self.eq.noise_amplitude)
+        # ───── график │ опционально ──────────────────────────────────────
+        if draw_modulus:
+            fig, ax, line = init_modulus_plot(
+                save_gif=save_gif, yscale=yscale, scaling_mode='history',
+                t=self.t
+            )
 
-                # Копирование данных с GPU на CPU в конце итерации, с использованием pinned memory
-                self.numerical_solution[n + 1] = psi_gpu.cpu().numpy()
-                self.energy[:, n + 1] = energy_gpu.cpu().numpy()
-            else:
-                # Выполнение на NumPy
-                self.numerical_solution[n + 1] = ssfm_order2(self.numerical_solution[n], self.energy[:, n], self.D,
-                                                             self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h,
-                                                             self.com.tau, self.com.damp_length, self.eq.noise_amplitude)
+        # ─────────────────────────────────────── CPU-ветка ───────────────
+        psi_next = self.numerical_solution[0]
 
-            if self.use_torch:
-                for k in range(self.eq.size):
-                    energy_gpu[k] = get_energy_rectangles_pytorch(psi_gpu[k], self.com.tau)
-                self.energy[:, n + 1] = energy_gpu.cpu().numpy()
-            else:
-                for k in range(self.eq.size):
-                    self.energy[k][n + 1] = get_energy_rectangles(self.numerical_solution[n + 1][k], self.com.tau)
+        if not self.use_torch:
+            for n in trange(self.com.N):
+                # ---------- очередной шаг --------------------------------
+                psi_next = ssfm_order2(
+                    psi_next,  # последний сохранённый
+                    self.energy[:, n],  # энергия предыдущего
+                    self,
+                    self.com.h, tau,
+                    self.com.damp_length,
+                    self.eq.noise_amplitude,
+                )
 
-            for k in range(self.eq.size):
-                self.peak_power[k][n + 1] = np.max(np.abs(self.numerical_solution[n + 1][k]) ** 2)
+                # ---------- метрики --------------------------------------
+                abs2 = np.abs(psi_next) ** 2
+                self.energy[:, n + 1] = abs2.sum(1) * tau
+                self.peak_power[:, n + 1] = abs2.max(1)
 
-            # Обновление графика через каждые `print_interval` шагов, если включен флаг `print_modulus`
-            if print_modulus and (n + 1) % print_interval == 0:
-                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
+                # ---------- сохранить шаг? -------------------------------
+                is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
+                if is_save_step:
+                    save_idx += 1
+                    if save_idx < self.stored_steps_count:
+                        self.numerical_solution[save_idx] = psi_next
 
-        if self.use_torch:
-            self.numerical_solution[-1] = psi_gpu.cpu().numpy()
-            self.energy[:, -1] = energy_gpu.cpu().numpy()
+                # ---------- обновить график ------------------------------
+                if draw_modulus and ((n + 1) % draw_interval == 0):
+                    update_modulus_plot(fig, ax, line, psi_next, self.z, n)
 
-        # Закрытие интерактивного режима после завершения симуляции
-        if print_modulus:
+        # ─────────────────────────────────────── GPU-ветка ───────────────
+        else:
+            psi_gpu = torch.as_tensor(
+                self.numerical_solution[0], dtype=self.ctype, device=self.device
+            )
+
+            for n in trange(self.com.N):
+                # ---------- очередной шаг (GPU) --------------------------
+                psi_gpu = ssfm_order2_pytorch(
+                    psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
+                    self,
+                    self.com.h, tau,
+                    self.com.damp_length,
+                    self.eq.noise_amplitude,
+                )
+
+                # ---------- метрики (GPU → CPU) --------------------------
+                abs2 = psi_gpu.abs() ** 2
+                energy_step = (abs2.sum(1) * tau).cpu().numpy()
+                peak_step = abs2.max(1).values.cpu().numpy()
+                self.energy[:, n + 1] = energy_step
+                self.peak_power[:, n + 1] = peak_step
+
+                # ---------- сохранить шаг? -------------------------------
+                is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
+                if is_save_step:
+                    save_idx += 1
+                    if save_idx < self.stored_steps_count:
+                        self.numerical_solution[save_idx] = (
+                            psi_gpu.detach().cpu().numpy()
+                        )
+
+                # ---------- обновить график ------------------------------
+                if draw_modulus and ((n + 1) % draw_interval == 0):
+                    psi_cpu_for_plot = psi_gpu.detach().cpu().numpy()
+                    update_modulus_plot(
+                        fig, ax, line, psi_cpu_for_plot, self.z, n
+                    )
+
+        # ───── финализация графика ───────────────────────────────────────
+        if draw_modulus:
             finalize_plot()
 
     def run_resonator_simulation_nocos(self, backward_energy):
@@ -778,7 +809,7 @@ class Solver:
                                  self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h, self.com.tau,
                                  self.eq.noise_amplitude)
 
-    def run_resonator_simulation_fullcos(self, backward_solution, print_modulus=False, print_interval=10):
+    def run_resonator_simulation_fullcos(self, backward_solution, draw_modulus=False, draw_interval=10):
         """
         С учётом взаимодействия частот прямой и обратной волн.
         в перспективе для более высокого порядка можно добавить флаг
@@ -787,8 +818,8 @@ class Solver:
             self.calculate_D_matrix()
 
         # Инициализация графика, если нужно
-        if print_modulus:
-            fig, ax, line = init_modulus_plot()
+        if draw_modulus:
+            fig, ax, line = init_modulus_plot(t=self.t)
 
         for n in trange(self.com.N):
             # Выполнение на NumPy
@@ -802,12 +833,12 @@ class Solver:
             for k in range(self.eq.size):
                 self.peak_power[k][n + 1] = np.max(np.abs(self.numerical_solution[n + 1][k]) ** 2)
 
-            # Обновление графика через каждые `print_interval` шагов, если включен флаг `print_modulus`
-            if print_modulus and (n + 1) % print_interval == 0:
-                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], n)
+            # Обновление графика через каждые `draw_interval` шагов, если включен флаг `draw_modulus`
+            if draw_modulus and (n + 1) % draw_interval == 0:
+                update_modulus_plot(fig, ax, line, self.numerical_solution[n + 1], self.z, n)
 
         # Закрытие интерактивного режима после завершения симуляции
-        if print_modulus:
+        if draw_modulus:
             finalize_plot()
 
     def get_analytical_solution(self):
@@ -864,11 +895,11 @@ class Solver:
         """
         Функция приводит размерное уравнение
 
-         i dU/dz - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0
+         i dU/dz + i beta1 dU/dt - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0
 
          к безразмерному виду
 
-        i dU/dz + d^2U/dt^2 + |U|^2 U = 0.
+        i dU/dz + i beta1/T/C dU/dt + d^2U/dt^2 + |U|^2 U = 0.
 
         Примечание:
         ::
@@ -906,6 +937,7 @@ class Solver:
         self.com.h /= length_scale  # [1]
         if self.z is not None: self.z /= length_scale  # [1]
 
+        self.eq.beta1 = self.eq.beta1 / (time_scale * coupling_coefficient) if self.eq.beta1 != 0.0 else 0.0  # [1]
         self.eq.beta2 = 2 * np.sign(beta2) if beta2 != 0.0 else 0.0  # [1]
         self.eq.gamma = 1.0 if gamma != 0.0 else 0.0  # [1]
         self.eq.E_sat /= energy_scale  # [1]
@@ -922,7 +954,6 @@ class Solver:
         if print_linear_coeffs_array:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
-        self.get_neighbors()
         if gamma != 0.0:  # Пока нет реализации для уравнений Манакова
             self.nonlinear_cubic_coeffs_array = np.where(self.nonlinear_cubic_coeffs_array != 0, 1.0, self.nonlinear_cubic_coeffs_array)
         else:
@@ -944,11 +975,11 @@ class Solver:
                                print_linear_coeffs_array=True):
         """ Функция приводит безразмерное уравнение
 
-         i dU/dz + d^2U/dt^2 + |U|^2 U = 0
+         i dU/dz + i beta1 dU/dt + d^2U/dt^2 + |U|^2 U = 0
 
          к размерному виду
 
-         i dU/dz - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0.
+         i dU/dz + i beta1 T C dU/dt - beta2/2 d^2U/dt^2 + gamma |U|^2 U = 0.
 
         Примечание:
         ::
@@ -986,6 +1017,7 @@ class Solver:
         self.com.h *= length_scale  # [m]
         if self.z is not None: self.z *= length_scale  # [m]
 
+        self.eq.beta1 *= time_scale * coupling_coefficient  # [ps/m]
         self.eq.beta2 = beta2  # [ps^2/m]
         self.eq.gamma = gamma  # [1/(W*m)]
         self.eq.E_sat *= energy_scale  # [pJ]
@@ -1001,7 +1033,6 @@ class Solver:
         if print_linear_coeffs_array:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
 
-        self.get_neighbors()
         self.nonlinear_cubic_coeffs_array *= gamma
 
         cores = np.arange(self.eq.size, dtype=float)
@@ -1030,34 +1061,141 @@ class Solver:
 
 
 # Функции для графиков
-def init_modulus_plot(yscale='linear'):
-    fig, ax = plt.subplots(figsize=(12, 6))
-    line, = ax.plot([], [], label='|u|')
+def init_modulus_plot(yscale: str = 'linear', *,
+                      scaling_mode: str = 'history',      # 'step' | 'history'
+                      margin: float = 1.1,
+                      t: np.ndarray | None = None,     # массив времени (M,)  – для подписи
+                      nticks: int = 5,                 # сколько t-меток в сегменте (последняя убирается)
+                      save_gif: bool = False,
+                      gif_path: str = 'evolution.gif',
+                      fps: int = 10):
+    """
+    Возвращает fig, ax, line.
+    scaling_mode:
+        'step'    – Y-лимит по максимуму ТЕКУЩЕГО кадра
+        'history' – Y-лимит по глобальному максимуму всех кадров
+    """
+
+    matplotlib.use('qt5agg', force=True)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    line, = ax.plot([], [], lw=1.3)
+
     ax.set_yscale(yscale)
-    ax.set_xlabel('Index')
-    ax.set_ylabel('Max Modulus')
-    ax.set_ylim(bottom=1e-15)
-    ax.legend()
-    ax.grid(True)
-    plt.ion()
+    ax.set_ylabel(r'|u|')
+    ax.set_ylim(1e-15, 1)
+    ax.grid(True, which='both', axis='y')
+
+    # служебные поля
+    ax._mcf_scaling_mode = scaling_mode
+    ax._mcf_margin = margin
+    ax._mcf_global_max = 1e-15
+    ax._mcf_M = None
+    ax._mcf_vlines = []
+    ax._mcf_coretexts = []
+    ax._mcf_t = t
+    ax._mcf_nticks = nticks
+    ax._mcf_tick_cache = None
+
+    # ленивый GIF-writer
+    ax._mcf_save_gif = False
+    ax._mcf_gif_writer = None
+    if save_gif:
+        try:
+            import imageio
+            ax._mcf_gif_writer = imageio.get_writer(gif_path, mode='I', fps=fps)
+            ax._mcf_save_gif = True
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "⚠ Модуль imageio не найден — GIF-запись отключена. "
+                "Установите `pip install imageio`.", RuntimeWarning)
+
+    plt.ion();
     plt.show()
     return fig, ax, line
 
 
-def update_modulus_plot(fig, ax, line, data, n):
-    max_modulus = np.max(np.abs(data))
-    line.set_xdata(range(len(data.flatten())))
-    line.set_ydata(np.abs(data.flatten()))
-    ax.relim()
-    ax.autoscale_view()
-    ax.set_title(f"Step {n + 1}: Max modulus |u| = {max_modulus: .4f}")
-    fig.canvas.draw()
-    fig.canvas.flush_events()
+def update_modulus_plot(fig, ax, line, data_2d: np.ndarray, z: np.ndarray, step: int):
+    """Обновляет картинку и (опционально) дописывает кадр в GIF."""
+    C, M = data_2d.shape
+    if ax._mcf_M is None:
+        ax._mcf_M = M
+
+    # линия |u|
+    y = np.abs(data_2d).ravel()
+    x = np.add.outer(np.arange(C) * M, np.arange(M)).ravel()
+    line.set_data(x, y)
+    max_mod = y.max()
+
+    # масштаб Y
+    if ax._mcf_scaling_mode == 'step':
+        ylim_top = max_mod * ax._mcf_margin
+    else:
+        ax._mcf_global_max = max(ax._mcf_global_max, max_mod)
+        ylim_top = ax._mcf_global_max * ax._mcf_margin
+    ax.set_ylim(1e-15, ylim_top)
+
+    # пределы X без пустых полей
+    ax.set_xlim(0, C * M - 1)
+
+    # пунктиры-разделители
+    for ln in ax._mcf_vlines: ln.remove()
+    ax._mcf_vlines = [ax.axvline(k * M, color='gray', ls='--', lw=.6, alpha=.35)
+                      for k in range(1, C)]
+
+    # minor-ticks времени t (последний тик не выводим)
+    t = ax._mcf_t
+    if t is not None:
+        key = (C, M, ax._mcf_nticks)
+        if ax._mcf_tick_cache != key:
+            ax._mcf_tick_cache = key
+            idx = np.linspace(0, M - 1, ax._mcf_nticks, dtype=int)[:-1]
+            pos, lbl = [], []
+            for c in range(C):
+                offs = c * M
+                pos.extend(offs + idx)
+                lbl.extend([f'{t[i]:.1f}' for i in idx])
+            ax.set_xticks(pos, minor=True)
+            ax.set_xticklabels(lbl, minor=True, rotation=90, fontsize=7)
+    ax.set_xticks([])  # major-ticks прячем
+    ax.set_xlabel('t [ps]')
+
+    # номера ядер сверху
+    for txt in ax._mcf_coretexts: txt.remove()
+    ax._mcf_coretexts.clear()
+    y_text = ylim_top * .92
+    for c in range(C):
+        xpos = (c + .5) * M
+        ax._mcf_coretexts.append(
+            ax.text(xpos, y_text, str(c),
+                    ha='center', va='bottom',
+                    fontsize=10, fontweight='bold',
+                    color='navy', alpha=.9))
+
+    # рендер на экран
+    ax.set_title(f'step = {step + 1} of {z.size - 1}, z = {z[step + 1]:.3g},    max |u| = {max_mod:.3g}')
+    fig.canvas.draw_idle()
+    plt.pause(0.001)
+
+    # запись в GIF
+    if ax._mcf_save_gif:
+        fig.canvas.draw()  # ensure rendered
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+
+        ren = fig.canvas.get_renderer()
+        h, w = int(ren.height), int(ren.width)  # ← cast к int
+
+        frame = buf.reshape(h, w, 3)
+        ax._mcf_gif_writer.append_data(frame)
 
 
+# ───────────────────────────────────────────────────────────────────────────
 def finalize_plot():
-    plt.ioff()
-    plt.show()
+    ax = plt.gca()
+    if getattr(ax, '_mcf_save_gif', False) and ax._mcf_gif_writer:
+        ax._mcf_gif_writer.close()
+    plt.ioff(); plt.show()
 
 
 @njit(inline='always')

@@ -130,8 +130,8 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
 
     Возвращает:
         tuple:
-            - numpy.ndarray: Матрица коэффициентов связи [1/м].
-            - numpy.ndarray: Матрица абсолютных ошибок [1/м].
+            - numpy.ndarray: Матрица коэффициентов связи [1/m].
+            - numpy.ndarray: Матрица абсолютных ошибок [1/m].
 
     Поддерживаемые конфигурации волокна:
         - Пустое кольцо (empty_ring)
@@ -158,12 +158,12 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
         for i in range(core_count):
             # Вычисляем двумерный радиус для определения кольца
             dimensional_radius = np.sqrt(
-                (fiber.eq.mask_array[i].number_2d_x * 0.5) ** 2 +
-                (fiber.eq.mask_array[i].number_2d_y * 0.5 * np.sqrt(3)) ** 2
+                (fiber.mask_array[i].number_2d_x * 0.5) ** 2 +
+                (fiber.mask_array[i].number_2d_y * 0.5 * np.sqrt(3)) ** 2
             )
             ring_index = int(np.ceil(dimensional_radius))
-            x_coord = distance_to_fiber_center[ring_index] * fiber.eq.mask_array[i].number_2d_x * 0.5 / max(ring_index, 1)
-            y_coord = distance_to_fiber_center[ring_index] * fiber.eq.mask_array[i].number_2d_y * 0.5 * np.sqrt(3) / max(ring_index, 1)
+            x_coord = distance_to_fiber_center[ring_index] * fiber.mask_array[i].number_2d_x * 0.5 / max(ring_index, 1)
+            y_coord = distance_to_fiber_center[ring_index] * fiber.mask_array[i].number_2d_y * 0.5 * np.sqrt(3) / max(ring_index, 1)
             core_center_coords.append((x_coord, y_coord))
     elif fiber.core_configuration is CoreConfig.dual_core:
         return get_coupling_coeff_2_core_fiber(fiber, light)
@@ -174,16 +174,35 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
         plot_core_centers(core_center_coords, fiber.core_radius, fiber.cladding_diameter)
 
     # Предполагаем, что все ядра идентичны, поэтому интеграл по диагонали (self-coupling) одинаков для всех.
-    diag_result = scipy_double_integral_by_circle(R, eps, fiber, light, core_center_coords, (0, 0), int_f2)
-    diag_val = diag_result[0]
-    diag_up = diag_result[0] + diag_result[1]
-    diag_low = diag_result[0]- diag_result[1]
+    samples = int(1 / eps) + 1  # ≈ та же точность, но без dblquad
+    diag_val = get_lp_mode_radial_integral(2, fiber, light, samples)
+    # print(diag_val)
+    # diag_result = scipy_double_integral_by_circle(R, eps, fiber, light, core_center_coords, (0, 0), int_f2)
+    # diag_val = diag_result[0]
+    # print(diag_val)
 
-    k = 0.5 * (light.k0 ** 2) / fiber.get_beta(light)
+    k_prefactor = 0.5 * (light.k0 ** 2) / fiber.get_beta(light)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # БЛОК УСКОРЕНИЯ: предварительный Ханкель-просчёт для LP01 (ũ и ĝ)
+    # ──────────────────────────────────────────────────────────────────────
+    r = np.linspace(0.0, R, samples)
+    u_r = np.array([get_lp_mode(0, 1, fiber, light, ri, 0.0) for ri in r])
+
+    k_max = 20.0 / fiber.core_radius  # верхняя граница достаточно высокая
+    k_arr = np.linspace(0.0, k_max, samples)  # равномерная сетка в k-пространстве
+    J_mat = sp.j0(np.outer(k_arr, r))  # матрица Бесселя J0(k·r)
+
+    u_tilde = np.trapz(u_r * r * J_mat, r, axis=1)  # û(k)
+
+    mask = r <= fiber.core_radius  # только область ядра
+    g_r = u_r * mask
+    g_tilde = np.trapz(g_r * r * J_mat, r, axis=1)  # ĝ(k)
+
+    delta_n2 = fiber.n_core ** 2 - fiber.n_cladding ** 2
 
     # Инициализация матриц для коэффициентов связи и ошибок
     coup_mat = np.zeros((core_count, core_count), dtype=float)
-    error_mat = np.zeros((core_count, core_count), dtype=float)
 
     # Словарь для кэширования результатов off-diagonal интегралов по расстоянию
     cache = {}
@@ -196,37 +215,29 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
             dy = core_center_coords[m][1] - core_center_coords[p][1]
             d = math.sqrt(dx * dx + dy * dy)
             # Используем округление для устранения неточностей при сравнении
-            d_key = round(d, 6)
+            d_key = round(d, 3)
             if d_key not in cache:
-                # Вычисление off-diagonal интеграла с использованием функции int_integral
-                result = scipy_double_integral_by_circle(R, eps, fiber, light, core_center_coords, (m, p), int_integral)
-                cache[d_key] = result
+                integrand = k_arr * u_tilde * g_tilde * sp.j0(k_arr * d)
+                int2 = 2.0 * math.pi * delta_n2 * np.trapz(integrand, k_arr)
+                cache[d_key] = int2
             else:
-                result = cache[d_key]
-
-            int2 = result[0]
-            int2_up = result[0] + result[1]
-            int2_low = result[0] - result[1]
+                int2 = cache[d_key]
 
             # Вычисление коэффициента связи qmp для пары ядер (m, p)
             # Поскольку ядра идентичны, используем один и тот же интеграл по диагонали для обоих ядер.
-            qmp = k * int2 / (diag_val ** 0.5 * diag_val ** 0.5)
+            qmp = k_prefactor * int2 / diag_val
             coupling = qmp * 1e+4
             coup_mat[m][p] = coupling
             coup_mat[p][m] = coupling
 
-            # Вычисление ошибок с учетом верхней и нижней оценок интегралов
-            full_err_up = k * int2_up / (diag_low ** 0.5 * diag_low ** 0.5)
-            full_err_low = k * int2_low / (diag_up ** 0.5 * diag_up ** 0.5)
-            error = (full_err_up - full_err_low) * 1e+4 / 2
-            error_mat[m][p] = error
-            error_mat[p][m] = error
-
-    return coup_mat * 1e+2, error_mat * 1e+2
+    return coup_mat * 1e+2
 
 
 def get_coupling_coeff_2_core_fiber(fiber, light):
     """ Коэффициент связи для двухсердцевинного волокна """
+
+    fiber.delta_n_core = fiber.n_core - fiber.n_cladding
+
     V = fiber.core_radius * light.k0 * (
         ((1.0 + fiber.delta_n_core) * fiber.n_cladding)**2 - fiber.n_cladding**2)**0.5
 
@@ -273,3 +284,14 @@ def get_lp_mode(l, m, fiber, light, x, y):
         return sp.jv(l, u * r / core_radius) / sp.jv(l, u) * math.cos(l * phi)
     else:
         return sp.kn(l, w * r / core_radius) / sp.kn(l, w) * math.cos(l * phi)
+
+def get_lp_mode_radial_integral(power, fiber, light, samples):
+    """
+    2π ∫ |LP01(r)|**power · r dr            ← 1-D trapz
+    • power = 2 → IF2   (нормировка)
+      power = 4 → IF4   (A_eff, gamma   – если понадобится)
+    """
+    R = 0.5 * fiber.cladding_diameter      # [µm] ограничимся оболочкой
+    r = np.linspace(0.0, R, samples)
+    u = np.array([get_lp_mode(0, 1, fiber, light, ri, 0.0) for ri in r])   # scalar call
+    return 2 * np.pi * np.trapz((u**power) * r, r)

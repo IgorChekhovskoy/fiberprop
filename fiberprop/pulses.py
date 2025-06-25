@@ -10,9 +10,11 @@ def KuznetsovMaSoliton(t, z, par=1):
     return (1 + numer / den) * np.exp(1j * z)
 
 
-def fundamental_soliton(t, z, beta2, lamb=1, c=1):
+def fundamental_soliton(t, z, beta2, gamma=1, lamb=1, c=1):
     """ Классический солитон """
-    return c * lamb / np.cosh(lamb*t) * np.exp(-1j * beta2 * lamb ** 2 * z)
+    if beta2 < 0:
+        return c * np.sqrt(-beta2 / gamma) * lamb / np.cosh(lamb*t) * np.exp(-0.5j * beta2 * lamb ** 2 * z)
+    return 0
 
 
 def gain_loss_soliton(t, z, beta2, gamma, E_sat, alpha, g_0):

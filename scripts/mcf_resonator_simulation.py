@@ -77,7 +77,7 @@ def mcf_resonator_simulation():
     P_sat = 40 * 5e-4  # мощность насыщения [W]
     E_sat = P_sat * time_width  # энергия насыщения [pJ]
     noise_amplitude = 1e-4  # уровень белого равномерного шума, добавляемого на каждом шаге
-    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=mcf_size, ring_number=1,
+    equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=mcf_size, ring_count=1,
                                          coupling_coefficient=c_coef, E_sat=E_sat, g_0=g_0, alpha=0.0,
                                          beta2=0.0, gamma=0.0, noise_amplitude=noise_amplitude)
 

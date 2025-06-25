@@ -37,12 +37,12 @@ def create_simple_dispersion_free_matrix(mat, alpha, g_0, step):
 
 
 @jit(nopython=True)
-def create_freq_matrix(mat, beta_2, alpha, g_0, omega, step):
+def create_freq_matrix(mat, beta1, beta2, alpha, g_0, omega, step):
     n = len(mat)
     m = len(omega)
     asw = np.empty((n * n, m), dtype=np.complex128)
 
-    diag_elements = step * (1j * np.diag(mat)[:, None] + (1j * beta_2[:, None] * omega ** 2 - alpha[:, None] - g_0[:, None]) / 2)
+    diag_elements = step * (1j * np.diag(mat)[:, None] + (-2j * beta1[:, None] * omega + 1j * beta2[:, None] * omega ** 2 - alpha[:, None] - g_0[:, None]) / 2)
     off_diag_elements = step * 1j * mat
 
     for i in range(n * n):

@@ -1,4 +1,6 @@
 import copy
+import numpy as np
+from numpy import newaxis as _na
 
 from numba import njit
 from scipy.fft import fft, ifft
@@ -18,7 +20,7 @@ def get_simpson_integral(arr_func, time_step):
 
 
 @njit(inline='always', cache=True)
-def get_energy_Simpson(arr_func, time_step):
+def get_energy_simpson(arr_func, time_step):
     """ Возвращает величину энергии (интеграл считается по формуле Симпсона) """
     power_arr = np.abs(arr_func)**2
     n = len(arr_func)
@@ -40,73 +42,102 @@ def get_rectangles_integral(arr_func, time_step):
     return arr_func * time_step
 
 
-def nonlinear_step(psi, gamma, E_sat, g_0, current_energy, step):
-    """ Нелинейный оператор (Керр и насыщение) """
-    n = len(psi)
-    for i in range(n):
-        P_k = np.abs(psi[i])**2
-        E_k = current_energy[i]
-        if g_0[i] == 0:  # нет усиления
-            psi[i] = psi[i] * np.exp(1j * gamma[i] * P_k * step)
-            continue
-        if E_k == 0:
-            continue
-        e_sat = E_sat[i]
-        g0 = g_0[i]
-        E = np.sqrt((E_k ** 2 + 2 * E_k * e_sat) * np.exp(2 * g0 * step) + e_sat ** 2) - e_sat
-        C = -gamma[i] * P_k * (E_k + e_sat - e_sat * np.log(E_k + 2 * e_sat)) / (g0 * E_k) + np.angle(psi[i])
-        P = P_k * np.exp(g0 * step) * np.sqrt((E_k + 2 * e_sat) / E_k) * np.sqrt(E / (E + 2 * e_sat))
-        phi = gamma[i] * P_k * (E + e_sat - e_sat * np.log(E + 2 * e_sat)) / (g0 * E_k) + C
-        psi[i] = np.sqrt(P) * np.exp(1j * phi)
+def nonlinear_step(psi: np.ndarray,
+                   gamma_h, g0_h, exp_g0h, exp_2g0h,
+                   E_sat: np.ndarray,
+                   g_0:   np.ndarray,
+                   energy_in: np.ndarray) -> None:
+    """in-place обновление psi (n,M)."""
+    P = np.abs(psi)**2
+    no_gain = (g_0 == 0.0)
+
+    if np.any(no_gain):          # без усиления
+        psi[no_gain] *= np.exp(1j * gamma_h[no_gain, _na] * P[no_gain])
+
+    gain = ~no_gain
+    if np.any(gain):             # с усилением
+        Ek   = energy_in[gain, _na]
+        Pk   = P[gain]
+        esat = E_sat[gain, _na]
+        g0h  = g0_h[gain, _na]
+        eg1  = exp_g0h[gain, _na]
+        eg2  = exp_2g0h[gain, _na]
+        gamh = gamma_h[gain, _na]
+
+        E  = np.sqrt((Ek**2 + 2*Ek*esat) * eg2 + esat**2) - esat
+        C  = -gamh*Pk*(Ek+esat-esat*np.log(Ek+2*esat)) / (g0h*Ek) + np.angle(psi[gain])
+        Pn = Pk*eg1*np.sqrt((Ek+2*esat)/Ek)*np.sqrt(E/(E+2*esat))
+        phi= gamh*Pk*(E+esat-esat*np.log(E+2*esat)) / (g0h*Ek) + C
+        psi[gain] = np.sqrt(Pn) * np.exp(1j*phi)
+
+    # psi[:, 0] = 0
+    # psi[:, -1] = 0
 
 
-@njit
-def linear_step(psi, Dmat):
-    """ Линейный оператор (связи, дисперсия и потери) """
-    n = len(psi)
-    res_vector = np.zeros_like(psi)
-    for i in range(n):
-        for j in range(n):
-            res_vector[i] += psi[j] * Dmat[i*n + j]
-    return res_vector
+def linear_step(psi, has_beta, D):
+    """
+    Вариант *без копий* и с минимальными проверками.
+    psi : (n, M) во временной области
+    """
+    if has_beta:
+        psi_f = fft(psi, axis=1)
+
+        psi_f = np.einsum('ijk,jk->ik', D, psi_f, optimize=True)
+
+        return ifft(psi_f, axis=1)
+    else:
+        # β₁ = β₂ = 0 : оператор не зависит от ω
+        # простое перемножение в t-области
+        return D @ psi
 
 
-def coupling_step(psi, Dmat_disp_free):
-    """ Линейный оператор для бездисперсионного случая (только связи и потери) """
-    res_psi = np.matmul(Dmat_disp_free, psi)
-    return res_psi
+def ssfm_order2(psi, current_energy, solver,
+                h, tau, damp_length=0.0, noise_amplitude=0.0):
+    """psi.shape=(n,M); current_E=(n,).  Возвращает psi (как в исходнике)."""
+    g0   = solver.eq.g_0
+    gain = g0 != 0.0
+    if gain.any():
+        current_energy[gain] = (np.abs(psi[gain]) ** 2).sum(1) * tau
 
+    # ½ NL
+    nonlinear_step(psi,
+                   solver.gamma_h_half, solver.g0_h_half,
+                   solver.exp_g0h_half, solver.exp_2g0h_half,
+                   solver.eq.E_sat, g0, current_energy)
 
-def ssfm_order2(psi, current_energy, D, gamma, E_sat, g_0, h, tau, damp_length=0.0, noise_amplitude=0.0):
-    """ Реализация схемы расщепления """
-    num = len(psi)
-    for i in range(num):
-        if g_0[i] != 0.0:  # нет усиления
-            current_energy[i] = get_energy_rectangles(psi[i], tau)
-    nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
+    # absorber-1
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
-    if damp_length != 0.0:
-        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
+    # FFT – L – IFFT
+    psi = linear_step(psi, solver.has_beta, solver.D)
 
-    psi = fft(psi, axis=1)
-    psi = linear_step(psi, D)
-    psi = ifft(psi, axis=1)
+    # absorber-2
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
-    if damp_length != 0.0:
-        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
+    # обновляем энергию ПОСЛЕ absorber-2
+    if gain.any():
+        current_energy[gain] = (np.abs(psi[gain]) ** 2).sum(1) * tau
 
-    for i in range(num):
-        if g_0[i] != 0.0:
-            current_energy[i] = get_energy_rectangles(psi[i], tau)
-    nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h/2)
+    # ½ NL (вторая)
+    nonlinear_step(psi,
+                   solver.gamma_h_half, solver.g0_h_half,
+                   solver.exp_g0h_half, solver.exp_2g0h_half,
+                   solver.eq.E_sat, g0, current_energy)
 
-    if damp_length != 0.0:
-        psi = apply_absorbing_boundary(psi, damping_length=damp_length)
+    # absorber-3
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
-    if noise_amplitude != 0.0:
-        current_noise = (np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape) +
-                         1j*np.random.uniform(-noise_amplitude, noise_amplitude, psi.shape))
-        psi += current_noise
+    # шум
+    if noise_amplitude:
+        noise = noise_amplitude * (
+            np.random.uniform(-1, 1, psi.shape) +
+            1j*np.random.uniform(-1, 1, psi.shape)
+        )
+        psi += noise
+
     return psi
 
 
@@ -143,9 +174,7 @@ def ssfm_order1_resonator_nocos(psi, energy_forward, energy_backward, D, gamma, 
     E_total = energy_forward + energy_backward
     new_psi = nonlinear_step_order1_resonator(psi, gamma, E_sat, g_0, E_total, h/2)
 
-    new_psi = fft(new_psi, axis=1)
     new_psi = linear_step(new_psi, D)
-    new_psi = ifft(new_psi, axis=1)
 
     num, _ = psi.shape
     for i in range(num):
@@ -169,9 +198,7 @@ def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_
                                       tau)
     nonlinear_step_order1_resonator(psi_forward, gamma, E_sat, g_0, E_total, h/2)
 
-    psi_forward = fft(psi_forward, axis=1)
     psi_forward = linear_step(psi_forward, D)
-    psi_forward = ifft(psi_forward, axis=1)
 
     E_total = get_rectangles_integral(abs(psi_forward) ** 2 + abs(psi_backward) ** 2 +
                                       2 * (psi_forward.conjugate() * psi_backward).real,
@@ -184,71 +211,28 @@ def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_
     return psi_forward
 
 
-def ssfm_order2_2(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
+def ssfm_order2_2(psi, current_energy, solver,
+                h, tau, damp_length=0.0, noise_amplitude=0.0):
     """ Реализация схемы расщепления """
-    psi = fft(psi, axis=1)
-    psi = linear_step(psi, D)
-    psi = ifft(psi, axis=1)
+
+    psi = linear_step(psi, solver.has_beta, solver.D)
 
     num = len(psi)
     for i in range(num):
-        if g_0[i] != 0:  # нет усиления
+        if solver.eq.g_0[i] != 0:  # нет усиления
             current_energy[i] = get_energy_rectangles(psi[i], tau)
-    nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h)
+    nonlinear_step(psi, solver.eq.gamma, solver.eq.E_sat, solver.eq.g_0, current_energy, h)
 
-    psi = fft(psi, axis=1)
-    psi = linear_step(psi, D)
-    psi = ifft(psi, axis=1)
+    psi = linear_step(psi, solver.has_beta, solver.D)
+
     return psi
 
 
-def ssfm_order2_dispersion_free(psi, current_energy, D, gamma, E_sat, g_0, h, tau):
-    """ Реализация схемы расщепления для случая, когда ДГС отсутствует """
-    psi = coupling_step(psi, D)
-
-    num = len(psi)
-    for i in range(num):
-        if g_0[i] != 0:  # нет усиления
-            current_energy[i] = get_energy_rectangles(psi[i], tau)
-    nonlinear_step(psi, gamma, E_sat, g_0, current_energy, h)
-
-    psi = coupling_step(psi, D)
-    return psi
-
-
-def apply_absorbing_boundary(psi, damping_length=0.1, damping_factor=1):
-    """
-    Применяет поглощающие граничные условия путем экспоненциального заглушения краев массива psi.
-
-    Parameters:
-    -----------
-    psi : np.ndarray
-        Волновая функция, к которой применяются граничные условия.
-    damping_factor : float
-        Фактор демпфирования, определяющий степень поглощения на краях.
-    absorption_region : float
-        Доля области, на которой применяется поглощение (от 0 до 0.5).
-
-    Returns:
-    --------
-    psi : np.ndarray
-        Волновая функция после применения граничных условий.
-    """
-    size, M = psi.shape
-    taper = np.ones(M)
-
-    # Определяем количество точек, на которые будет распространяться заглушение
-    absorption_length = int(M * damping_length)
-
-    # Применяем заглушение к краям области
-    for i in range(absorption_length):
-        # taper[i] = np.exp(-damping_factor * (absorption_length - i) / absorption_length)
-        taper[i] = np.cos(np.pi / 2 * (absorption_length - i) / absorption_length) ** 6
-        taper[-i - 1] = taper[i]
-
-    # Применяем заглушение ко всей области
-    for k in range(size):
-        psi[k] *= taper
-
+def apply_absorbing_boundary(psi: np.ndarray, *, solver) -> np.ndarray:
+    """Использует заранее посчитанный taper из solver."""
+    taper = solver._taper_np
+    if taper is None:
+        return psi
+    psi *= taper          # broadcasting (M,) → (C,M)
     return psi
 

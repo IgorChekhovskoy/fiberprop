@@ -50,7 +50,7 @@ def mcf_resonator_EvoVideo():
     print_matrix(solver.linear_coeffs_array, 'Finally coupling matrix')
 
     N_iter = 200  # количество итераций в резонаторе
-    chosen_core = 3  # ядро, которое выводится на некоторых графиках отдельно от оставльных
+    chosen_core = 3  # ядро, которое выводится на некоторых графиках отдельно от остальных
     chosen_EVO = animate_energy_z  # animate_energy_z, animate_spectrum, animate_magnitude
     fig, ax = get_artist(chosen_EVO, solver.eq.size, y_min=0, y_max=10)
 

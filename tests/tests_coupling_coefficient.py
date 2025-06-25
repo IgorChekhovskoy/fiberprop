@@ -1,13 +1,12 @@
 import math
-import multiprocessing
 import numpy as np
 import copy
 import time
 
 from fiberprop.solver import CoreConfig
-from fiberprop.coupling_coefficient.base_functions import get_coupling_coefficients, get_lp_mode
-from fiberprop.coupling_coefficient.fiber import Fiber, FiberMaterial
-from fiberprop.coupling_coefficient.light import Light
+from fiberprop.base_functions import get_coupling_coefficients, get_lp_mode
+from fiberprop.fiber import Fiber, FiberMaterial
+from fiberprop.light import Light
 
 
 def print_matrix(matrix, name='matrix'):
@@ -212,3 +211,36 @@ def draw_beta_of_lambda(fiber, light, l1, l2, N):
         output_file.write('Variables=lambda[mkm],beta[1/mkm],beta1[ns/m],beta2[ps^2/km]\n')
         for i in range(N + 1):
             output_file.write(f'{l[i]:.17f}\t {beta[i]:.17f}\t {beta1[i]:.17f}\t {beta2[i]:.17f}\n')
+
+
+def test_smf28_parameters():
+    # Заданные значения
+    lambda0 = 1.55  # µm
+    beta2_expected = -21  # ps^2/km
+    gamma_expected = 0.00164  # 1/(W·m)
+
+    # Создаём Light и Fiber с параметрами SMF‑28
+    light = Light(lambda0=lambda0)
+    fiber = Fiber(
+        core_configuration=CoreConfig.not_set, # неважна геометрия для передачи gamma/beta2
+        core_count=1,
+        cladding_diameter=125.0,
+        core_radius=4.1,  # ≈ режим SMF‑28
+        NA=0.14,
+        n2=2.6  # примерно 2.6e-20 m²/W
+    )
+    fiber.core_material = FiberMaterial.SIO2  # кварц
+    fiber.material_concentration = 0.0
+    fiber.set_refractive_indexes_by_lambda(lambda0)
+
+    beta2 = fiber.get_beta2(light)
+    gamma, _ = fiber.get_gamma(light)
+
+    print(beta2, gamma)
+
+    assert abs(beta2 - beta2_expected) < 2, f"β₂ ожидается {beta2_expected}, но вычислено {beta2}"
+    assert abs(gamma - gamma_expected) < 0.0002, f"γ ожидается {gamma_expected}, но вычислено {gamma}"
+
+
+if __name__ == '__main__':
+    test_smf28_parameters()
