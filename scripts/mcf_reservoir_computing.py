@@ -193,7 +193,7 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
     return L_D, L_NL, L_coupling, L_G, L_sat
 
 
-def mcf_nn_reservoir_computing(
+def mcf_nn_reservoir_computing_for_debug(
         fiber_length_m=5.0,                 # длина MCF, m
         feedback_length_m=6.0,              # длина воздушного плеча, m
         abc_fraction=0.10,                  # доля сетки под ABC (с края)
@@ -232,7 +232,7 @@ def mcf_nn_reservoir_computing(
     fiber.set_refractive_indexes_by_lambda(light.lambda0)
 
     central_core_ind = int(eq_size / 2 + 1) if eq_size > 1 else 0
-    
+
     coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_info=display_debug_info)
     coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
     gamma = fiber.get_gamma(light, eps=1e-3)
@@ -303,7 +303,7 @@ def mcf_nn_reservoir_computing(
 
     # ─── Solver и параметры уравнения ────────────────────────────
     esat_array = np.asarray(psat_array) * 2 * T
-    
+
     comp = ComputationalParameters(N=n_z, M=M,
                                    L1=0.0, L2=fiber_length_m,
                                    T1=-T, T2=T,
@@ -354,17 +354,157 @@ def mcf_nn_reservoir_computing(
             plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
 
             plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][central_core_ind]) ** 2,
-                                     np.abs(solver.numerical_solution[solver.com.N][central_core_ind]) ** 2],
+                                     np.abs(solver.numerical_solution[-1][central_core_ind]) ** 2],
                           names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
 
             # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[central_core_ind]) ** 2, f"$|U_3(z,t)|^2$")
 
-    return solver.numerical_solution[solver.com.N]
+    return solver.numerical_solution[-1]
+
+
+
+def mcf_nn_reservoir_computing(
+        data_in=None,                       # ndarray (C, M_in)
+        fiber_length_m=5.0,                 # длина MCF, m
+        time_step_ps=0.1,                   # шаг по времени, ps
+        step_number_per_dimensionless_distance=500,
+        layer_count=1.0,
+        layer_radii_array=(1,),             # радиусы колец, µm
+        g0_array=(),
+        psat_array=(),
+        use_gpu=False,
+        display_debug_info=False,
+        display_plots=False,
+        save_gif=False
+):
+    # ─── входные данные ──────────────────────────────────────────
+    if data_in is None:
+        raise ValueError('Массив data_in размера (C×M) должен быть задан')
+    eq_size, M = data_in.shape
+
+    core_configuration = CoreConfig.hexagonal
+    light = Light(lambda0=1.55)                                 # µm
+
+    # ─── волокно и линейка ──────────────────────────────────────
+    fiber = Fiber(core_configuration=core_configuration,
+                  ring_count=layer_count,
+                  core_radius=2.95,
+                  cladding_diameter=125.0,
+                  n2=3.2,
+                  distance_to_fiber_center=layer_radii_array,
+                  NA=0.125,
+                  core_material=FiberMaterial.SIO2_AND_GEO2_ALLOY,
+                  material_concentration=0.038)
+    fiber.set_refractive_indexes_by_lambda(light.lambda0)
+
+    central_core_ind = int(eq_size / 2 + 1) if eq_size > 1 else 0
+
+    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_info=display_debug_info)
+    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
+    gamma = fiber.get_gamma(light, eps=1e-3)
+    beta1 = fiber.get_beta1(light)                     # [ps/m]
+    beta2 = fiber.get_beta2(light) * 1e-3             # [ps²/m]
+
+    if display_debug_info:
+        print("coupling_coefficient =", coupling_coefficient)
+        print("gamma =", gamma)
+        print("beta1 =", beta1)
+        print("beta2 =", beta2)
+
+    T = time_step_ps * M / 2
+
+    # ─── буфер задержки ──────────────────────────────────────────
+    fiber_propagation_time = fiber_length_m * beta1                           # [ps]
+
+    feedback_loop_propagation_time = 2 * T - fiber_propagation_time
+    beta1_air = 1 / light.c_light * 1e+12
+    feedback_length_m = feedback_loop_propagation_time / beta1_air  # длина воздушного плеча, m
+
+    if display_debug_info:
+        print()
+        print("fiber_length_m =", fiber_length_m)
+        print("feedback_length_m =", feedback_length_m)
+
+    assert feedback_length_m > fiber_length_m
+
+    L_D, L_NL, L_coupling, L_G, L_sat = compute_characteristic_lengths(beta2_ps2_m=beta2,
+                                         gamma_1_w_m=gamma,
+                                         coupling_coefficient=coupling_coefficient,
+                                         data_in=data_in,
+                                         time_step_ps=time_step_ps,
+                                         central_core_ind=central_core_ind,
+                                         g0_array=g0_array,
+                                         psat_array=psat_array,
+                                         display_debug_info=display_debug_info)
+
+    # ─── масштабы и временное окно ──────────────────────────────
+    time_scale = np.sqrt(0.5 * abs(beta2) / coupling_coefficient)                        # [ps]
+    length_scale = np.min([L_D, L_NL, L_coupling])  # [m]
+
+    fiber_length_dimensionless = fiber_length_m / length_scale
+    n_z = step_number_per_dimensionless_distance * int(round(fiber_length_dimensionless))
+
+    esat_array = np.asarray(psat_array) * 2 * T
+
+    if display_debug_info:
+        print("data_in.shape=", data_in.shape)
+        print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
+        print("fiber_propagation_time =", fiber_propagation_time, "ps")
+        print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
+        print("fiber_length_dimensionless =", fiber_length_dimensionless)
+        print("length_scale =", length_scale)
+        print("n_z =", n_z)
+        print("esat = ", esat_array)
+
+    # ─── Solver и параметры уравнения ────────────────────────────
+    
+    comp = ComputationalParameters(N=n_z, M=M,
+                                   L1=0.0, L2=fiber_length_m,
+                                   T1=-T, T2=T)
+
+    eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
+                            ring_count=layer_count,
+                            coupling_coefficient=coupling_coefficient, beta1=0,
+                            beta2=0, gamma=gamma,
+                            E_sat=esat_array, alpha=0.0, g_0=g0_array,
+                            display_debug_info=display_debug_info)
+
+    solver = Solver(comp, eq,
+                    initial_condition=data_in,
+                    stored_steps_count=None if display_debug_info else 2,
+                    use_dimensional=True,
+                    use_gpu=use_gpu,
+                    use_torch=use_gpu,
+                    display_debug_info=display_debug_info)
+
+    solver.linear_coeffs_array = coupling_matrix
+
+    solver.run_numerical_simulation(draw_modulus=display_debug_info,
+                                    draw_interval=10,
+                                    save_gif=save_gif,
+                                    yscale="linear")
+
+    if display_plots:
+        energies = [solver.energy[i, :] for i in range(solver.eq.size)]
+        names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
+        plot2D_plotly(solver.z, energies, names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
+
+        peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
+        names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
+        plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
+
+        plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][central_core_ind]) ** 2,
+                                 np.abs(solver.numerical_solution[-1][central_core_ind]) ** 2],
+                      names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
+
+        # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[central_core_ind]) ** 2, f"$|U_3(z,t)|^2$")
+
+    return solver.numerical_solution[-1] * np.exp(1j * beta1_air * feedback_length_m)
 
 
 if __name__ == '__main__':
 
-    layer_count = 1.1
+    layer_count = 1
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
 
@@ -377,7 +517,7 @@ if __name__ == '__main__':
         if i == 0:
             layer_radii_array[i] = 0 # [mkm]
         if i == 1:
-            layer_radii_array[i] = 2 * 17.3 # [mkm]
+            layer_radii_array[i] = 17.3 # [mkm]
         if i == 2:
             layer_radii_array[i] = 50 # [mkm]
 
@@ -402,19 +542,19 @@ if __name__ == '__main__':
     seed = 42
     data_in = mackey_glass_masked(core_count, M, seed, **mg_params) * 10
 
-    mcf_nn_reservoir_computing(
+    kappa = 0.9 # коэффициент обратной связи 0…1
+
+    modulation_frequency = 40 # GHz
+
+    data_out, feedback_length_m = mcf_nn_reservoir_computing(
+        data_in=data_in,  # ndarray (C, M_in)
         fiber_length_m=1,  # физическая длина MCF, m
-        feedback_length_m=1.1,  # длина воздушного плеча, m
-        abc_fraction=0,  # доля окна под ABC (с каждой стороны)
-        margin_fraction=0,  # отступ после ABC
-        time_step_ps=1,  # шаг сетки t, ps
-        step_number_per_dimensionless_distance=20,
+        time_step_ps=1/modulation_frequency*1e+3,  # шаг сетки t, ps
+        step_number_per_dimensionless_distance=200,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,  # радиусы колец, µm
         g0_array=g0_array,
         psat_array=psat_array,
-        data_in=data_in,  # ndarray (C, M_in)
-        kappa=0.9,  # коэффициент обратной связи 0…1
         use_gpu=False,
         display_debug_info=True,
         display_plots=True,
