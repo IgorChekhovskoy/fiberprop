@@ -147,8 +147,6 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
     display_debug_info : bool, optional
         True → печатать результаты.
     """
-    if not display_debug_info:
-        return
 
     power = np.abs(data_in[central_core_ind]) ** 2            # [W]
     P_peak = power.max() if power.size else 0.0
@@ -175,22 +173,23 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
     L_D  = T0_ps ** 2 / abs(beta2_ps2_m) if beta2_ps2_m else np.inf
     L_NL = 1.0 / (gamma_1_w_m * P_peak)  if P_peak else np.inf
     L_coupling = np.pi / 2 / coupling_coefficient
-    g0_c = float(g0_array[central_core_ind]) if len(g0_array) else 0.0
-    L_G  = 1.0 / g0_c if g0_c > 0 else np.inf
-    Esat = float(psat_array[central_core_ind]) if len(psat_array) else 0.0
-    L_sat = Esat / P_peak if P_peak else np.inf
+    #g0_c = float(g0_array[central_core_ind]) if len(g0_array) else 0.0
+    #L_G  = 1.0 / g0_c if g0_c > 0 else np.inf
+    #Esat = float(psat_array[central_core_ind]) if len(psat_array) else 0.0
+    #L_sat = Esat / P_peak if P_peak else np.inf
 
-    print()
-    print(f"P_peak = {P_peak:.3e} W")
-    print(f"τ_FWHM = {tau_fwhm_ps:.3f} ps,   T0 = {T0_ps:.3f} ps")
-    print(f"L_D    = {L_D:.3f} m  (дисперсионная длина)")
-    print(f"L_NL   = {L_NL:.3f} m  (нелинейная длина)")
-    print(f"L_coupling   = {L_coupling:.3f} m  (длина связи)")
-    print(f"L_G    = {L_G:.3f} m  (длина усиления 1/g0)")
-    print(f"L_sat  = {L_sat:.3f} m  (экв. путь до насыщения)")
-    print()
+    if display_debug_info:
+        print()
+        print(f"P_peak = {P_peak:.3e} W")
+        print(f"τ_FWHM = {tau_fwhm_ps:.3f} ps,   T0 = {T0_ps:.3f} ps")
+        print(f"L_D    = {L_D:.3f} m  (дисперсионная длина)")
+        print(f"L_NL   = {L_NL:.3f} m  (нелинейная длина)")
+        print(f"L_coupling   = {L_coupling:.3f} m  (длина связи)")
+        # print(f"L_G    = {L_G:.3f} m  (длина усиления 1/g0)")
+        # print(f"L_sat  = {L_sat:.3f} m  (экв. путь до насыщения)")
+        print()
 
-    return L_D, L_NL, L_coupling, L_G, L_sat
+    return L_D, L_NL, L_coupling #, L_G, L_sat
 
 
 def mcf_nn_reservoir_computing_for_debug(
@@ -231,7 +230,7 @@ def mcf_nn_reservoir_computing_for_debug(
                   material_concentration=0.038)
     fiber.set_refractive_indexes_by_lambda(light.lambda0)
 
-    central_core_ind = int(eq_size / 2 + 1) if eq_size > 1 else 0
+    central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
 
     coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_info=display_debug_info)
     coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
@@ -395,9 +394,10 @@ def mcf_nn_reservoir_computing(
                   NA=0.125,
                   core_material=FiberMaterial.SIO2_AND_GEO2_ALLOY,
                   material_concentration=0.038)
+
     fiber.set_refractive_indexes_by_lambda(light.lambda0)
 
-    central_core_ind = int(eq_size / 2 + 1) if eq_size > 1 else 0
+    central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
 
     coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_info=display_debug_info)
     coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
@@ -422,12 +422,13 @@ def mcf_nn_reservoir_computing(
 
     if display_debug_info:
         print()
+        print("beta1_air =", beta1_air)
         print("fiber_length_m =", fiber_length_m)
         print("feedback_length_m =", feedback_length_m)
 
     assert feedback_length_m > fiber_length_m
 
-    L_D, L_NL, L_coupling, L_G, L_sat = compute_characteristic_lengths(beta2_ps2_m=beta2,
+    L_D, L_NL, L_coupling = compute_characteristic_lengths(beta2_ps2_m=beta2,
                                          gamma_1_w_m=gamma,
                                          coupling_coefficient=coupling_coefficient,
                                          data_in=data_in,
@@ -499,7 +500,7 @@ def mcf_nn_reservoir_computing(
 
         # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[central_core_ind]) ** 2, f"$|U_3(z,t)|^2$")
 
-    return solver.numerical_solution[-1] * np.exp(1j * beta1_air * feedback_length_m)
+    return solver.numerical_solution[-1] * np.exp(1j * beta1_air * feedback_length_m), feedback_length_m
 
 
 if __name__ == '__main__':
@@ -517,7 +518,7 @@ if __name__ == '__main__':
         if i == 0:
             layer_radii_array[i] = 0 # [mkm]
         if i == 1:
-            layer_radii_array[i] = 17.3 # [mkm]
+            layer_radii_array[i] = 2 * 17.3 # [mkm]
         if i == 2:
             layer_radii_array[i] = 50 # [mkm]
 
@@ -544,12 +545,12 @@ if __name__ == '__main__':
 
     kappa = 0.9 # коэффициент обратной связи 0…1
 
-    modulation_frequency = 40 # GHz
+    modulation_frequency_ghz = 40 # GHz
 
     data_out, feedback_length_m = mcf_nn_reservoir_computing(
         data_in=data_in,  # ndarray (C, M_in)
         fiber_length_m=1,  # физическая длина MCF, m
-        time_step_ps=1/modulation_frequency*1e+3,  # шаг сетки t, ps
+        time_step_ps=1/modulation_frequency_ghz*1e+3,  # шаг сетки t, ps
         step_number_per_dimensionless_distance=200,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,  # радиусы колец, µm
