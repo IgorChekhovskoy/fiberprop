@@ -21,16 +21,45 @@ def mackey_glass(t_size, tau=17, n=10, beta=2, gamma=1, initial_condition=1.2):
     return t
 
 
-def create_masks(eq_size, t_size, seed):
-    np.random.seed(seed)
-    masks = np.random.uniform(0, 1, (eq_size, t_size))
-    return masks
+def create_mask(mask_size: int, seed: int | None = None) -> np.ndarray:
+    """
+    Генерирует одну и ту же случайную маску длиной *mask_size*
+    для всех сердцевин.
+    """
+    rng = np.random.default_rng(seed)
+    return rng.uniform(0.0, 1.0, mask_size)
 
 
-def mackey_glass_masked(eq_size, t_size, seed, **mg_params):
-    mg_series = mackey_glass(t_size, **mg_params)
-    masks = create_masks(eq_size, t_size, seed)
-    initial_conditions = masks * mg_series
+def mackey_glass_masked(core_count: int,
+                        mackey_glass_symbol_count: int,
+                        mask_size: int,
+                        seed: int | None = None,
+                        **mg_params) -> np.ndarray:
+    """
+    Формирует входной сигнал для резервуарных вычислений.
+
+    1. Строим ряд Макея-Гласса длиной *mackey_glass_symbol_count*.
+    2. Создаём одну маску длиной *mask_size* (одинакова для всех C).
+    3. Для каждого символа sᵢ берём поэлементное произведение
+       sᵢ × mask и конкатенируем. Итоговая длина:
+       *mackey_glass_symbol_count × mask_size*.
+    4. Дублируем получившийся вектор для всех *core_count* сердцевин.
+
+    Возвращает ndarray формы (C, mackey_glass_symbol_count·mask_size).
+    """
+    # 1. Ряд Макея-Гласса
+    mg_series = mackey_glass(mackey_glass_symbol_count, **mg_params)   # (S,)
+
+    # 2. Маска
+    mask = create_mask(mask_size, seed)                                # (M,)
+
+    # 3. Поэлементное произведение каждого символа и маски,
+    #    затем склейка: kron даёт нужный порядок [s0·mask, s1·mask, …]
+    pattern = np.kron(mg_series, mask)                                 # (S*M,)
+
+    # 4. Дублируем для всех сердцевин
+    initial_conditions = np.tile(pattern, (core_count, 1))                # (C, S*M)
+
     return initial_conditions
 
 
@@ -376,6 +405,109 @@ def mcf_nn_reservoir_computing(
         display_plots=False,
         save_gif=False
 ):
+    """
+        Численно моделирует единичный *пробег* комплексного сигнала по
+        многоядерному волокну (MCF) и воздушному плечу обратной связи.
+
+        Алгоритм строит полное комплексное поле **U(z,t)** для всех *C*
+        сердцевин, интегрируя систему линейно-связанных NLSE
+        с помощью метода расщепления по физическим процессам (SSFM).
+        По завершении возвращается комплексное поле на выходе MCF и
+        требуемая длина воздушного плеча задержки.
+
+        ----------
+        Параметры
+        ----------
+        data_in : ndarray, shape = (C, M)
+            **Начальное условие** – комплексная огибающая сигналов (√W)
+            в *C* сердцевинах (комплексные величины).
+            *C* — количество сердцевин, *M* — размер временной сетки.
+        fiber_length_m : float, default 5.0
+            Длина моделируемого участка многоядерного волокна, м.
+        time_step_ps : float, default 0.1
+            Шаг временной сетки Δt в пикосекундах (ps).
+            Общая длительность окна 2 T = *M* Δt.
+        step_number_per_dimensionless_distance : int, default 500
+            Число продольных шагов интегрирования SSFM на единицу
+            безразмерной длины (см. *length_scale* ниже).
+        layer_count : float, default 1
+            Число кольцевых слоёв вокруг центральной сердцевины
+            (0 → одиночное ядро).
+        layer_radii_array : tuple[float, …], default (1.,)
+            Радиусы слоёв (микроны), начиная с центрального (0 µm).
+            Длина = ``layer_count + 1``.
+        g0_array : array-like, default ()
+            Коэффициенты малого-сигнала g₀ [1/м] для *C* сердцевин.
+            Нулевой массив → усиление отключено.
+        psat_array : array-like, default ()
+            Мощность насыщения P_sat, Вт, для *C* сердцевин
+            (используется как E_sat = 2 T P_sat).
+        use_gpu : bool, default False
+            True → основное ядро SSFM выполняется на GPU (PyTorch-CUDA),
+            иначе – NumPy/CPU.
+        display_debug_info : bool, default False
+            Печатает расчётные коэффициенты, характерные длины,
+            задержки и прочие служебные данные.
+        display_plots : bool, default False
+            Визуализация хода интегрирования и итоговых спектров
+            средствами plotly (2D/3D).
+        save_gif : bool, default False
+            При включённой отрисовке modulus-кадров сохраняет анимацию
+            эволюции поля в GIF-файл в рабочем каталоге.
+
+        ----------
+        Возвращает
+        ----------
+        data_out : ndarray, shape = (C, M)
+            Комплексное поле после прохождения MCF
+            *и* фазового сдвига в воздушном плече:
+            ``U_out = U(L, t) · exp(+j β₁,air · L_air)``.
+        feedback_length_m : float
+            Рассчитанная длина воздушного плеча петли обратной связи.
+
+        ----------
+        Исключения
+        ----------
+        ValueError
+            • `data_in is None` или некорректной формы
+            • Размерности массивов g₀/E_sat не совпадают с *C*.
+        AssertionError
+            Возникает, если вычисленная длина воздушного плеча
+            меньше самой секции MCF (нарушена длительность окна).
+
+        ----------
+        Примечания
+        ----------
+        * Характерное время **T₀** вычисляется по FWHM импульса
+          центральной сердцевины, далее строятся длины
+          L_D, L_NL, L_coup.  Минимальная из них задаёт
+          *length_scale*, что, в сочетании с
+          *step_number_per_dimensionless_distance*, определяет
+          общее число продольных шагов `N` для интегратора.
+        * В GPU-режиме копируются на CPU только
+          ``stored_steps_count`` снимков поля – экономия VRAM.
+        * Подробнее о применении delay-based reservoir computing
+          с многоядерным волокном см.:
+          S. Honardoost *et al.*, *Opt. Express* 26 (2018) 11072-11090;
+          L. Duport *et al.*, *IEEE Photon. Tech. Lett.* 31 (2019) 890-893.
+
+        ----------
+        Пример
+        ----------
+        >>> M = 8192                       # точек на окно
+        >>> C = 7                          # сердцевин
+        >>> u0 = np.random.randn(C, M) * .01
+        >>> u_out, L_air = mcf_nn_reservoir_computing(
+        ...     data_in=u0,
+        ...     fiber_length_m=1.0,
+        ...     time_step_ps=25,           # 40 GHz
+        ...     step_number_per_dimensionless_distance=300,
+        ...     layer_count=1,
+        ...     layer_radii_array=(0., 34.6),
+        ...     display_debug_info=True
+        ... )
+        """
+
     # ─── входные данные ──────────────────────────────────────────
     if data_in is None:
         raise ValueError('Массив data_in размера (C×M) должен быть задан')
@@ -532,7 +664,9 @@ if __name__ == '__main__':
     for i in range(core_count):
         psat_array[i] = 40 * 5e-4 # мощность насыщения [W]
 
-    M = 2**13
+    mackey_glass_symbol_count = 40
+    mask_size = 40
+
     mg_params = {
         'tau': 17,
         'n': 10,
@@ -541,7 +675,12 @@ if __name__ == '__main__':
         'initial_condition': 1.2
     }
     seed = 42
-    data_in = mackey_glass_masked(core_count, M, seed, **mg_params) * 10
+    data_in = mackey_glass_masked(core_count, mackey_glass_symbol_count, mask_size, seed, **mg_params) # √W
+
+    required_avg_power_w = 1.0  # ← задайте требуемую среднюю мощность, W
+    current_avg_power = np.mean(np.abs(data_in) ** 2)  # ⟨|U|²⟩
+    scale_factor = np.sqrt(required_avg_power_w / current_avg_power)
+    data_in *= scale_factor
 
     kappa = 0.9 # коэффициент обратной связи 0…1
 

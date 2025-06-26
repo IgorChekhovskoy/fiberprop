@@ -2,7 +2,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import numpy as np
-from sympy import false
 
 
 def plot3D(z, t, field, name, filename=None, file_format='png', yscale='linear'):
