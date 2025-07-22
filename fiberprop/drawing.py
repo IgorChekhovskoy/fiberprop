@@ -92,7 +92,7 @@ def plot2D(t_arrr, func_arr, name='', filename=None, file_format='png', yscale='
 
 
 def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_text='График функций',
-                  names=None, filename=None, file_format='png', yscale='linear'):
+                  names=None, filename=None, file_format='png', yscale='linear', linewidth=1):
     """ Функция строит и выводит одномерный график с использованием Plotly """
 
     fig = go.Figure()
@@ -122,9 +122,9 @@ def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_te
         plot_bgcolor='white',
         paper_bgcolor='white',
         margin=dict(l=60, r=20, t=60, b=60),
-        xaxis=dict(showline=True, linewidth=2, linecolor='black', mirror=True, ticks='outside', showgrid=True,
+        xaxis=dict(showline=True, linewidth=linewidth, linecolor='black', mirror=True, ticks='outside', showgrid=True,
                    gridwidth=0.5, gridcolor='gray'),
-        yaxis=dict(showline=True, linewidth=2, linecolor='black', mirror=True, ticks='outside', showgrid=True,
+        yaxis=dict(showline=True, linewidth=linewidth, linecolor='black', mirror=True, ticks='outside', showgrid=True,
                    gridwidth=0.5, gridcolor='gray', exponentformat='power', type=yscale)
     )
 

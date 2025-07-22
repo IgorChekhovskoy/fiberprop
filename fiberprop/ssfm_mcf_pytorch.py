@@ -1,5 +1,6 @@
 import torch
 import torch.fft as fft
+from tqdm import trange
 
 
 def get_energy_rectangles_pytorch(arr_func, time_step):
@@ -137,4 +138,91 @@ def ssfm_order2_pytorch(
 
     # вернём psi и обновлённый NumPy-энергий,
     # чтобы caller заполнил self.energy[:, n+1]
+    return psi
+
+
+#################################################
+
+def _nonlinear_step_windowed_pytorch(
+        psi: torch.Tensor,
+        gamma_h: torch.Tensor, g0_h: torch.Tensor,
+        exp_g0h: torch.Tensor, exp_2g0h: torch.Tensor,
+        E_sat: torch.Tensor, g0: torch.Tensor,
+        tau: float, window: int
+) -> None:
+    """
+    In-place Kerr + gain with rectangular windowing along time axis.
+    Проходимся с шагом window, чтобы уменьшить перепады энергии
+    и исключить OOM на очень длинных записей.
+    """
+    C, M = psi.shape
+    for s in range(0, M, window):
+        e = min(M, s + window)
+        view = psi[:, s:e]          # (C, w) – общая ссылка, без .clone()
+        # энергия в окне для каждого core
+        E_slice = (view.abs() ** 2).sum(dim=1) * tau   # (C,)
+        # применяем обычный нелинейный шаг
+        nonlinear_step_pytorch(
+            view, gamma_h, g0_h, exp_g0h, exp_2g0h,
+            E_sat, g0, E_slice
+        )
+
+# ─────────────────────────────────────────────────────────────
+def ssfm_order2_dnd_windowed_torch(
+        solver,
+        window_size: int,
+        damp_length: float = 0.0,
+) -> torch.Tensor:
+    """
+    Полностью GPU-ориентированный вариант схемы «D-N-D»
+    с оконным нелинейным шагом. Работает и на CPU, если
+    solver.device — 'cpu'.
+
+    Возвращает final-tensor psi    (C, M).
+    """
+    # исходное поле
+    psi = torch.as_tensor(
+        solver.numerical_solution[0],
+        dtype=solver.ctype,
+        device=solver.device
+    )
+
+    # --- матрицы линейного шага (½-h, h, −½-h) -------------------
+    D_half_t  = torch.as_tensor(solver.D_half,  dtype=solver.ctype,
+                                device=solver.device)
+    D_full_t  = torch.as_tensor(solver.D,       dtype=solver.ctype,
+                                device=solver.device)
+    invD_half = torch.as_tensor(solver.invD_half, dtype=solver.ctype,
+                                device=solver.device)
+
+    tau = solver.com.tau
+    gamma_h  = solver.gamma_h_t
+    g0_h     = solver.g0_h_t
+    exp_g0h  = solver.exp_g0h_t
+    exp_2g0h = solver.exp_2g0h_t
+    g0       = solver.g0_t
+    E_sat    = solver.E_sat_t
+
+    # ------------- префикс: ½-D -----------------------------------
+    psi = linear_step_pytorch(psi, solver.has_beta, D_half_t)
+    if damp_length:
+        psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
+
+    # ------------- основной цикл по z -----------------------------
+    for _ in trange(solver.com.N):
+
+        _nonlinear_step_windowed_pytorch(
+            psi, gamma_h, g0_h, exp_g0h, exp_2g0h,
+            E_sat, g0, tau, window_size
+        )
+
+        psi = linear_step_pytorch(psi, solver.has_beta, D_full_t)
+        if damp_length:
+            psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
+
+    # ------------- суффикс: ½-D⁻¹ ----------------------------------
+    psi = linear_step_pytorch(psi, solver.has_beta, invD_half)
+    if damp_length:
+        psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
+
     return psi

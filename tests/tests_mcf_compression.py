@@ -168,7 +168,7 @@ def test_mcf_compression_dimensional():
     L2 = 1.78 * length_scale # [m]
     T = 30 * time_scale # [ps]
 
-    computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T)
+    computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T, method="ssfm_order2_dnd_windowed")
 
     equation_params = EquationParameters(core_configuration=CoreConfig.hexagonal, size=7, ring_count=1,
                                          coupling_coefficient=coupling_coefficient, beta2=beta2, gamma=gamma,
@@ -179,7 +179,7 @@ def test_mcf_compression_dimensional():
                     pulses=gaussian_pulse,
                     pulse_params_list={"p": 0.687 * power_scale,
                                        "tau": 1.775 * time_scale},
-                    use_gpu=True)
+                    use_gpu=False)
 
     solver.run_numerical_simulation()
 
@@ -191,16 +191,16 @@ def test_mcf_compression_dimensional():
     names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
     plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
 
-    plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][3]) ** 2,
-                             np.abs(solver.numerical_solution[solver.com.N][3]) ** 2],
-                  names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
+    # plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][3]) ** 2,
+    #                          np.abs(solver.numerical_solution[solver.com.N][3]) ** 2],
+    #               names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]')
 
     # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[3]) ** 2, f"$|U_3(z,t)|^2$")
 
     print(solver.peak_power[3][solver.com.N] / solver.peak_power[3][0])
     print(solver.energy[3][solver.com.N] / solver.energy[3][0])
 
-    assert abs(solver.peak_power[3][solver.com.N] / solver.peak_power[3][0] - 32.6) < 1e-1, "Expected 32.6"
+    assert abs(solver.peak_power[3][solver.com.N] / solver.peak_power[3][0] - 37.7) < 1e-1, "Expected 37.7"
     assert abs(solver.energy[3][solver.com.N] / solver.energy[3][0] - 6.41) < 1e-2, "Expected 6.41"
 
 
@@ -235,7 +235,7 @@ def test_mcf_compression_dimensional_to_dimensionless():
                     pulses=gaussian_pulse,
                     pulse_params_list={"p": 0.687 * power_scale,
                                        "tau": 1.775 * time_scale},
-                    use_gpu=True)
+                    use_gpu=False)
 
     solver.convert_to_dimensionless(coupling_coefficient, gamma, beta2)
 

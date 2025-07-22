@@ -4,6 +4,8 @@ from numpy import newaxis as _na
 
 from numba import njit
 from scipy.fft import fft, ifft
+from tqdm import trange
+
 from .pulses import *
 
 
@@ -91,8 +93,8 @@ def linear_step(psi, has_beta, D):
         return D @ psi
 
 
-def ssfm_order2(psi, current_energy, solver,
-                h, tau, damp_length=0.0, noise_amplitude=0.0):
+def ssfm_order2_ndn(psi, current_energy, solver,
+                    h, tau, window_size, damp_length=0.0, noise_amplitude=0.0):
     """psi.shape=(n,M); current_E=(n,).  Возвращает psi (как в исходнике)."""
     g0   = solver.eq.g_0
     gain = g0 != 0.0
@@ -125,6 +127,10 @@ def ssfm_order2(psi, current_energy, solver,
                    solver.gamma_h_half, solver.g0_h_half,
                    solver.exp_g0h_half, solver.exp_2g0h_half,
                    solver.eq.E_sat, g0, current_energy)
+
+    # _nl_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
+    #              solver.exp_g0h_half, solver.exp_2g0h_half,
+    #              solver.eq.E_sat, solver.eq.g_0, tau, window_size)
 
     # absorber-3
     if damp_length:
@@ -211,19 +217,78 @@ def ssfm_order1_resonator_fullcos(psi_forward, psi_backward, D, gamma, E_sat, g_
     return psi_forward
 
 
-def ssfm_order2_2(psi, current_energy, solver,
-                h, tau, damp_length=0.0, noise_amplitude=0.0):
+def ssfm_order2_dnd(psi, current_energy, solver,
+                    h, tau, damp_length=0.0, noise_amplitude=0.0):
     """ Реализация схемы расщепления """
 
-    psi = linear_step(psi, solver.has_beta, solver.D)
+    psi = linear_step(psi, solver.has_beta, solver.D_half)
 
-    num = len(psi)
-    for i in range(num):
-        if solver.eq.g_0[i] != 0:  # нет усиления
-            current_energy[i] = get_energy_rectangles(psi[i], tau)
-    nonlinear_step(psi, solver.eq.gamma, solver.eq.E_sat, solver.eq.g_0, current_energy, h)
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
-    psi = linear_step(psi, solver.has_beta, solver.D)
+    g0 = solver.eq.g_0
+    gain = g0 != 0.0
+    if gain.any():
+        current_energy[gain] = (np.abs(psi[gain]) ** 2).sum(1) * tau
+
+    nonlinear_step(psi,
+                   solver.gamma_h, solver.g0_h,
+                   solver.exp_g0h, solver.exp_2g0h,
+                   solver.eq.E_sat, g0, current_energy)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    psi = linear_step(psi, solver.has_beta, solver.D_half)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    # шум
+    if noise_amplitude:
+        noise = noise_amplitude * (
+                np.random.uniform(-1, 1, psi.shape) +
+                1j * np.random.uniform(-1, 1, psi.shape)
+        )
+        psi += noise
+
+    return psi
+
+
+def nonlinear_step_in_fourier_space(psi: np.ndarray,
+                   gamma_h, g0_h, exp_g0h, exp_2g0h, tau,
+                   E_sat: np.ndarray,
+                   g0:   np.ndarray,
+                   current_energy: np.ndarray) -> None:
+    """in-place обновление psi (n,M)."""
+
+    psi_t = ifft(psi, axis=1)
+
+    gain = g0 != 0.0
+
+    if gain.any():
+        current_energy[gain] = (np.abs(psi_t[gain]) ** 2).sum(1) * tau
+
+    nonlinear_step(psi_t, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, g0, current_energy)
+
+    psi[:] = fft(psi_t, axis=1)
+
+
+def linear_step_in_fourier_space(psi_f, D):
+
+    return np.einsum('ijk,jk->ik', D, psi_f, optimize=True)
+
+
+def ssfm_order2_2_in_fourier_space(psi, current_energy, solver, h, tau):
+
+    psi = linear_step_in_fourier_space(psi, solver.D)
+
+    nonlinear_step_in_fourier_space(psi,
+                   solver.gamma_h, solver.g0_h,
+                   solver.exp_g0h, solver.exp_2g0h, tau,
+                   solver.eq.E_sat, solver.eq.g_0, current_energy)
+
+    psi = linear_step_in_fourier_space(psi, solver.D)
 
     return psi
 
@@ -236,3 +301,122 @@ def apply_absorbing_boundary(psi: np.ndarray, *, solver) -> np.ndarray:
     psi *= taper          # broadcasting (M,) → (C,M)
     return psi
 
+################################################
+
+# def nonlinear_step_windowed(psi: np.ndarray,
+#                             gamma_h, g0_h, exp_g0h, exp_2g0h,
+#                             E_sat: np.ndarray,
+#                             g_0:   np.ndarray,
+#                             tau, window):
+#     for s in range(0, psi.shape[1], window):
+#         e = min(psi.shape[1], s+window)
+#         view = psi[:, s:e]
+#         energy = (np.abs(view)**2).sum(1)*tau
+#         nonlinear_step(view,
+#                        gamma_h, g0_h,
+#                        exp_g0h, exp_2g0h,
+#                        E_sat, g_0, energy)
+
+
+def nonlinear_step_windowed(psi: np.ndarray,
+                            gamma_h, g0_h, exp_g0h, exp_2g0h,
+                            E_sat: np.ndarray,
+                            g_0:   np.ndarray,
+                            tau: float,
+                            window: int,
+                            *,
+                            offset_left: int = 0):
+    """
+    Kerr-+-gain шаг с «пустыми» зонами offset.
+    Усиление применяется ТОЛЬКО внутри [offset_left, offset_right).
+    """
+    offset_right = psi.shape[1] - offset_left     # симметрия по умолчанию
+
+    # константы «без усиления»
+    g0_zeros = np.zeros_like(g_0)
+    exp_1    = np.ones_like(exp_g0h)
+
+    M = psi.shape[1]
+    for s in range(0, M, window):
+        e    = min(M, s + window)
+        view = psi[:, s:e]
+
+        # границы окна относительно рабочей зоны
+        l_off = max(0, offset_left  - s)          # сколько точек слева без усиления
+        r_off = max(0, e - offset_right)          # сколько точек справа без усиления
+        core_len = view.shape[1] - l_off - r_off  # длина «рабочей» части
+
+        # ---- левая offset-часть ---------------------------------------
+        if l_off:
+            sub = view[:, :l_off]
+            energy = (np.abs(sub)**2).sum(1) * tau
+            nonlinear_step(sub,
+                           gamma_h, g0_h*0,   # g0 = 0
+                           exp_1,  exp_1,     # exp(g0·h) = 1
+                           E_sat,  g0_zeros,
+                           energy)
+
+        # ---- центральная часть с усилением ----------------------------
+        if core_len > 0:
+            sub = view[:, l_off:l_off + core_len]
+            energy = (np.abs(sub)**2).sum(1) * tau
+            nonlinear_step(sub,
+                           gamma_h, g0_h,
+                           exp_g0h, exp_2g0h,
+                           E_sat,   g_0,
+                           energy)
+
+        # ---- правая offset-часть --------------------------------------
+        if r_off:
+            sub = view[:, -r_off:]
+            energy = (np.abs(sub)**2).sum(1) * tau
+            nonlinear_step(sub,
+                           gamma_h, g0_h*0,
+                           exp_1,   exp_1,
+                           E_sat,   g0_zeros,
+                           energy)
+
+def ssfm_order2_ndn_windowed(psi, current_energy, solver,
+                            h, tau, window_size,
+                            damp_length=0.0, noise_amplitude=0.0):
+
+    nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
+                            solver.exp_g0h_half, solver.exp_2g0h_half,
+                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+
+    psi = linear_step(psi, solver.has_beta, solver.D)
+
+    nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
+                            solver.exp_g0h_half, solver.exp_2g0h_half,
+                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+
+    # current_energy[:] = np.sum(np.abs(psi)**2, axis=1)*tau
+
+    return psi
+
+
+def ssfm_order2_dnd_windowed(solver, window_size, damp_length=0.0):
+
+    psi = linear_step(solver.numerical_solution[0], solver.has_beta, solver.D_half)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    for n in trange(solver.com.N):
+
+        nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
+                                solver.exp_g0h, solver.exp_2g0h,
+                                solver.eq.E_sat, solver.eq.g_0, solver.com.tau, window_size,
+                                offset_left=solver.com.offset_size)
+
+        psi = linear_step(psi, solver.has_beta, solver.D)
+
+        if damp_length:
+            psi = apply_absorbing_boundary(psi, solver=solver)
+
+    psi = linear_step(psi, solver.has_beta, solver.invD_half)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    return psi
