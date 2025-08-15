@@ -1,5 +1,6 @@
 import torch
 import torch.fft as fft
+from torch import Tensor
 from tqdm import trange
 
 
@@ -7,9 +8,6 @@ def get_energy_rectangles_pytorch(arr_func, time_step):
     """ Возвращает величину энергии (интеграл считается по формуле левых прямоугольников) """
     return torch.sum(torch.abs(arr_func) ** 2) * time_step
 
-
-import torch
-from torch import Tensor
 
 # @torch.jit.script
 def nonlinear_step_pytorch(psi: Tensor,
@@ -168,7 +166,7 @@ def _nonlinear_step_windowed_pytorch(
         )
 
 # ─────────────────────────────────────────────────────────────
-def ssfm_order2_dnd_windowed_torch(
+def ssfm_order2_dnd_windowed_short_torch(
         solver,
         window_size: int,
         damp_length: float = 0.0,

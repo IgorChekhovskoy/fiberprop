@@ -1,9 +1,23 @@
 import copy
 import numpy as np
 from numpy import newaxis as _na
-
 from numba import njit
-from scipy.fft import fft, ifft
+
+# === Многопоточные FFT (MKL, если есть; иначе SciPy с workers) ===
+import os
+try:
+    # вариант с MKL (если пакет установлен)
+    from numpy.fft import fft as _fft_impl, ifft as _ifft_impl
+    # from mkl_fft import fft as _fft_impl, ifft as _ifft_impl
+    def _fft_mt(x, axis):  return _fft_impl(x, axis=axis)
+    def _ifft_mt(x, axis): return _ifft_impl(x, axis=axis)
+except Exception:
+    # чистый SciPy: включаем многопоточность через workers
+    from scipy.fft import fft as _fft_impl, ifft as _ifft_impl
+    _workers = int(os.environ.get("OMP_NUM_THREADS", "1")) or 1
+    def _fft_mt(x, axis):  return _fft_impl(x, axis=axis, workers=_workers)
+    def _ifft_mt(x, axis): return _ifft_impl(x, axis=axis, workers=_workers)
+
 from tqdm import trange
 
 from .pulses import *
@@ -82,11 +96,11 @@ def linear_step(psi, has_beta, D):
     psi : (n, M) во временной области
     """
     if has_beta:
-        psi_f = fft(psi, axis=1)
+        psi_f = _fft_mt(psi, axis=1)
 
         psi_f = np.einsum('ijk,jk->ik', D, psi_f, optimize=True)
 
-        return ifft(psi_f, axis=1)
+        return _ifft_mt(psi_f, axis=1)
     else:
         # β₁ = β₂ = 0 : оператор не зависит от ω
         # простое перемножение в t-области
@@ -262,7 +276,7 @@ def nonlinear_step_in_fourier_space(psi: np.ndarray,
                    current_energy: np.ndarray) -> None:
     """in-place обновление psi (n,M)."""
 
-    psi_t = ifft(psi, axis=1)
+    psi_t = _ifft_mt(psi, axis=1)
 
     gain = g0 != 0.0
 
@@ -271,7 +285,7 @@ def nonlinear_step_in_fourier_space(psi: np.ndarray,
 
     nonlinear_step(psi_t, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, g0, current_energy)
 
-    psi[:] = fft(psi_t, axis=1)
+    psi[:] = _fft_mt(psi_t, axis=1)
 
 
 def linear_step_in_fourier_space(psi_f, D):
@@ -395,7 +409,7 @@ def ssfm_order2_ndn_windowed(psi, current_energy, solver,
     return psi
 
 
-def ssfm_order2_dnd_windowed(solver, window_size, damp_length=0.0):
+def ssfm_order2_dnd_windowed_short(solver, window_size, damp_length=0.0):
 
     psi = linear_step(solver.numerical_solution[0], solver.has_beta, solver.D_half)
 

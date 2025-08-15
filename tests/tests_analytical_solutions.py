@@ -55,7 +55,7 @@ def calculate_error(num: np.ndarray, ana: np.ndarray, tau: float) -> float:
 
 def make_solver(pulse: str, *, M: int, N: int) -> Solver:
     """Return a configured `Solver` instance for given grid sizes."""
-    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0, method="ssfm_order2_dnd_windowed")
+    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0, method="ssfm_order2_dnd_compact_windowed")
 
     if pulse == "fundamental":
         # Classic NLSE – only dispersion & Kerr non‑linearity
@@ -85,8 +85,10 @@ def make_solver(pulse: str, *, M: int, N: int) -> Solver:
                  pulses=p_func,
                  stored_steps_count=2,
                  pulse_params_list=p_kwargs,
+                 num_threads=6,
                  use_torch=False,
-                 use_gpu=False)
+                 use_gpu=False,
+                 display_debug_info=False)
     return sol
 
 def _dbg_plot(t, num, ana, title):
@@ -97,10 +99,10 @@ def _dbg_plot(t, num, ana, title):
     plt.figure(figsize=(6, 3))
     plt.plot(t, np.abs(ana.real - num.real), 'C0', label='Re error')
     plt.plot(t, np.abs(ana.imag - num.imag), 'C1', label='Im error')
-    # plt.plot(t, num.real, 'C0', label='Re num')
-    # plt.plot(t, ana.real, 'C1', label='Re ana')
-    # plt.plot(t, num.imag, 'C2', label='Im num')
-    # plt.plot(t, ana.imag, 'C3', label='Im ana')
+    #plt.plot(t, num.real, 'C0', label='Re num')
+    #plt.plot(t, ana.real, 'C1', label='Re ana')
+    #plt.plot(t, num.imag, 'C2', label='Im num')
+    #plt.plot(t, ana.imag, 'C3', label='Im ana')
     # plt.plot(t, abs(num), 'C4', label='Abs num')
     # plt.plot(t, abs(ana), 'C5', label='Abs ana')
     plt.title(title)

@@ -1,6 +1,8 @@
 import numpy as np
 from numpy.typing import NDArray
 from scipy.linalg.lapack import get_lapack_funcs
+from tqdm import trange
+
 from fiberprop.ssfm_mcf import apply_absorbing_boundary, nonlinear_step, linear_step, nonlinear_step_windowed
 
 __all__ = [
@@ -207,5 +209,32 @@ def ssfm_order2_dnd_compact_windowed(psi, current_energy, solver,
     psi = linear_step_compact(psi, solver, h * 0.5)
 
     current_energy[:] = np.sum(np.abs(psi)**2, axis=1)*tau
+
+    return psi
+
+
+def ssfm_order2_dnd_compact_windowed_short(solver, window_size, damp_length=0.0):
+
+    psi = linear_step_compact(solver.numerical_solution[0], solver, solver.com.h * 0.5)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    for n in trange(solver.com.N):
+
+        nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
+                                solver.exp_g0h, solver.exp_2g0h,
+                                solver.eq.E_sat, solver.eq.g_0, solver.com.tau, window_size,
+                                offset_left=solver.com.offset_size)
+
+        psi = linear_step_compact(psi, solver, solver.com.h)
+
+        if damp_length:
+            psi = apply_absorbing_boundary(psi, solver=solver)
+
+    psi = linear_step_compact(psi, solver, solver.com.h * 0.5)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
     return psi

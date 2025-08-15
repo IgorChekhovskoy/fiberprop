@@ -1,25 +1,43 @@
 import numpy as np
 
 def rk4_step(u, v, dt, dz, rhs_u, rhs_v, feedback_coefficient, boundary_condition, boundary_condition_derivative):
-    """Классический RK-4 для системы  du/dt=f , dv/dt=g ."""
-    k1u = rhs_u(u, v, dz)
-    k1v = rhs_v(u, v, dz)
+    """RK4 с наложением граничных условий на КАЖДОЙ стадии."""
+    def apply_bc(uu, vv):
+        uu[:, 0] = uu[:, -1] * feedback_coefficient + boundary_condition
+        vv[:, 0] = vv[:, -1] * feedback_coefficient + boundary_condition_derivative
+        return uu, vv
 
-    k2u = rhs_u(u + 0.5*dt*k1u, v + 0.5*dt*k1v, dz)
-    k2v = rhs_v(u + 0.5*dt*k1u, v + 0.5*dt*k1v, dz)
+    # k1
+    u1, v1 = apply_bc(u.copy(), v.copy())
+    k1u = rhs_u(u1, v1, dz)
+    k1v = rhs_v(u1, v1, dz)
 
-    k3u = rhs_u(u + 0.5*dt*k2u, v + 0.5*dt*k2v, dz)
-    k3v = rhs_v(u + 0.5*dt*k2u, v + 0.5*dt*k2v, dz)
+    # k2
+    u2 = u + 0.5 * dt * k1u
+    v2 = v + 0.5 * dt * k1v
+    u2, v2 = apply_bc(u2, v2)
+    k2u = rhs_u(u2, v2, dz)
+    k2v = rhs_v(u2, v2, dz)
 
-    k4u = rhs_u(u + dt*k3u, v + dt*k3v, dz)
-    k4v = rhs_v(u + dt*k3u, v + dt*k3v, dz)
+    # k3
+    u3 = u + 0.5 * dt * k2u
+    v3 = v + 0.5 * dt * k2v
+    u3, v3 = apply_bc(u3, v3)
+    k3u = rhs_u(u3, v3, dz)
+    k3v = rhs_v(u3, v3, dz)
 
-    u_next = u + dt/6. * (k1u + 2*k2u + 2*k3u + k4u)
-    v_next = v + dt/6. * (k1v + 2*k2v + 2*k3v + k4v)
+    # k4
+    u4 = u + dt * k3u
+    v4 = v + dt * k3v
+    u4, v4 = apply_bc(u4, v4)
+    k4u = rhs_u(u4, v4, dz)
+    k4v = rhs_v(u4, v4, dz)
 
-    u_next[:,0] = u_next[:,-1] * feedback_coefficient + boundary_condition
-    v_next[:,0] = v_next[:,-1] * feedback_coefficient + boundary_condition_derivative
+    u_next = u + (dt / 6.0) * (k1u + 2*k2u + 2*k3u + k4u)
+    v_next = v + (dt / 6.0) * (k1v + 2*k2v + 2*k3v + k4v)
 
+    # финальный край на t_{n+1}
+    u_next, v_next = apply_bc(u_next, v_next)
     return u_next, v_next
 
 

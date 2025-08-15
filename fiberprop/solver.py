@@ -3,6 +3,8 @@ from scipy.fft import fftfreq
 from dataclasses import dataclass, field
 from typing import Union
 from math import sqrt, pi
+import os
+os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
 from numba import njit
 
 from .fiber_geometry import make_eq_mask, CoreConfig, get_core_count
@@ -10,14 +12,16 @@ from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_d
 from .pulses import zero_pulse
 from .drawing import *
 from .rk4 import rk4_step
-from .rk4_pytorch import rk4_step_torch
 from .ssfm_compact_scheme_mcf import ssfm_order2_ndn_compact_windowed, prepare_compact_solver_for_linear_step, \
-    ssfm_order2_dnd_compact_windowed
+    ssfm_order2_dnd_compact_windowed, ssfm_order2_dnd_compact_windowed_short
 from .ssfm_mcf import ssfm_order2_ndn, get_energy_rectangles, ssfm_order1_resonator_nocos, \
     ssfm_order1_resonator_fullcos, \
-    ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed
+    ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed_short
 from .stationary_solution_solver import find_stationary_solution
 from .utils import fft_derivative
+
+from .threading_control import configure_threads, threading_report
+
 
 try:
     import torch
@@ -25,7 +29,8 @@ try:
 except ImportError:
     is_torch_available = False
 
-from .ssfm_mcf_pytorch import ssfm_order2_pytorch, ssfm_order2_dnd_windowed_torch
+from .ssfm_mcf_pytorch import ssfm_order2_pytorch, ssfm_order2_dnd_windowed_short_torch
+from .rk4_pytorch import rk4_step_torch
 
 
 @dataclass
@@ -120,6 +125,7 @@ class EquationParameters:
         alpha (float | np.ndarray | list): Коэффициент потерь [1/m]
         g_0 (float | np.ndarray | list): Ненасыщенное усиление [1/m]
         coupling_coefficient (float | np.ndarray | list): Коэффициент связи между сердцевинами [1/m]
+        coupling_matrix (np.ndarray ): (size×size), если задана — перекрывает coupling_coefficient
         noise_amplitude (float): Амплитуда аддитивного белого шума  [sqrt(W/2)]
 
     Особенности:
@@ -152,6 +158,7 @@ class EquationParameters:
     alpha: Union[float, np.ndarray, list] = 0.0
     g_0: Union[float, np.ndarray, list] = 0.0
     coupling_coefficient: Union[float, np.ndarray, list] = 1.0
+    coupling_matrix: np.ndarray | None = None  # (size×size), если задана — перекрывает coupling_coefficient
     noise_amplitude: float = 0.0  # амплитуда аддитивного белого шума (на каждом шаге)
 
     def __post_init__(self):
@@ -176,34 +183,19 @@ class EquationParameters:
         )
 
         # Преобразование скалярных параметров и списков в массивы одинаковых значений
-        if isinstance(self.beta1, (int, float, list)):
-            self.beta1 = np.array(self.beta1, dtype=float)
-            if self.beta1.ndim == 0:
-                self.beta1 = np.full(self.size, self.beta1, dtype=float)
-        if isinstance(self.beta2, (int, float, list)):
-            self.beta2 = np.array(self.beta2, dtype=float)
-            if self.beta2.ndim == 0:
-                self.beta2 = np.full(self.size, self.beta2, dtype=float)
-        if isinstance(self.gamma, (int, float, list)):
-            self.gamma = np.array(self.gamma, dtype=float)
-            if self.gamma.ndim == 0:
-                self.gamma = np.full(self.size, self.gamma, dtype=float)
-        if isinstance(self.E_sat, (int, float, list)):
-            self.E_sat = np.array(self.E_sat, dtype=float)
-            if self.E_sat.ndim == 0:
-                self.E_sat = np.full(self.size, self.E_sat, dtype=float)
-        if isinstance(self.alpha, (int, float, list)):
-            self.alpha = np.array(self.alpha, dtype=float)
-            if self.alpha.ndim == 0:
-                self.alpha = np.full(self.size, self.alpha, dtype=float)
-        if isinstance(self.g_0, (int, float, list)):
-            self.g_0 = np.array(self.g_0, dtype=float)
-            if self.g_0.ndim == 0:
-                self.g_0 = np.full(self.size, self.g_0, dtype=float)
-        if isinstance(self.coupling_coefficient, (int, float, list)):
-            self.coupling_coefficient = np.array(self.coupling_coefficient, dtype=float)
-            if self.coupling_coefficient.ndim == 0:
-                self.coupling_coefficient = np.full(self.size, self.coupling_coefficient, dtype=float)
+        def _to_array(x, size):
+            arr = np.asarray(x, dtype=float)
+            if arr.ndim == 0:
+                arr = np.full(size, float(arr), dtype=float)
+            return arr
+
+        self.beta1 = _to_array(self.beta1, self.size)
+        self.beta2 = _to_array(self.beta2, self.size)
+        self.gamma = _to_array(self.gamma, self.size)
+        self.E_sat = _to_array(self.E_sat, self.size)
+        self.alpha = _to_array(self.alpha, self.size)
+        self.g_0 = _to_array(self.g_0, self.size)
+        self.coupling_coefficient = _to_array(self.coupling_coefficient, self.size)
 
 
     @staticmethod
@@ -273,6 +265,8 @@ class Solver:
                 Использовать PyTorch вместо NumPy
             precision : str, optional
                 Точность вычислений: 'float32' или 'float64'
+            num_threads : int | str | None, optional
+                Число потоков для CPU ('default' | 'max' | int). По умолчанию 'default' - сколько задано в системе.
             display_debug_info : bool, optional
                 Вывести отладочную информацию
 
@@ -331,8 +325,14 @@ class Solver:
             use_gpu=False,
             use_torch=False,
             precision='float64',
+            num_threads: Union[int, str, None] = "default",
             display_debug_info=False
     ):
+        configure_threads(num_threads)
+
+        if display_debug_info:
+            print(threading_report())
+
         self.gamma_h = None
         self.g0_h = None
         self.exp_g0h = None
@@ -352,14 +352,24 @@ class Solver:
         self.com = com
         self.eq = eq
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
+        self.precision = precision
         self.use_gpu = use_gpu and is_torch_available  # Устанавливаем режим GPU только если PyTorch доступен
         self.use_torch = (use_torch and is_torch_available) or (self.use_gpu and is_torch_available)
         self.device = None
         if self.use_torch:
             self.device = torch.device('cuda' if self.use_gpu else 'cpu')
-        self.precision = precision
-        self.dtype = torch.float32 if self.precision == 'float32' else torch.float64
-        self.ctype = torch.complex64 if self.precision == 'float32' else torch.complex128
+
+            self.dtype = torch.float32 if self.precision == "float32" else torch.float64
+            self.ctype = torch.complex64 if self.precision == "float32" else torch.complex128
+            # NumPy-эквиваленты — НУЖНЫ для осей/Numba/SciPy
+            self._np_rdtype = np.float32 if self.precision == "float32" else np.float64
+            self._np_cdtype = np.complex64 if self.precision == "float32" else np.complex128
+        else:
+            self.dtype = np.float32 if self.precision == "float32" else np.float64
+            self.ctype = np.complex64 if self.precision == "float32" else np.complex128
+            # при numpy-режиме это те же типы
+            self._np_rdtype = self.dtype
+            self._np_cdtype = self.ctype
 
         self.display_debug_info = display_debug_info
 
@@ -442,56 +452,68 @@ class Solver:
         self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
         self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
 
-        central_coef = 0.0 if self.use_dimensional else 1.0  # у размерной задачи на диагонали должны быть нули
-        if self.eq.core_configuration is CoreConfig.ring_with_center:
-            for j in range(1, self.eq.size):
-                self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
-                self.linear_coeffs_array[j][0] = 1.0 * self.eq.coupling_coefficient[j]
-                self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j] * central_coef
-            for j in range(1, self.eq.size - 1):
-                self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
-                self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
-            if self.eq.size > 1:
-                self.linear_coeffs_array[1][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[1]
-                self.linear_coeffs_array[self.eq.size - 1][1] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
-
-        elif self.eq.core_configuration is CoreConfig.empty_ring:
-            for j in range(self.eq.size - 1):
-                self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
-                self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
-            if self.eq.size > 1:
-                for j in range(self.eq.size):
+        cm = getattr(self.eq, "coupling_matrix", None)
+        if cm is not None:
+            A = np.asarray(cm)
+            if A.shape != (self.eq.size, self.eq.size):
+                raise ValueError(
+                    f"EquationParameters.coupling_matrix must have shape {(self.eq.size, self.eq.size)}, "
+                    f"got {A.shape}"
+                )
+            # симметризуем на всякий случай (реальные связи), приводим к float (у нас dtype=float)
+            A = 0.5 * (A + A.T)
+            self.linear_coeffs_array[:, :] = A.real
+        else:
+            central_coef = 0.0 if self.use_dimensional else 1.0  # у размерной задачи на диагонали должны быть нули
+            if self.eq.core_configuration is CoreConfig.ring_with_center:
+                for j in range(1, self.eq.size):
+                    self.linear_coeffs_array[0][j] = 1.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j][0] = 1.0 * self.eq.coupling_coefficient[j]
                     self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j] * central_coef
-                self.linear_coeffs_array[0][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[0]
-                self.linear_coeffs_array[self.eq.size - 1][0] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
+                for j in range(1, self.eq.size - 1):
+                    self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
+                if self.eq.size > 1:
+                    self.linear_coeffs_array[1][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[1]
+                    self.linear_coeffs_array[self.eq.size - 1][1] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
 
-        elif self.eq.core_configuration is CoreConfig.square:
-            if self.eq.size > 1:
-                for j in range(self.eq.size):
-                    self.linear_coeffs_array[j][j] = -4.0 * self.eq.coupling_coefficient[j] * central_coef
-                for j in range(self.eq.size):
-                    for k in range(self.eq.size):
-                        if j != k:
-                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
-                                    self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
-                                self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
-                            if abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1 and \
-                                    self.eq.mask_array[j].number_2d_x == self.eq.mask_array[k].number_2d_x:
-                                self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
+            elif self.eq.core_configuration is CoreConfig.empty_ring:
+                for j in range(self.eq.size - 1):
+                    self.linear_coeffs_array[j][j + 1] = 1.0 * self.eq.coupling_coefficient[j]
+                    self.linear_coeffs_array[j + 1][j] = 1.0 * self.eq.coupling_coefficient[j]
+                if self.eq.size > 1:
+                    for j in range(self.eq.size):
+                        self.linear_coeffs_array[j][j] = -2.0 * self.eq.coupling_coefficient[j] * central_coef
+                    self.linear_coeffs_array[0][self.eq.size - 1] = 1.0 * self.eq.coupling_coefficient[0]
+                    self.linear_coeffs_array[self.eq.size - 1][0] = 1.0 * self.eq.coupling_coefficient[self.eq.size - 1]
 
-        elif self.eq.core_configuration is CoreConfig.hexagonal:
-            if self.eq.size > 1:
-                for j in range(self.eq.size):
-                    self.linear_coeffs_array[j][j] = -6.0 * self.eq.coupling_coefficient[j] * central_coef
-                for j in range(self.eq.size):
-                    for k in range(self.eq.size):
-                        if j != k:
-                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 2 and \
-                                    self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
-                                self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
-                            if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
-                                    abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1:
-                                self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
+            elif self.eq.core_configuration is CoreConfig.square:
+                if self.eq.size > 1:
+                    for j in range(self.eq.size):
+                        self.linear_coeffs_array[j][j] = -4.0 * self.eq.coupling_coefficient[j] * central_coef
+                    for j in range(self.eq.size):
+                        for k in range(self.eq.size):
+                            if j != k:
+                                if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
+                                        self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
+                                    self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
+                                if abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1 and \
+                                        self.eq.mask_array[j].number_2d_x == self.eq.mask_array[k].number_2d_x:
+                                    self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
+
+            elif self.eq.core_configuration is CoreConfig.hexagonal:
+                if self.eq.size > 1:
+                    for j in range(self.eq.size):
+                        self.linear_coeffs_array[j][j] = -6.0 * self.eq.coupling_coefficient[j] * central_coef
+                    for j in range(self.eq.size):
+                        for k in range(self.eq.size):
+                            if j != k:
+                                if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 2 and \
+                                        self.eq.mask_array[j].number_2d_y == self.eq.mask_array[k].number_2d_y:
+                                    self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
+                                if abs(self.eq.mask_array[j].number_2d_x - self.eq.mask_array[k].number_2d_x) == 1 and \
+                                        abs(self.eq.mask_array[j].number_2d_y - self.eq.mask_array[k].number_2d_y) == 1:
+                                    self.linear_coeffs_array[j][k] = 1.0 * self.eq.coupling_coefficient[j]
 
         if self.display_debug_info:
             print_matrix(self.linear_coeffs_array, "linear_coeffs_array")
@@ -511,19 +533,19 @@ class Solver:
 
     def initialize_arrays(self, initial_condition=None, pulses=None):
         """Создает пустые массивы для хранения результатов"""
-        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False)
-        self.z = np.linspace(self.com.L1, self.com.L2, self.com.N + 1)
-        self.omega = fftfreq(self.com.M, self.com.tau) * 2 * pi
-        self.omega2 = self.omega ** 2
+        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False, dtype=self._np_rdtype)
+        self.z = np.linspace(self.com.L1, self.com.L2, self.com.N + 1, dtype=self._np_rdtype)
+        self.omega = (fftfreq(self.com.M, self.com.tau) * 2 * pi).astype(self._np_rdtype)
+        self.omega2 = (self.omega ** 2).astype(self._np_rdtype)
 
         if initial_condition is not None or pulses is not zero_pulse:
-            self.numerical_solution = np.zeros((self.stored_steps_count, self.eq.size, self.com.M), dtype=complex)
+            self.numerical_solution = np.zeros((self.stored_steps_count, self.eq.size, self.com.M), dtype=self._np_cdtype)
         else:
-            self.numerical_solution_time = np.zeros((self.eq.size, self.com.N + 1), dtype=complex)
+            self.numerical_solution_time = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_cdtype)
 
-        self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
-        self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
-        self.phase_by_z = np.zeros((self.eq.size, self.com.N + 1), dtype=float)
+        self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
+        self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
+        self.phase_by_z = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
 
     def validate_initial_condition(self, initial_condition: np.ndarray):
         """Проверяет корректность начального условия"""
@@ -540,7 +562,7 @@ class Solver:
     def apply_initial_condition(self, initial_condition: np.ndarray):
         """Применяет заданное начальное условие"""
         # Конвертируем в комплексный тип если нужно
-        self.numerical_solution[0] = initial_condition.astype(complex)
+        self.numerical_solution[0] = initial_condition.astype(self._np_cdtype, copy=False)
 
         # Рассчитываем начальные характеристики
         for k in range(self.eq.size):
@@ -587,39 +609,32 @@ class Solver:
 
     # ─── solver.py ─────────────────────────────────────────────
     def calculate_D_matrix(self, h) -> None:
-        """
-        Строит дисперсионно-связную матрицу и подготавливает
-        представления, удобные для CPU- и GPU-веток.
-        """
         n, M = self.eq.size, self.com.M
 
-        # 1) плоская матрица (n², M)
         if np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0):
-            self.D = create_simple_dispersion_free_matrix(
-                self.linear_coeffs_array, self.eq.alpha,
-                self.eq.g_0, h
-            )  # (n, n)
+            # build in double
+            D64 = create_simple_dispersion_free_matrix(
+                self.linear_coeffs_array.astype(np.float64, copy=False),
+                self.eq.alpha.astype(np.float64, copy=False),
+                self.eq.g_0.astype(np.float64, copy=False),
+                float(h)
+            )  # (n,n), complex128
+            self.D = D64.astype(self._np_cdtype, copy=False)
         else:
-            self.D = get_pade_exponential2(
-                create_freq_matrix(
-                    self.linear_coeffs_array,
-                    self.eq.beta1, self.eq.beta2,
-                    self.eq.alpha, self.eq.g_0,
-                    self.omega, h
-                )
-            )  # (n², M)
+            C64 = self.linear_coeffs_array.astype(np.float64, copy=False)
+            b1 = self.eq.beta1.astype(np.float64, copy=False)
+            b2 = self.eq.beta2.astype(np.float64, copy=False)
+            a = self.eq.alpha.astype(np.float64, copy=False)
+            g0 = self.eq.g_0.astype(np.float64, copy=False)
+            om = self.omega.astype(np.float64, copy=False)
 
-            # 2) представление (n, n, M)  — NumPy-view без копии
-            self.D = self.D.reshape(n, n, M)
+            D_flat64 = get_pade_exponential2(
+                create_freq_matrix(C64, b1, b2, a, g0, om, float(h))
+            )  # (n², M), complex128
+            self.D = D_flat64.reshape(n, n, M).astype(self._np_cdtype, copy=False)
 
-        # 3) сразу готовим тензор на GPU, если будем считать в torch
         if self.use_torch:
-            self.D_pytorch = torch.as_tensor(
-                self.D,
-                dtype=self.ctype,
-                device=self.device
-            )
-
+            self.D_pytorch = torch.as_tensor(self.D, dtype=self.ctype, device=self.device)
 
     def calculate_invD_half(self) -> None:
         """
@@ -718,14 +733,12 @@ class Solver:
         exp_part = np.exp(-(σ + 1j * κ) * x ** q)
         edge = cos_part# * exp_part
 
-        taper = np.ones(M, dtype=np.complex128)
-        taper[:L] = edge
-        taper[M - L:] = edge[::-1]
-
+        taper = np.ones(self.com.M, dtype=self._np_cdtype)
+        taper[:L] = edge.astype(self._np_rdtype)
+        taper[-L:] = edge[::-1].astype(self._np_rdtype)
         self._taper_np = taper
         if self.use_torch:
-            self._taper_t = torch.as_tensor(
-                taper, dtype=self.ctype, device=self.device)
+            self._taper_t = torch.as_tensor(taper, dtype=self.ctype, device=self.device)
 
     def filter_params(self, func, pulse_params):
         # Получаем список параметров, которые принимает функция
@@ -781,7 +794,7 @@ class Solver:
             if self.D is None:
                 self.calculate_D_matrix(self.com.h)
 
-        if self.com.method == "ssfm_order2_dnd" or self.com.method == "ssfm_order2_dnd_windowed":
+        if self.com.method == "ssfm_order2_dnd" or self.com.method == "ssfm_order2_dnd_windowed_short":
             if self.D_half is None:
                 self.calculate_D_matrix(self.com.h * 0.5)
                 self.D_half = self.D.copy()
@@ -795,10 +808,8 @@ class Solver:
 
         if self.com.method == "ssfm_order2_ndn_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h)
-            if self.D is None:
-                self.calculate_D_matrix(self.com.h)
 
-        if self.com.method == "ssfm_order2_dnd_compact_windowed":
+        if self.com.method == "ssfm_order2_dnd_compact_windowed" or self.com.method == "ssfm_order2_dnd_compact_windowed_short":
             prepare_compact_solver_for_linear_step(self, self.com.h * 0.5)
 
         if self.gamma_h_half is None:
@@ -819,8 +830,11 @@ class Solver:
         psi_next = self.numerical_solution[0]
 
         if not self.use_torch:
-            if self.com.method == "ssfm_order2_dnd_windowed":
-                self.numerical_solution[-1] = ssfm_order2_dnd_windowed(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
+            if self.com.method == "ssfm_order2_dnd_windowed_short":
+                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
+                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+            elif self.com.method == "ssfm_order2_dnd_compact_windowed_short":
+                self.numerical_solution[-1] = ssfm_order2_dnd_compact_windowed_short(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
                 self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             else:
                 for n in trange(self.com.N):
@@ -842,7 +856,7 @@ class Solver:
                             self.com.damp_length,
                             self.eq.noise_amplitude,
                         )
-                    elif self.com.method == "ssfm_order2_ndn_compact":
+                    elif self.com.method == "ssfm_order2_ndn_compact_windowed":
                         psi_next = ssfm_order2_ndn_compact_windowed(
                             psi_next,
                             self.energy[:, n],
@@ -851,7 +865,7 @@ class Solver:
                             self.com.damp_length,
                             self.eq.noise_amplitude,
                         )
-                    elif self.com.method == "ssfm_order2_dnd_compact":
+                    elif self.com.method == "ssfm_order2_dnd_compact_windowed":
                         psi_next = ssfm_order2_dnd_compact_windowed(
                             psi_next,
                             self.energy[:, n],
@@ -874,9 +888,9 @@ class Solver:
                 self.numerical_solution[0], dtype=self.ctype, device=self.device
             )
 
-            if self.com.method == "ssfm_order2_dnd_windowed":
+            if self.com.method == "ssfm_order2_dnd_windowed_short":
 
-                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_torch(
+                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short_torch(
                     self,
                     self.com.window_size,
                     self.com.damp_length
@@ -1035,57 +1049,92 @@ class Solver:
         if draw_modulus:
             finalize_plot()
 
-
-    def _rhs_u(self, u, v, dz):  # du/dt = v
+    def _rhs_u(self, u, v, dz):
+        # du/dt = v
         return v
 
     def _rhs_v(self, u, v, dz):
-        # энергия вдоль z
-        # Ez = np.trapz(np.abs(u) ** 2, dx=dz, axis=1, keepdims=True)  # (C,1)
-        # g = self.eq.g_0 * (2 * self.eq.E_sat + Ez) / (self.eq.E_sat + Ez)
+        # ∂u/∂z: 2-й порядок внутри и на краях
+        Cn, Nz = u.shape
+        du_dz = (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) / (2.0 * dz)
+        if Nz >= 3:
+            du_dz[:, 0] = (-3.0 * u[:, 0] + 4.0 * u[:, 1] - u[:, 2]) / (2.0 * dz)
+            du_dz[:, -1] = (3.0 * u[:, -1] - 4.0 * u[:, -2] + u[:, -3]) / (2.0 * dz)
+        elif Nz == 2:
+            du_dz[:, 0] = (u[:, 1] - u[:, 0]) / dz
+            du_dz[:, -1] = (u[:, -1] - u[:, 0]) / dz
+        else:  # Nz == 1
+            du_dz[:, 0] = 0.0
 
-        term = (1j * self.eq.beta1[:, None] * v \
-               + 1j * np.gradient(u, dz, axis=1) \
-               + self.eq.gamma[:, None] * np.abs(u) ** 2 * u \
-               # - 1j * g * u
-               + 1j * self.eq.alpha[:, None] * u)
+        # i * C * u
+        coupling = self.linear_coeffs_array @ u  # (eq_size, Nz)
 
-        return 2.0 / self.eq.beta2[:, None] * term
+        # Энергия по z (трапеция) -> форма (eq_size, 1), без keepdims
+        abs2 = np.abs(u) ** 2
+        if Nz == 1:
+            Ez = dz * abs2  # (eq_size, 1)
+        elif Nz == 2:
+            Ez = dz * 0.5 * (abs2[:, :1] + abs2[:, 1:])  # (eq_size, 1)
+        else:
+            edge = 0.5 * (abs2[:, :1] + abs2[:, -1:])
+            mid = np.sum(abs2[:, 1:-1], axis=1, keepdims=True)
+            Ez = dz * (edge + mid)  # (eq_size, 1)
+
+        # g(t) = g0 / (1 + E/E_sat) по каждому каналу
+        g = self.eq.g_0[:, None] / (1.0 + Ez / self.eq.E_sat[:, None])  # (eq_size, 1)
+
+        term = (1j * du_dz
+                + 1j * self.eq.beta1[:, None] * v
+                + self.eq.gamma[:, None] * abs2 * u
+                - 1j * 0.5 * g * u
+                + 1j * 0.5 * self.eq.alpha[:, None] * u
+                + 1j * coupling)
+
+        return (2.0 / self.eq.beta2[:, None]) * term
 
     def _rhs_u_torch(self, u, v, dz_t):
+        # du/dt = v
         return v
 
     def _rhs_v_torch(self, u: torch.Tensor, v: torch.Tensor, dz_t: torch.Tensor):
-        """
-        Правая часть для dv/dt (PyTorch-ветка).
-            • du/dz рассчитываем центральной разностью второго порядка
+        Cn, Nz = u.shape
 
-        Параметры
-        ---------
-        u, v : (C, Nz) complex
-            Поле и его первая временная производная.
-        dz_t : scalar-тензор float
-            Шаг сетки по z.
-
-        Возврат
-        -------
-        rhs_v : (C, Nz) complex
-        """
-
-        # ---------- ∂u/∂z (центральная разность, периодический край) ----------
+        # ∂u/∂z: 2-й порядок внутри и на краях
         du_dz = (torch.roll(u, -1, dims=1) - torch.roll(u, 1, dims=1)) / (2.0 * dz_t)
+        if Nz >= 3:
+            du_dz[:, 0] = (-3.0 * u[:, 0] + 4.0 * u[:, 1] - u[:, 2]) / (2.0 * dz_t)
+            du_dz[:, -1] = (3.0 * u[:, -1] - 4.0 * u[:, -2] + u[:, -3]) / (2.0 * dz_t)
+        elif Nz == 2:
+            du_dz[:, 0] = (u[:, 1] - u[:, 0]) / dz_t
+            du_dz[:, -1] = (u[:, -1] - u[:, 0]) / dz_t
+        else:
+            du_dz[:, 0] = 0.0
 
-        # односторонние формулы на концах (чтобы не было «замыкания»):
-        du_dz[:, 0] = (u[:, 1] - u[:, 0]) / dz_t
-        du_dz[:, -1] = (u[:, -1] - u[:, -2]) / dz_t
+        # i * C * u
+        C_t = torch.as_tensor(self.linear_coeffs_array, dtype=self.ctype, device=self.device)
+        coupling = torch.matmul(C_t, u)
 
-        # ---------- физическая правая часть -----------------------------------
-        term = (1j * self.eq.beta1_t[:, None] * v
-                + 1j * du_dz
-                + self.eq.gamma_t[:, None] * torch.abs(u) ** 2 * u
-                + 1j * self.eq.alpha_t[:, None] * u)
+        # Энергия по z (трапеция) -> (eq_size, 1)
+        abs2 = torch.abs(u) ** 2
+        if Nz == 1:
+            Ez = dz_t * abs2
+        elif Nz == 2:
+            Ez = dz_t * 0.5 * (abs2[:, :1] + abs2[:, 1:])
+        else:
+            edge = 0.5 * (abs2[:, :1] + abs2[:, -1:])
+            mid = abs2[:, 1:-1].sum(dim=1, keepdim=True)
+            Ez = dz_t * (edge + mid)
 
-        return 2.0 / self.eq.beta2_t[:, None] * term
+        g = self.g0_t[:, None] / (1.0 + Ez / self.E_sat_t[:, None])
+
+        term = (1j * du_dz
+                + 1j * self.eq.beta1_t[:, None] * v
+                + self.eq.gamma_t[:, None] * abs2 * u
+                - 1j * 0.5 * g * u
+                + 1j * 0.5 * self.eq.alpha_t[:, None] * u
+                + 1j * coupling)
+
+        return (2.0 / self.eq.beta2_t[:, None]) * term
 
     def run_numerical_simulation_time(self,
                                       draw_modulus: bool = False,
@@ -1123,7 +1172,7 @@ class Solver:
             u = torch.zeros((C, Nz), dtype=ctype, device=self.device)
             v = torch.zeros_like(u)
         else:
-            u = np.zeros((C, Nz), complex)
+            u = np.zeros((C, Nz), dtype=self.ctype)
             v = np.zeros_like(u)
 
         # ---------- pre-compute d(bc)/dt ---------------------------------
@@ -1135,6 +1184,20 @@ class Solver:
             bc_prime_t = torch.as_tensor(bc_prime, dtype=ctype, device=self.device)
             fb_coef_t  = torch.as_tensor(self.feedback_coefficient,
                                          dtype=ctype, device=self.device)
+
+        # ------------------------------------------------------------------
+
+        # буферы истории на правом краю (берём 1D срез по z=-1)
+        hist_u_L = []
+        hist_v_L = []
+        # буферы входа
+        hist_bc = [bc[:, k].copy() for k in range(self.com.M)]
+        hist_bc_prime = [bc_prime[:, k].copy() for k in range(self.com.M)]
+
+        # параметры задержки
+        tau_fb_ps = self.feedback_delay_ps  # задай в вызывающем коде
+        delay_steps_float = tau_fb_ps / dt
+        kappa_phase = self.feedback_coefficient  # комплексный, с фазой воздуха
 
         # ---------- график ------------------------------------------------
         if draw_modulus:
@@ -1157,6 +1220,15 @@ class Solver:
         else:
             self.energy[:, 0] = 0.0
             self.peak_power[:, 0] = 0.0
+
+        # -----------------------------------------------------------------
+
+        # установить начальный край z=0
+        u[:, 0] = hist_bc[0]
+        v[:, 0] = hist_bc_prime[0]
+        # начальная история правого края — нули
+        hist_u_L.append(np.zeros(u.shape[0], dtype=u.dtype))
+        hist_v_L.append(np.zeros(v.shape[0], dtype=v.dtype))
 
         # ---------- главный цикл по времени ------------------------------
         for m in trange(self.com.M, disable=not draw_modulus and not self.display_debug_info):
@@ -1210,6 +1282,18 @@ class Solver:
                     self.feedback_coefficient,
                     bc[:, m], bc_prime[:, m]
                 )
+
+                # u, v = rk4_step_delayed_bc(
+                #     u, v, dt, dz,
+                #     self._rhs_u, self._rhs_v,  # :contentReference[oaicite:5]{index=5}
+                #     hist_u_L, hist_v_L,
+                #     hist_bc, hist_bc_prime,
+                #     m, delay_steps_float, kappa_phase
+                # )
+
+                # после получения (u,v) на t_{m+1}: обновим историю правого края
+                hist_u_L.append(u[:, -1].copy())
+                hist_v_L.append(v[:, -1].copy())
 
                 self.numerical_solution_time = u
                 # self.energy[:, m + 1]      = np.trapz(np.abs(u) ** 2, dx=dz, axis=1)

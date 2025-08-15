@@ -67,11 +67,26 @@ class Fiber:
     mask_array: List[Mask] = field(init=False)
 
     def __post_init__(self):
-        if self.core_count == 0 and self.ring_count == 0:
-            raise ValueError("core_count or ring_count must be > 0")
-        elif self.core_count > 0 and self.ring_count == 0:
-            self.ring_count = get_ring_count(self.core_configuration, self.core_count)
+        if self.ring_count < 0:
+            raise ValueError("ring_count must be >= 0")
+
+        rc = int(round(self.ring_count))
+        cc = int(self.core_count)
+
+        # 2) нормализация случая ring_count == 0
+        if rc == 0:
+            # «ноль колец» означает минимум одно центральное ядро
+            # если пользователь явно не просил больше, фиксируем 1
+            if cc <= 1:
+                self.ring_count = 0.0
+                self.core_count = 1
+            else:
+                # пользователь хочет >1 ядра — вычисляем, сколько колец нужно
+                self.ring_count = get_ring_count(self.core_configuration, cc)
+                self.core_count = cc
         else:
+            # 3) задано количество колец → восстанавливаем число ядер
+            self.ring_count = float(rc)
             self.core_count = get_core_count(self.core_configuration, self.ring_count)
 
         self.mask_array = make_eq_mask(

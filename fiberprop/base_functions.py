@@ -118,7 +118,7 @@ def plot_core_centers(core_center_coords, core_radius, cladding_diameter, title=
     plt.show()
 
 
-def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
+def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_plots=False):
     """
     Вычисляет матрицу коэффициентов связи между сердцевинами многожильного оптического волокна.
 
@@ -126,7 +126,7 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
         fiber (Fiber): Объект волокна с заданными параметрами.
         light (Light): Параметры излучения (длина волны и др.).
         eps (float, optional): Точность вычисления интегралов. По умолчанию 1e-3.
-        display_debug_info (bool, optional): Если True, отображает график расположения сердцевин.
+        display_debug_plots (bool, optional): Если True, отображает график расположения сердцевин.
 
     Возвращает:
         tuple:
@@ -170,7 +170,7 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_info=False):
     else:
         raise ValueError('This fiber configuration is not yet supported')
 
-    if display_debug_info:
+    if display_debug_plots:
         plot_core_centers(core_center_coords, fiber.core_radius, fiber.cladding_diameter)
 
     # Предполагаем, что все ядра идентичны, поэтому интеграл по диагонали (self-coupling) одинаков для всех.
