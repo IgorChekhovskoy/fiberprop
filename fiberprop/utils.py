@@ -1,33 +1,59 @@
 import numpy as np
-import torch
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except Exception:
+    torch = None  # type: ignore
+    _TORCH_AVAILABLE = False
 
 def fft_derivative(arr, dt, axis=-1):
     """
     Производная по времени через БПФ:
         d/dt f(t)  ⟷  i·ω·F(ω)
-    • arr : ndarray (..., M) – комплексный сигнал
-    • dt  : шаг по времени
-    • axis: ось времени
+
+    Parameters
+    ----------
+    arr : ndarray (..., M)
+        Комплексный сигнал.
+    dt : float
+        Шаг по времени.
+    axis : int
+        Ось времени (по умолчанию последняя).
+
+    Returns
+    -------
+    ndarray (комплекс)
     """
     n = arr.shape[axis]
-    omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)          # [rad/ps]
-    F     = np.fft.fft(arr, axis=axis)
-    dFdt  = 1j * omega * F
-    return np.fft.ifft(dFdt, axis=axis)                    # комплексная ∂f/∂t
+    omega = 2.0 * np.pi * np.fft.fftfreq(n, d=dt)  # [rad/ps]
+    F = np.fft.fft(arr, axis=axis)
+    dFdt = 1j * omega * F
+    return np.fft.ifft(dFdt, axis=axis)
 
 
 def fft_derivative_torch(arr, dt, axis=-1):
+    """
+    Torch-аналог fft_derivative. Требует установленный PyTorch.
+    """
+    if not _TORCH_AVAILABLE:
+        raise RuntimeError(
+            "fft_derivative_torch требует PyTorch, но он не установлен. "
+            "Установите torch или используйте fft_derivative (NumPy)."
+        )
     n = arr.shape[axis]
     dtype = arr.dtype
     device = arr.device
     omega = 2.0 * torch.pi * torch.fft.fftfreq(
-                n, d=dt, device=device, dtype=dtype.real_dtype)
-    # reshape omega for broadcasting вдоль нужной оси
-    shape = [1]*arr.ndim
+        n, d=dt, device=device, dtype=dtype.real_dtype
+    )
+    # reshape omega для корректного broadcasting вдоль нужной оси
+    shape = [1] * arr.ndim
     shape[axis] = n
     omega = omega.reshape(shape)
-    F     = torch.fft.fft(arr, dim=axis)
-    dFdt  = 1j * omega * F
+
+    F = torch.fft.fft(arr, dim=axis)
+    dFdt = 1j * omega * F
     return torch.fft.ifft(dFdt, dim=axis)
 
 
