@@ -12,6 +12,8 @@ import numpy as np #; np.show_config()
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 
+from fiberprop.threading_control import physical_cpu_count, temporary_thread_limits
+
 
 def mackey_glass(t_size, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0):
     delay = tau / dt
@@ -318,7 +320,7 @@ def mcf_nn_reservoir_computing(
     central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
 
     coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_plots=display_debug_plots)
-    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
+    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 1e-10
     max_val = np.max(np.abs(coupling_matrix))
     threshold = max_val * 1e-2
     coupling_matrix = np.where(np.abs(coupling_matrix) > threshold, coupling_matrix, 0)
@@ -350,7 +352,10 @@ def mcf_nn_reservoir_computing(
         print("fiber_length_m =", fiber_length_m)
         print("feedback_length_m =", feedback_length_m)
 
-    assert feedback_length_m > fiber_length_m
+    if feedback_length_m <= fiber_length_m:
+        raise ValueError(
+            f"INVALID_CONFIG: feedback_length_m({feedback_length_m:.6g}) <= fiber_length_m({fiber_length_m:.6g})"
+        )
 
     L_D, L_NL, L_coupling, L_gain = compute_characteristic_lengths(beta2_ps2_m=beta2,
                                          gamma_1_w_m=gamma,
@@ -367,7 +372,7 @@ def mcf_nn_reservoir_computing(
     length_scale = np.min([L_D, L_NL, L_coupling, L_gain])  # [m]
 
     fiber_length_dimensionless = fiber_length_m / length_scale
-    n_z = step_number_per_dimensionless_distance * int(round(fiber_length_dimensionless))
+    n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
 
     esat_array = np.asarray(psat_array) * window_size * time_step_ps
 
@@ -423,8 +428,6 @@ def mcf_nn_reservoir_computing(
                     precision='float64',
                     num_threads=num_threads,
                     display_debug_info=display_debug_info)
-
-    print("dt_plot_ps =", (solver.t[1] - solver.t[0]))
 
     if display_debug_plots:
         number_of_points_for_display = solver.com.M # np.min([5000, solver.com.M])
@@ -657,7 +660,10 @@ def mcf_nn_reservoir_computing_temporal_evolution(
         print("fiber_length_m =", fiber_length_m)
         print("feedback_length_m =", feedback_length_m)
 
-    assert feedback_length_m > fiber_length_m
+    if feedback_length_m <= fiber_length_m:
+        raise ValueError(
+            f"INVALID_CONFIG: feedback_length_m({feedback_length_m:.6g}) <= fiber_length_m({fiber_length_m:.6g})"
+        )
 
     ################################################
 
@@ -941,18 +947,6 @@ def nrmse(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
 
     return rmse / s
 
-
-def physical_cpu_count() -> int:
-    try:
-        import psutil
-        n = psutil.cpu_count(logical=False)
-        if n is None:
-            n = os.cpu_count() or 1
-        return int(n)
-    except Exception:
-        # эвристика: половина логических
-        n = os.cpu_count() or 1
-        return max(1, int(n // 2))
 
 def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: bool = True) -> np.ndarray:
     if add_bias:
@@ -1422,14 +1416,16 @@ _VOLATILE_FIELDS = {
 }
 
 # сколько знаков оставлять у float в ключе
-_DEFAULT_FLOAT_DIGITS = 12
+_DEFAULT_FLOAT_DIGITS = 3
 
 # при желании можно задать «пер-поле» точность:
 _FIELD_DIGITS = {
-    ("reservoir", "time_step_ps"): 12,
-    ("reservoir", "fiber_length_m"): 9,
-    ("reservoir", "kappa"): 12,
-    ("mask", "gain_in"): 9,
+    ("reservoir", "time_step_ps"): 3,
+    ("reservoir", "fiber_length_m"): 3,
+    ("reservoir", "psat_array"): 3,
+    ("reservoir", "g0_array"): 3,
+    ("reservoir", "kappa"): 3,
+    ("mask", "gain_in"): 3,
 }
 
 def _quantize_for_hash(obj, path=()) -> Any:
@@ -1711,9 +1707,10 @@ def run_single_experiment(cfg: ExperimentConfig,
     if cfg.reservoir.display_debug_plots:
         debug_plot_input_overview(cfg_with_ws, mg_series_used=mg_series)
 
-    # ключ кэша и прогон
+    # ключ кэша
     params_dict = _params_for_cache(cfg_with_ws.core_count, cfg_with_ws.mg, cfg_with_ws.mask,
                                     cfg_with_ws.reservoir, cfg_with_ws.variant)
+    # основной запуск с кэшированием
     data_out, feedback_length_m, cache_key = run_mcf_with_cache(data_in, params_dict, force_rerun=force_rerun)
 
     # ── признаки/таргеты: ПЕРЕХОД НА СИМВОЛЫ + taps
@@ -1833,52 +1830,56 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                          include_mask_size: bool = False,
                          mask_size_range: Tuple[int, int] = (20, 80),
                          include_window_size: bool = False,
-                         delay_factor_range: Tuple[int, int] = (20, 60),
+                         delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                          n_jobs: Optional[int] = None,
                          free_run_horizon: int = 0,
-                         force_rerun=False) -> Dict[str, Any]:
+                         force_rerun: bool = False) -> Dict[str, Any]:
     """
-    Оптимизирует: kappa, g0, psat, fiber_length, gain_in (+ опционально mask_size и window_size=mask_size*delay_factor_in_symbols).
-    Использует Optuna. n_jobs = числу физических ядер по умолчанию.
+    Подбор гиперпараметров с Optuna.
+
+    Что тюним всегда: kappa, g0, psat, fiber_length, gain_in (лог-шкала).
+    Опционально: mask_size и delay_factor_in_symbols (а НЕ прямой window_size).
+    Внутри trial все вычисления — в 1 поток (temporary_thread_limits(1)), чтобы не было nested parallelism.
     """
     import optuna
-    from fiberprop.threading_control import temporary_thread_limits
 
     if n_jobs is None:
         n_jobs = physical_cpu_count()
-        print("n_jobs =", n_jobs)
+    if n_jobs == 6: # ПК в НГУ. Гипертрединга нет, поэтому нельзя грузить все ядра
+        n_jobs = 5
+    print("n_jobs =", n_jobs)
 
     best = dict(score=float("inf"), res=None, params=None)
 
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
-            # общие гиперпараметры
-            kappa = trial.suggest_float("kappa", 0.7, 0.99)
-            g0 = trial.suggest_float("g0", 0.0, 20.0)
-            psat = trial.suggest_float("psat", 0.005, 0.05)
-            fiber_length = trial.suggest_float("fiber_length", 0.05, 0.2)
-            gain_in = trial.suggest_float("gain_in", 0.5, 2.0)
+            # --- 1) основные гиперпараметры резерваура и усиления
+            kappa = trial.suggest_float("kappa", 0.01, 0.99)
+            g0 = trial.suggest_float("g0", 0.01, 20.0, log=True)
+            psat = trial.suggest_float("psat", 0.001, 0.1, log=True)
+            fiber_length = trial.suggest_float("fiber_length", 0.05, 1.5, log=True)
+            gain_in = trial.suggest_float("gain_in", 1e-2, 2e+1, log=True)
 
-            # маска и окно
-            mask_size = base_cfg.mask.mask_size
-            window_size = base_cfg.reservoir.window_size
+            # --- 2) маска и задержка (через delay_factor_in_symbols)
+            mask_size = int(base_cfg.mask.mask_size)
             if include_mask_size:
                 mask_size = trial.suggest_int("mask_size", int(mask_size_range[0]), int(mask_size_range[1]))
-            if include_window_size:
-                delay_factor_in_symbols = trial.suggest_int("delay_factor_in_symbols", int(delay_factor_range[0]), int(delay_factor_range[1]))
-                window_size = int(mask_size * delay_factor_in_symbols)
 
-            # собираем конфиг
+            delay_factor = int(getattr(base_cfg.reservoir, "delay_factor_in_symbols", 30))
+            if include_window_size:
+                delay_factor = trial.suggest_int("delay_factor_in_symbols",
+                                                 int(delay_factor_in_symbols_range[0]), int(delay_factor_in_symbols_range[1]))
+
+            # --- 3) собираем конфиг trial'а (ВАЖНО: прокидываем delay_factor_in_symbols, а не window_size)
             cfg = ExperimentConfig(
                 core_count=base_cfg.core_count,
-                mg=base_cfg.mg,  # длину ряда не меняем в оптимизации (для честности сравнения)
+                mg=base_cfg.mg,  # длину ряда не меняем в оптимизации
                 mask=MaskConfig(mask_size=mask_size,
                                 mask_kind=base_cfg.mask.mask_kind,
                                 seed=base_cfg.mask.seed,
                                 gain_in=gain_in),
                 reservoir=ReservoirConfig(
                     fiber_length_m=fiber_length,
-                    window_size=window_size,
                     time_step_ps=base_cfg.reservoir.time_step_ps,
                     step_number_per_dimensionless_distance=base_cfg.reservoir.step_number_per_dimensionless_distance,
                     upsampling=base_cfg.reservoir.upsampling,
@@ -1891,30 +1892,53 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     num_threads=1,
                     display_debug_info=False,
                     display_debug_plots=False,
-                    save_gif=False
+                    save_gif=False,
+                    delay_factor_in_symbols=int(delay_factor),
+                    delay_additional_in_mask_steps=base_cfg.reservoir.delay_additional_in_mask_steps,
+                    # window_size НЕ задаём — его вычислит run_single_experiment() из delay_factor/mask_size/phase
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
             )
 
+            # --- 4) запуск и метрика
             res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
-            score = res["metrics"]["nrmse_val"]
 
+            score = float(res["metrics"]["nrmse_val"])
+            if not np.isfinite(score):
+                score = 1e9
+
+            # --- 5) обновим «лучшее»
             nonlocal best
             if score < best["score"]:
-                best = dict(score=score,
-                            res=res,
-                            params=dict(
-                                kappa=kappa, g0=g0, psat=psat,
-                                fiber_length=fiber_length,
-                                gain_in=gain_in,
-                                mask_size=mask_size,
-                                window_size=window_size
-                            ))
-            return float(score)
+                # вычислим окно задержки (для логов)
+                ws = compute_window_size_samples(cfg)
+                best = dict(
+                    score=score,
+                    res=res,
+                    params=dict(
+                        kappa=kappa, g0=g0, psat=psat,
+                        fiber_length=fiber_length,
+                        gain_in=gain_in,
+                        mask_size=mask_size,
+                        delay_factor_in_symbols=int(delay_factor),
+                        window_size=ws
+                    )
+                )
+            return score
 
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
+    variant_str = str(base_cfg.variant)
+    core_count = int(base_cfg.core_count)
+    study_name = f"mcf_rc_{variant_str}_C{core_count}"
+
+    storage_url = "sqlite:///mcf_optuna.db"  # файл в текущей папке
+    study = optuna.create_study(
+        study_name=study_name,
+        direction="minimize",
+        storage=storage_url,
+        load_if_exists=True
+    )
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True, catch=(AssertionError, ValueError))
 
     best_trial = study.best_trial
     return dict(
@@ -1924,7 +1948,9 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         best_val_nrmse=float(best["score"]),
         optuna_best_params=best_trial.params,
         optuna_best_value=float(best_trial.value),
+        study_name=study_name,
     )
+
 
 # =========================
 # Сценарии запуска
@@ -1935,7 +1961,7 @@ def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
                                  include_mask_size: bool = False,
                                  include_window_size: bool = False,
                                  mask_size_range: Tuple[int, int] = (20, 80),
-                                 delay_factor_range: Tuple[int, int] = (20, 60),
+                                 delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                                  free_run_horizon: int = 0,
                                  force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
@@ -1945,7 +1971,7 @@ def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
                                     include_mask_size=include_mask_size,
                                     mask_size_range=mask_size_range,
                                     include_window_size=include_window_size,
-                                    delay_factor_range=delay_factor_range,
+                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
@@ -1956,7 +1982,7 @@ def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
                                 include_mask_size: bool = False,
                                 include_window_size: bool = False,
                                 mask_size_range: Tuple[int, int] = (20, 80),
-                                delay_factor_range: Tuple[int, int] = (20, 60),
+                                delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                                 free_run_horizon: int = 0,
                                 force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
@@ -1966,7 +1992,7 @@ def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
                                     include_mask_size=include_mask_size,
                                     mask_size_range=mask_size_range,
                                     include_window_size=include_window_size,
-                                    delay_factor_range=delay_factor_range,
+                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
@@ -1977,7 +2003,7 @@ def run_spatial_only(base_cfg: ExperimentConfig,
                      include_mask_size: bool = False,   # не актуально, но держим для единообразия
                      include_window_size: bool = False,
                      mask_size_range: Tuple[int, int] = (1, 1),
-                     delay_factor_range: Tuple[int, int] = (20, 60),
+                     delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                      free_run_horizon: int = 0,
                      force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
@@ -1987,7 +2013,7 @@ def run_spatial_only(base_cfg: ExperimentConfig,
                                     include_mask_size=include_mask_size,
                                     mask_size_range=mask_size_range,
                                     include_window_size=include_window_size,
-                                    delay_factor_range=delay_factor_range,
+                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
@@ -2000,7 +2026,7 @@ def run_spatial_only(base_cfg: ExperimentConfig,
 if __name__ == "__main__":
     # Базовые параметры
     force_rerun = False  # игнорировать кэш и считать заново
-    layer_count = 0
+    layer_count = 1
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
 
@@ -2013,7 +2039,7 @@ if __name__ == "__main__":
         if i == 0:
             layer_radii_array[i] = 0 # [mkm]
         if i == 1:
-            layer_radii_array[i] = 17.3 # [mkm]
+            layer_radii_array[i] = 25 #17.3 # [mkm]
         if i == 2:
             layer_radii_array[i] = 17.3 * 2 # [mkm]
         if i == 3:
@@ -2021,7 +2047,7 @@ if __name__ == "__main__":
 
         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
 
-    temporal_mask_modulation_frequency_ghz = 40 # GHz
+    temporal_mask_modulation_frequency_ghz = 150 # GHz
 
     variant = "temporal_same_all_cores" # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
@@ -2030,24 +2056,24 @@ if __name__ == "__main__":
     else:
         temporal_mask_size = 1
 
-    mg_cfg = MGConfig(t_size=2**9, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
+    mg_cfg = MGConfig(t_size=2**10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=1.0)
+    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=2.57)
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=0.1,
+        fiber_length_m=0.114, # 0.1
         time_step_ps=1.0 / temporal_mask_size * 1e+3,
         step_number_per_dimensionless_distance=20,
         upsampling=1,
-        delay_factor_in_symbols=30,
+        delay_factor_in_symbols=11,
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([10.0]*core_count),
-        psat_array=tuple([0.02]*core_count),
-        kappa=0.9,
+        g0_array=tuple([0.345]*core_count), # 10
+        psat_array=tuple([0.027]*core_count), # 0.02
+        kappa=0.5, # 0.9
         use_gpu=False,
-        num_threads=6,
+        num_threads=1,
         display_debug_plots=True,
         display_debug_info=True,
     )
@@ -2055,33 +2081,45 @@ if __name__ == "__main__":
     training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-6, # washout=100,
                                   target_shift=1,
                                   train_frac=0.8, val_frac=0.0) # для одиночного запуска
-                                  #train_frac=0.6, val_frac=0.2) # для Optuna
 
     base_cfg = ExperimentConfig(core_count=core_count, mg=mg_cfg, mask=mask_cfg,
                                 reservoir=reservoir_cfg, training=training_cfg,
                                 variant=variant)
 
-    t_size = estimate_required_t_size_fast(base_cfg)
-    print("Estimated required symbol count =", t_size)
-    mg_cfg.t_size = t_size
+    # t_size = estimate_required_t_size_fast(base_cfg)
+    # print("Estimated required symbol count =", t_size)
+    # mg_cfg.t_size = np.min([int(np.ceil(t_size / 1000.0)) * 1000, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
-    if variant == "spatial_only":
-        res = run_spatial_only(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
-    elif variant == "temporal_same_all_cores":
-        res = run_temporal_same_all_cores(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
-    elif variant == "temporal_unique_per_core":
-        res = run_temporal_unique_per_core(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
+    # if variant == "spatial_only":
+    #     res = run_spatial_only(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
+    # elif variant == "temporal_same_all_cores":
+    #     res = run_temporal_same_all_cores(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
+    # elif variant == "temporal_unique_per_core":
+    #     res = run_temporal_unique_per_core(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
+    #
+    # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
-    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
-    # Пример: Optuna-поиск + маска/окно в пространстве поиска
-    # best = run_temporal_unique_per_core(base_cfg,
-    #                                     n_trials_opt=20,
-    #                                     include_mask_size=True,
-    #                                     include_window_size=True,
-    #                                     mask_size_range=(20, 80),
-    #                                     delay_factor_range=(20, 60),
-    #                                     free_run_horizon=200,
-    #                                     force_rerun=force_rerun)
-    # print("BEST val NRMSE:", best["best_val_nrmse"], "params:", best["best_trial_params"])
+    # === Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===
+    # Вариант «temporal_same_all_cores» для одной сердцевины;
+    # окно задержки и размер маски тоже можно подстроить.
+    # Для запуска optuna dashboard установи
+    # pip install optuna-dashboard
+    # и выполни в отдельной консоли после запуска расчета (путь укажи свой до папки проекта)
+    # optuna-dashboard sqlite:///C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/mcf_optuna.db --port 8080
+    # Открой в браузере http://127.0.0.1:8080/dashboard/
+
+    base_cfg.training.train_frac = 0.6
+    base_cfg.training.val_frac = 0.2
+    res = run_temporal_same_all_cores(
+        base_cfg,
+        n_trials_opt=500,  # сколько попробовать конфигураций
+        include_mask_size=True,  # разрешить подбор mask_size
+        include_window_size=True,  # разрешить подбор window_size (через delay_factor)
+        mask_size_range=(10, 300),  # диапазон длин маски (точек на символ)
+        delay_factor_in_symbols_range=(1, 200),  # множитель для окна/задержки
+        free_run_horizon=0,  # без свободного прогона после обучения
+        force_rerun=False  # используй кэш, если ключ совпал
+    )
+    print("Лучший результат Optuna:\n", res)

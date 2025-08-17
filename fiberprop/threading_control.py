@@ -200,3 +200,105 @@ def temporary_thread_limits(num_threads: Union[int, str, None]):
                     pass
         except Exception:
             pass
+
+def physical_cpu_count() -> int:
+    """
+    Возвращает число ФИЗИЧЕСКИХ ядер (не логических).
+    Порядок попыток:
+      1) psutil.cpu_count(logical=False)
+      2) Windows: wmic / PowerShell CIM (NumberOfCores)
+      3) macOS: sysctl -n hw.physicalcpu
+      4) Linux: lscpu (Core(s) per socket * Socket(s)) или парсинг /proc/cpuinfo
+      5) Fallback: os.cpu_count()  (логические) — как «последний шанс»
+    """
+    import os, sys, subprocess, shlex
+
+    # 1) psutil (кроссплатформенно; возвращает физические ядра или None)
+    try:
+        import psutil  # psutil.readthedocs.io: cpu_count(logical=False) → физические ядра
+        n = psutil.cpu_count(logical=False)
+        if isinstance(n, int) and n > 0:
+            return n
+    except Exception:
+        pass
+
+    plat = sys.platform
+
+    # 2) Windows — NumberOfCores (WMIC → PowerShell CIM)
+    if plat.startswith("win"):
+        # wmic (есть даже на старых системах; может быть помечен deprecated, но работает)
+        try:
+            out = subprocess.check_output(["wmic", "cpu", "get", "NumberOfCores"], text=True, stderr=subprocess.DEVNULL)
+            nums = [int(s) for s in out.split() if s.isdigit()]
+            if nums:
+                return sum(nums)
+        except Exception:
+            pass
+        # PowerShell (новее и надёжнее): суммируем NumberOfCores по всем сокетам
+        try:
+            ps_cmd = "Get-CimInstance Win32_Processor | Select-Object -Expand NumberOfCores | Measure-Object -Sum | " \
+                     "Select-Object -Expand Sum"
+            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_cmd],
+                                          text=True, stderr=subprocess.DEVNULL)
+            n = int(out.strip())
+            if n > 0:
+                return n
+        except Exception:
+            pass
+
+    # 3) macOS — sysctl hw.physicalcpu
+    if plat == "darwin":
+        try:
+            out = subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.physicalcpu"],
+                                          text=True, stderr=subprocess.DEVNULL)
+            n = int(out.strip())
+            if n > 0:
+                return n
+        except Exception:
+            pass
+
+    # 4) Linux — lscpu (Core(s) per socket × Socket(s)), иначе /proc/cpuinfo
+    if plat.startswith("linux"):
+        # lscpu
+        try:
+            out = subprocess.check_output(["lscpu"], text=True, stderr=subprocess.DEVNULL)
+            cores_per_socket, sockets = None, None
+            for line in out.splitlines():
+                if "Core(s) per socket:" in line:
+                    cores_per_socket = int(line.split(":")[1].strip())
+                elif "Socket(s):" in line:
+                    sockets = int(line.split(":")[1].strip())
+            if cores_per_socket and sockets:
+                n = cores_per_socket * sockets
+                if n > 0:
+                    return n
+        except Exception:
+            pass
+        # /proc/cpuinfo: считаем уникальные пары (physical id, core id)
+        try:
+            phys_ids = set()
+            cur_phys, cur_core = None, None
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    if ln.startswith("physical id"):
+                        cur_phys = ln.split(":")[1].strip()
+                    elif ln.startswith("core id"):
+                        cur_core = ln.split(":")[1].strip()
+                    elif not ln.strip():  # конец записи CPU
+                        if cur_phys is not None and cur_core is not None:
+                            phys_ids.add((cur_phys, cur_core))
+                        cur_phys, cur_core = None, None
+                # финальная запись без пустой строки
+                if cur_phys is not None and cur_core is not None:
+                    phys_ids.add((cur_phys, cur_core))
+            if phys_ids:
+                return len(phys_ids)
+        except Exception:
+            pass
+
+    # 5) Fallback — логические (лучше, чем 0)
+    try:
+        n = os.cpu_count() or 1
+        return int(n)
+    except Exception:
+        return 1

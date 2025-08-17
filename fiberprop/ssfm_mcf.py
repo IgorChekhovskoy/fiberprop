@@ -409,14 +409,14 @@ def ssfm_order2_ndn_windowed(psi, current_energy, solver,
     return psi
 
 
-def ssfm_order2_dnd_windowed_short(solver, window_size, damp_length=0.0):
+def ssfm_order2_dnd_windowed_short(solver, window_size, damp_length=0.0, disable_progress_bar=False):
 
     psi = linear_step(solver.numerical_solution[0], solver.has_beta, solver.D_half)
 
     if damp_length:
         psi = apply_absorbing_boundary(psi, solver=solver)
 
-    for n in trange(solver.com.N):
+    for _ in trange(solver.com.N, disable=disable_progress_bar):
 
         nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
                                 solver.exp_g0h, solver.exp_2g0h,

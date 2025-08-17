@@ -138,7 +138,7 @@ def plot2D_plotly(x_arrr, funcs_arr, x_axis_label='t', y_axis_label='', title_te
         print(f'plot2D_plotly: \tDone. Saved to {filename}.{file_format}')
     else:
         fig.show()
-        print('plot2D_plotly: \tDone')
+        # print('plot2D_plotly: \tDone')
 
 
 def plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale=False, marker_flag=True):

@@ -831,13 +831,15 @@ class Solver:
 
         if not self.use_torch:
             if self.com.method == "ssfm_order2_dnd_windowed_short":
-                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
+                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size,
+                                                                             damp_length=self.com.damp_length,
+                                                                             disable_progress_bar=not self.display_debug_info)
                 self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_compact_windowed_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_compact_windowed_short(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
                 self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             else:
-                for n in trange(self.com.N):
+                for n in trange(self.com.N, disable=not self.display_debug_info):
                     if self.com.method == "ssfm_order2_ndn":
                         psi_next = ssfm_order2_ndn(
                             psi_next,
@@ -893,12 +895,13 @@ class Solver:
                 self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short_torch(
                     self,
                     self.com.window_size,
-                    self.com.damp_length
+                    self.com.damp_length,
+                    disable_progress_bar=not self.display_debug_info
                 ).cpu().numpy()
 
                 self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             else:
-                for n in trange(self.com.N):
+                for n in trange(self.com.N, disable=not self.display_debug_info):
                     # ---------- очередной шаг (GPU) --------------------------
                     psi_gpu = ssfm_order2_pytorch(
                         psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
@@ -981,7 +984,7 @@ class Solver:
         psi_next = self.numerical_solution[0]
 
         if not self.use_torch:
-            for n in trange(self.com.N):
+            for n in trange(self.com.N, disable=not self.display_debug_info):
                 # ---------- очередной шаг --------------------------------
                 psi_next = ssfm_order2_2_in_fourier_space(
                     psi_next,  # последний сохранённый
@@ -1012,7 +1015,7 @@ class Solver:
                 self.numerical_solution[0], dtype=self.ctype, device=self.device
             )
 
-            for n in trange(self.com.N):
+            for n in trange(self.com.N, disable=not self.display_debug_info):
                 # ---------- очередной шаг (GPU) --------------------------
                 psi_gpu = ssfm_order2_pytorch(
                     psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
@@ -1343,7 +1346,7 @@ class Solver:
         if draw_modulus:
             fig, ax, line = init_modulus_plot(t=self.t)
 
-        for n in trange(self.com.N):
+        for n in trange(self.com.N, disable=not self.display_debug_info):
             # Выполнение на NumPy
             self.numerical_solution[n + 1] = ssfm_order1_resonator_fullcos(self.numerical_solution[n], backward_solution[:, n],
                                                                            self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0,

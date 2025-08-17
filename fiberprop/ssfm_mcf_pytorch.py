@@ -170,6 +170,7 @@ def ssfm_order2_dnd_windowed_short_torch(
         solver,
         window_size: int,
         damp_length: float = 0.0,
+        disable_progress_bar=False,
 ) -> torch.Tensor:
     """
     Полностью GPU-ориентированный вариант схемы «D-N-D»
@@ -207,7 +208,7 @@ def ssfm_order2_dnd_windowed_short_torch(
         psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
     # ------------- основной цикл по z -----------------------------
-    for _ in trange(solver.com.N):
+    for _ in trange(solver.com.N, disable=disable_progress_bar):
 
         _nonlinear_step_windowed_pytorch(
             psi, gamma_h, g0_h, exp_g0h, exp_2g0h,

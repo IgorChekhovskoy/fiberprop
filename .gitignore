@@ -185,3 +185,4 @@ fabric.properties
 .idea
 /mcf_rc_cache/
 /evolution.gif
+/mcf_optuna.db
