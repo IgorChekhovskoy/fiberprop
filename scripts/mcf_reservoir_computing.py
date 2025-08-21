@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from fiberprop.threading_control import physical_cpu_count, temporary_thread_limits
 
 
-def mackey_glass(t_size, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0):
+def mackey_glass(t_size, tau=17.0, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0):
     delay = tau / dt
     k = int(np.floor(delay))
     frac = delay - k
@@ -32,7 +32,7 @@ def mackey_glass(t_size, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.
             x_tau = x[j]
         else:
             x_tau = (1.0 - frac) * x[j - 1] + frac * x[j]
-        dxdt = beta * x_tau / (1.0 + x_tau**n) - gamma * x[i - 1]
+        dxdt = beta * x_tau / (1.0 + x_tau ** n) - gamma * x[i - 1]
         x[i] = x[i - 1] + dt * dxdt
     return x
 
@@ -60,13 +60,13 @@ def create_mask(mask_size: int, rng: np.random.Generator, kind: str = "rademache
 
 
 def mackey_glass_masked(core_count: int,
-                                 mackey_glass_symbol_count: int,
-                                 mask_size: int,
-                                 seed: int | None = None,
-                                 gain_in: float = 1.0,
-                                 warmup: int | None = None,
-                                 mask_kind: str = "rademacher",
-                                 **mg_params) -> np.ndarray:
+                        mackey_glass_symbol_count: int,
+                        mask_size: int,
+                        seed: int | None = None,
+                        gain_in: float = 1.0,
+                        warmup: int | None = None,
+                        mask_kind: str = "rademacher",
+                        **mg_params) -> np.ndarray:
     """
     Генерирует вход для резервуара (C, S*M):
       1) ряд MG длиной S + warmup;
@@ -130,16 +130,16 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
     # ------------------------------------------------------------------
     # common quantities
     # ------------------------------------------------------------------
-    q      = data_in[central_core_ind]
-    power  = np.abs(q)**2                           # W
-    tau    = time_step_ps                          # ps
-    L_coup = np.pi / (2*coupling_coefficient) if coupling_coefficient else np.inf
+    q = data_in[central_core_ind]
+    power = np.abs(q) ** 2  # W
+    tau = time_step_ps  # ps
+    L_coup = np.pi / (2 * coupling_coefficient) if coupling_coefficient else np.inf
 
     if use_fwhm:
         # ==============================================================
         # 1. old FWHM / peak-power approach
         # ==============================================================
-        P_peak   = power.max() if power.size else 0.0
+        P_peak = power.max() if power.size else 0.0
         idx_peak = power.argmax()
 
         half = 0.5 * P_peak
@@ -155,7 +155,7 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
         tau_fwhm_ps = (r - l) * tau
         T0_ps = tau_fwhm_ps / 1.763 if tau_fwhm_ps > 0 else np.inf
 
-        L_D  = T0_ps**2 / abs(beta2_ps2_m) if beta2_ps2_m else np.inf
+        L_D = T0_ps ** 2 / abs(beta2_ps2_m) if beta2_ps2_m else np.inf
         L_NL = 1.0 / (gamma_1_w_m * P_peak) if P_peak else np.inf
 
     else:
@@ -163,19 +163,19 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
         # 2. integral definitions  (preferred / default)
         # ==============================================================
         # ∫|q|² dt
-        energy = power.sum() * tau                            # W·ps
+        energy = power.sum() * tau  # W·ps
         if energy == 0:
             return np.inf, np.inf, L_coup, np.inf
 
         # ∫|∂_t q|² dt
-        dqdt   = np.gradient(q, tau)                          # √W / ps
-        disp_int = (np.abs(dqdt)**2).sum() * tau              # W / ps
+        dqdt = np.gradient(q, tau)  # √W / ps
+        disp_int = (np.abs(dqdt) ** 2).sum() * tau  # W / ps
 
         # ∫|q|⁴ dt
-        quartic = (power**2).sum() * tau                      # W²·ps
+        quartic = (power ** 2).sum() * tau  # W²·ps
 
-        L_D  = 2 * energy / (abs(beta2_ps2_m) * disp_int) if disp_int and beta2_ps2_m else np.inf
-        L_NL = energy / (gamma_1_w_m * quartic)      if quartic  else np.inf
+        L_D = 2 * energy / (abs(beta2_ps2_m) * disp_int) if disp_int and beta2_ps2_m else np.inf
+        L_NL = energy / (gamma_1_w_m * quartic) if quartic else np.inf
 
     g = np.asarray(g0_array, float).ravel()
     m = np.isfinite(g) & (g > 1e-12)
@@ -191,15 +191,33 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
     return L_D, L_NL, L_coup, L_gain
 
 
+# === NEW: FFT-friendly padding helper ===
+def _fft_padding_params(M: int, min_fraction: float = 0.1) -> Tuple[int, float, int]:
+    """
+    Возвращает (offset_size0, offset_part, target_len) для добивки нулями:
+      - offset_size0: сколько нулей добавить в начало,
+      - offset_part: доля (offset_size0 / M) — всегда >= min_fraction,
+      - target_len: итоговая длина по времени после добивки (= next_fast_len(M + ceil(min_fraction*M))).
+    """
+    from scipy.fft import next_fast_len as _next_fast_len
+
+    min_off = max(1, int(np.ceil(min_fraction * float(M))))
+    target_len = int(_next_fast_len(int(M + min_off)))
+    offset_size0 = int(target_len - M)
+    # гарантируем минимум 10% и согласуем с выбранным быстрым размером
+    offset_part = max(float(min_fraction), float(offset_size0) / float(M))
+    return offset_size0, offset_part, target_len
+
+
 def mcf_nn_reservoir_computing(
-        data_in=None,                       # ndarray (C, M_in)
-        fiber_length_m=5.0,                 # длина MCF, m
-        window_size=1000,                   # размер окна в отчетах (количество time_step_ps), по нему будет выбираться длина воздушного плеча
-        time_step_ps=0.1,                   # шаг по времени, ps
+        data_in=None,  # ndarray (C, M_in)
+        fiber_length_m=5.0,  # длина MCF, m
+        window_size=1000,
+        time_step_ps=0.1,  # шаг по времени, ps
         step_number_per_dimensionless_distance=500,
         upsampling=1,
         layer_count=1.0,
-        layer_radii_array=(1,),             # радиусы колец, µm
+        layer_radii_array=(1,),  # радиусы колец, µm
         g0_array=(),
         psat_array=(),
         kappa=0.9,
@@ -207,7 +225,9 @@ def mcf_nn_reservoir_computing(
         num_threads: int | str | None = "default",
         display_debug_info=False,
         display_debug_plots=False,
-        save_gif=False
+        save_gif=False,
+        max_hours_total: Optional[float] = None,
+        use_dispersion: bool = True,
 ):
     """
         Численно моделирует единичный *пробег* комплексного сигнала по
@@ -228,6 +248,8 @@ def mcf_nn_reservoir_computing(
             *C* — количество сердцевин, *M* — размер временной сетки.
         fiber_length_m : float, default 5.0
             Длина моделируемого участка многоядерного волокна, м.
+        window_size : int, default 1000
+            Размер окна в отчетах (количество time_step_ps), по нему будет выбираться длина воздушного плеча
         time_step_ps : float, default 0.1
             Длительность одного шага по маске в пикосекундах (ps).
             Общая длительность окна 2 T = *M* Δt.
@@ -235,11 +257,10 @@ def mcf_nn_reservoir_computing(
             Число продольных шагов интегрирования SSFM на единицу
             безразмерной длины (см. *length_scale* ниже).
         upsampling : int, default 1
-            Число точек на один шаг маски
-        layer_count : float, default 1
-            Число кольцевых слоёв вокруг центральной сердцевины
-            (0 → одиночное ядро).
-        layer_radii_array : tuple[float, …], default (1.,)
+            Число точек на один шаг маски (апсемплинг по времени).
+        layer_count : float, default 1.0
+            Количество колец вокруг центральной сердцевины (может быть дробным).
+        layer_radii_array : tuple, default (1,)
             Радиусы слоёв (микроны), начиная с центрального (0 µm).
             Длина = ``layer_count + 1``.
         g0_array : array-like, default ()
@@ -266,12 +287,9 @@ def mcf_nn_reservoir_computing(
         ----------
         Возвращает
         ----------
-        data_out : ndarray, shape = (C, M)
-            Комплексное поле после прохождения MCF
-            *и* фазового сдвига в воздушном плече:
-            ``U_out = U(L, t) · exp(+j β₁,air · L_air)``.
-        feedback_length_m : float
-            Рассчитанная длина воздушного плеча петли обратной связи.
+        словарь:
+            "data_out": ndarray (C, M) — комплексное поле после прохождения MCF,
+            "params": dict — рассчитанные параметры волокна и системы обратной связи.
 
         ----------
         Исключения
@@ -294,6 +312,10 @@ def mcf_nn_reservoir_computing(
           общее число продольных шагов `N` для интегратора.
         * В GPU-режиме копируются на CPU только
           ``stored_steps_count`` снимков поля – экономия VRAM.
+
+        * при display_debug_info=True на каждой итерации печатается
+        массив NRMSE по окнам задержки между соседними итерациями:
+          "NRMSE per window (iter k vs k-1): [ ... ]"
         """
 
     # ─── входные данные ──────────────────────────────────────────
@@ -301,319 +323,8 @@ def mcf_nn_reservoir_computing(
         raise ValueError('Массив data_in размера (C×M) должен быть задан')
     eq_size, M = data_in.shape
 
-    core_configuration = CoreConfig.hexagonal
-    light = Light(lambda0=1.55)                                 # µm
-
-    # ─── волокно и линейка ──────────────────────────────────────
-    fiber = Fiber(core_configuration=core_configuration,
-                  ring_count=layer_count,
-                  core_radius=2.95,
-                  cladding_diameter=125.0,
-                  n2=3.2,
-                  distance_to_fiber_center=layer_radii_array,
-                  NA=0.125,
-                  core_material=FiberMaterial.SIO2_AND_GEO2_ALLOY,
-                  material_concentration=0.038)
-
-    fiber.set_refractive_indexes_by_lambda(light.lambda0)
-
-    central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
-
-    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_plots=display_debug_plots)
-    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 1e-10
-    max_val = np.max(np.abs(coupling_matrix))
-    threshold = max_val * 1e-2
-    coupling_matrix = np.where(np.abs(coupling_matrix) > threshold, coupling_matrix, 0)
-
-    gamma = fiber.get_gamma(light, eps=1e-3)
-    beta1 = fiber.get_beta1(light)                     # [ps/m]
-    beta2 = fiber.get_beta2(light) * 1e-3             # [ps²/m]
-
-    if display_debug_info:
-        print("coupling_coefficient =", coupling_coefficient)
-        print("gamma =", gamma)
-        print("beta1 =", beta1)
-        print("beta2 =", beta2)
-
-    T = time_step_ps * M / 2
-
-    # ─── буфер задержки ──────────────────────────────────────────
-    fiber_propagation_time = fiber_length_m * beta1                           # [ps]
-
-    feedback_loop_propagation_time = window_size * time_step_ps - fiber_propagation_time
-    beta1_air = 1 / light.c_light * 1e+12
-    feedback_length_m = feedback_loop_propagation_time / beta1_air  # длина воздушного плеча, m
-
-    feedback_coeff = kappa * np.exp(1j * beta1_air * feedback_length_m)
-
-    if display_debug_info:
-        print()
-        print("beta1_air =", beta1_air)
-        print("fiber_length_m =", fiber_length_m)
-        print("feedback_length_m =", feedback_length_m)
-
-    if feedback_length_m <= fiber_length_m:
-        raise ValueError(
-            f"INVALID_CONFIG: feedback_length_m({feedback_length_m:.6g}) <= fiber_length_m({fiber_length_m:.6g})"
-        )
-
-    L_D, L_NL, L_coupling, L_gain = compute_characteristic_lengths(beta2_ps2_m=beta2,
-                                         gamma_1_w_m=gamma,
-                                         coupling_coefficient=coupling_coefficient,
-                                         data_in=data_in,
-                                         time_step_ps=time_step_ps,
-                                         central_core_ind=central_core_ind,
-                                         g0_array=g0_array,
-                                         psat_array=psat_array,
-                                         display_debug_info=display_debug_info)
-
-    # ─── масштабы и временное окно ──────────────────────────────
-    time_scale = np.sqrt(0.5 * abs(beta2) / coupling_coefficient)                        # [ps]
-    length_scale = np.min([L_D, L_NL, L_coupling, L_gain])  # [m]
-
-    fiber_length_dimensionless = fiber_length_m / length_scale
-    n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
-
-    esat_array = np.asarray(psat_array) * window_size * time_step_ps
-
-    if display_debug_info:
-        print("data_in.shape=", data_in.shape)
-        print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
-        print("fiber_propagation_time =", fiber_propagation_time, "ps")
-        print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
-        print("fiber_length_dimensionless =", fiber_length_dimensionless)
-        print("length_scale =", length_scale)
-        print("n_z =", n_z)
-        print("esat = ", esat_array)
-        print("\nwindow_size * time_step_ps =", window_size * time_step_ps)
-
-    # ─── Solver и параметры уравнения ────────────────────────────
-
-    offset_part = 0.1   # отступ с каждой стороны от начальных данных для учета дисперсии
-    offset_size0 = int(round(offset_part * data_in.shape[1]))
-    initial_data = np.zeros((data_in.shape[0], (M + offset_size0) * 2), dtype=np.complex128)
-    initial_data[:, offset_size0:M + offset_size0] = data_in
-
-    # upsampling
-    if upsampling != 1:
-        initial_data = np.repeat(initial_data, upsampling, axis=1)
-
-    M_final = initial_data.shape[1]
-    offset_size = offset_size0 * upsampling
-
-    T_half = (M_final * time_step_ps) / (2.0 * upsampling)
-
-    comp = ComputationalParameters(N=n_z, M=M_final,
-                                   L1=0.0, L2=fiber_length_m,
-                                   T1=-T_half, T2=T_half,
-                                   method="ssfm_order2_dnd_windowed_short", #"ssfm_order2_dnd_compact_windowed",
-                                   # damp_length=offset_part * 0.5,
-                                   window_size=window_size * upsampling,
-                                   offset_size=offset_size)
-
-    eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
-                            ring_count=layer_count,
-                            coupling_matrix=coupling_matrix,
-                            beta1=0,
-                            beta2=beta2, gamma=gamma,
-                            E_sat=esat_array, alpha=0.0, g_0=g0_array,
-                            display_debug_info=display_debug_info)
-
-    solver = Solver(comp, eq,
-                    initial_condition=initial_data,
-                    stored_steps_count=2, #None if display_debug_info else 2,
-                    use_dimensional=True,
-                    use_gpu=use_gpu,
-                    use_torch=use_gpu,
-                    precision='float64',
-                    num_threads=num_threads,
-                    display_debug_info=display_debug_info)
-
-    if display_debug_plots:
-        number_of_points_for_display = solver.com.M # np.min([5000, solver.com.M])
-
-        step = int(solver.com.M / number_of_points_for_display)
-
-    iteration_count = int(np.ceil(M / window_size))
-
-    if display_debug_info:
-        print("\niteration_count =", iteration_count)
-
-    for iteration_index in range(iteration_count):
-
-        if display_debug_info:
-            print("\niteration", iteration_index + 1, "of", iteration_count)
-
-        solver.run_numerical_simulation(
-                                        # draw_modulus=display_debug_info,
-                                        draw_interval=10,
-                                        save_gif=save_gif,
-                                        yscale="linear")
-
-        if display_debug_plots:
-            # energies = [solver.energy[i, :] for i in range(solver.eq.size)]
-            # names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
-            # plot2D_plotly(solver.z, energies, names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
-            #
-            # peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
-            # names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
-            # plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
-
-            # phase = [solver.phase_by_z[i, :] for i in range(solver.eq.size)]
-            # names = [f'$phi_{{{i}}}$' for i in range(solver.eq.size)]
-            # plot2D_plotly(solver.z, phase, names=names, x_axis_label='z [m]', y_axis_label='phase [rad]')
-
-            plot2D_plotly(solver.t[::step] * 1e-3, [np.abs(solver.numerical_solution[0][central_core_ind][::step]) ** 2,
-                                     np.abs(solver.numerical_solution[-1][central_core_ind][::step]) ** 2],
-                          names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
-                          x_axis_label='t [ns]', y_axis_label='power [W]')
-
-            # plot3D_plotly(solver.t[::step], solver.z, np.abs(solver.numerical_solution[central_core_ind][::step]) ** 2, f"$|U_{central_core_ind}(z,t)|^2$")
-
-        solver.numerical_solution[0] = initial_data + np.roll(solver.numerical_solution[-1], window_size * upsampling, axis=1) * feedback_coeff
-
-    if display_debug_plots:
-        plot2D_plotly(np.fft.fftshift(solver.omega), np.abs(np.fft.fftshift(np.fft.fft(solver.numerical_solution[-1][central_core_ind]))) ** 2,
-                      names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"], x_axis_label=r'$\omega, \text{rad/s}$',
-                      y_axis_label='spectrum intensity [W]', yscale="log", title_text="Spectrum")
-
-    return (solver.numerical_solution[-1][:, offset_size * upsampling:
-                                             (offset_size + data_in.shape[1]) * upsampling:
-                                            upsampling],
-            feedback_length_m)
-
-
-def mcf_nn_reservoir_computing_temporal_evolution(
-        data_in=None,  # ndarray (C, M_in)
-        fiber_length_m=5.0,  # длина MCF, m
-        time_step_ps=0.1,  # шаг по времени, ps
-        kappa=1.0,
-        step_number_per_dimensionless_distance=500,
-        layer_count=1.0,
-        layer_radii_array=(1,),  # радиусы колец, µm
-        g0_array=(),
-        psat_array=(),
-        use_gpu=False,
-        display_debug_info=False,
-        display_debug_plots=False,
-        save_gif=False,
-        upsampling=1
-):
-    """
-        Численно моделирует единичный *пробег* комплексного сигнала по
-        многоядерному волокну (MCF) и воздушному плечу обратной связи.
-
-        Алгоритм строит полное комплексное поле **U(z,t)** для всех *C*
-        сердцевин, интегрируя систему линейно-связанных NLSE
-        с помощью метода расщепления по физическим процессам (SSFM).
-        По завершении возвращается комплексное поле на выходе MCF и
-        требуемая длина воздушного плеча задержки.
-
-        ----------
-        Параметры
-        ----------
-        data_in : ndarray, shape = (C, M)
-            **Начальное условие** – комплексная огибающая сигналов (√W)
-            в *C* сердцевинах (комплексные величины).
-            *C* — количество сердцевин, *M* — размер временной сетки.
-        fiber_length_m : float, default 5.0
-            Длина моделируемого участка многоядерного волокна, м.
-        time_step_ps : float, default 0.1
-            Шаг временной сетки Δt в пикосекундах (ps).
-            Общая длительность окна 2 T = *M* Δt.
-        step_number_per_dimensionless_distance : int, default 500
-            Число продольных шагов интегрирования SSFM на единицу
-            безразмерной длины (см. *length_scale* ниже).
-        layer_count : float, default 1
-            Число кольцевых слоёв вокруг центральной сердцевины
-            (0 → одиночное ядро).
-        layer_radii_array : tuple[float, …], default (1.,)
-            Радиусы слоёв (микроны), начиная с центрального (0 µm).
-            Длина = ``layer_count + 1``.
-        g0_array : array-like, default ()
-            Коэффициенты малого-сигнала g₀ [1/м] для *C* сердцевин.
-            Нулевой массив → усиление отключено.
-        psat_array : array-like, default ()
-            Мощность насыщения P_sat, Вт, для *C* сердцевин
-            (используется как E_sat = 2 T P_sat).
-        use_gpu : bool, default False
-            True → основное ядро SSFM выполняется на GPU (PyTorch-CUDA),
-            иначе – NumPy/CPU.
-        display_debug_info : bool, default False
-            Печатает расчётные коэффициенты, характерные длины,
-            задержки и прочие служебные данные.
-        display_debug_plots : bool, default False
-            Визуализация хода интегрирования и итоговых спектров
-            средствами plotly (2D/3D).
-        save_gif : bool, default False
-            При включённой отрисовке modulus-кадров сохраняет анимацию
-            эволюции поля в GIF-файл в рабочем каталоге.
-
-        ----------
-        Возвращает
-        ----------
-        data_out : ndarray, shape = (C, M)
-            Комплексное поле после прохождения MCF
-            *и* фазового сдвига в воздушном плече:
-            ``U_out = U(L, t) · exp(+j β₁,air · L_air)``.
-        feedback_length_m : float
-            Рассчитанная длина воздушного плеча петли обратной связи.
-
-        ----------
-        Исключения
-        ----------
-        ValueError
-            • `data_in is None` или некорректной формы
-            • Размерности массивов g₀/E_sat не совпадают с *C*.
-        AssertionError
-            Возникает, если вычисленная длина воздушного плеча
-            меньше самой секции MCF (нарушена длительность окна).
-
-        ----------
-        Примечания
-        ----------
-        * Характерное время **T₀** вычисляется по FWHM импульса
-          центральной сердцевины, далее строятся длины
-          L_D, L_NL, L_coup.  Минимальная из них задаёт
-          *length_scale*, что, в сочетании с
-          *step_number_per_dimensionless_distance*, определяет
-          общее число продольных шагов `N` для интегратора.
-        * В GPU-режиме копируются на CPU только
-          ``stored_steps_count`` снимков поля – экономия VRAM.
-        * Подробнее о применении delay-based reservoir computing
-          с многоядерным волокном см.:
-          S. Honardoost *et al.*, *Opt. Express* 26 (2018) 11072-11090;
-          L. Duport *et al.*, *IEEE Photon. Tech. Lett.* 31 (2019) 890-893.
-
-        ----------
-        Пример
-        ----------
-        >>> M = 8192                       # точек на окно
-        >>> C = 7                          # сердцевин
-        >>> u0 = np.random.randn(C, M) * .01
-        >>> u_out, L_air = mcf_nn_reservoir_computing(
-        ...     data_in=u0,
-        ...     fiber_length_m=1.0,
-        ...     time_step_ps=25,           # 40 GHz
-        ...     step_number_per_dimensionless_distance=300,
-        ...     layer_count=1,
-        ...     layer_radii_array=(0., 34.6),
-        ...     display_debug_info=True
-        ... )
-        """
-
-    # ─── входные данные ──────────────────────────────────────────
-    if data_in is None:
-        raise ValueError('Массив data_in размера (C×M) должен быть задан')
-
-    if not isinstance(upsampling, int) or upsampling < 1:
-        raise ValueError('upsampling должен быть натуральным числом ≥ 1')
-
-    eq_size, M_orig = data_in.shape
-    M = M_orig * upsampling
-
-    data_in = np.repeat(data_in, upsampling, axis=1)
-    time_step_ps /= upsampling
+    if window_size <= 0 or window_size > M:
+        raise ValueError("window_size должен быть >= 1")
 
     core_configuration = CoreConfig.hexagonal
     light = Light(lambda0=1.55)  # µm
@@ -628,13 +339,16 @@ def mcf_nn_reservoir_computing_temporal_evolution(
                   NA=0.125,
                   core_material=FiberMaterial.SIO2_AND_GEO2_ALLOY,
                   material_concentration=0.038)
-
     fiber.set_refractive_indexes_by_lambda(light.lambda0)
 
     central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
 
-    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_info=display_debug_info)
-    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 139.55
+    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_plots=display_debug_plots)
+    coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 1e-10
+    max_val = np.max(np.abs(coupling_matrix))
+    threshold = max_val * 1e-2
+    coupling_matrix = np.where(np.abs(coupling_matrix) > threshold, coupling_matrix, 0)
+
     gamma = fiber.get_gamma(light, eps=1e-3)
     beta1 = fiber.get_beta1(light)  # [ps/m]
     beta2 = fiber.get_beta2(light) * 1e-3  # [ps²/m]
@@ -645,154 +359,289 @@ def mcf_nn_reservoir_computing_temporal_evolution(
         print("beta1 =", beta1)
         print("beta2 =", beta2)
 
-    T = time_step_ps * M / 2
-
     # ─── буфер задержки ──────────────────────────────────────────
     fiber_propagation_time = fiber_length_m * beta1  # [ps]
-
-    feedback_loop_propagation_time = 2 * T - fiber_propagation_time
     beta1_air = 1 / light.c_light * 1e+12
+    feedback_loop_propagation_time = window_size * time_step_ps - fiber_propagation_time
     feedback_length_m = feedback_loop_propagation_time / beta1_air  # длина воздушного плеча, m
+    feedback_coeff = kappa * np.exp(1j * beta1_air * feedback_length_m)
 
-    if display_debug_info:
-        print()
-        print("beta1_air =", beta1_air)
-        print("fiber_length_m =", fiber_length_m)
-        print("feedback_length_m =", feedback_length_m)
-
-    if feedback_length_m <= fiber_length_m:
-        raise ValueError(
-            f"INVALID_CONFIG: feedback_length_m({feedback_length_m:.6g}) <= fiber_length_m({fiber_length_m:.6g})"
-        )
-
-    ################################################
-
-    t_axis = (np.arange(data_in.shape[1]) - data_in.shape[1] / 2) * time_step_ps  # [ps]
-
-    # берём центральную сердцевину:
-    u0 = data_in[central_core_ind]
-
-    # первая производная dU/dt (комплексная)
-    du_dt = np.gradient(u0, time_step_ps)  # [√W / ps]
-
-    plt.figure(figsize=(9, 4))
-
-    # ── |u|² ----------------------------------------------------------------
-    plt.subplot(1, 2, 1)
-    plt.plot(t_axis, np.abs(u0) ** 2)
-    plt.title("Модуль² входного поля")
-    plt.xlabel("t  [ps]")
-    plt.ylabel("|u|²  [W]")
-
-    # ── dRe(u)/dt  -----------------------------------------------------------
-    plt.subplot(1, 2, 2)
-    plt.plot(t_axis, du_dt.real, label="Re du/dt")
-    plt.plot(t_axis, du_dt.imag, "--", label="Im du/dt")
-    plt.title("Первая производная  du/dt")
-    plt.xlabel("t  [ps]")
-    plt.legend()
-
-    plt.show()
-
-    #############################################
-
-    L_D, L_NL, L_coupling, L_gain = compute_characteristic_lengths(beta2_ps2_m=beta2,
-                                                           gamma_1_w_m=gamma,
-                                                           coupling_coefficient=coupling_coefficient,
-                                                           data_in=data_in,
-                                                           time_step_ps=time_step_ps,
-                                                           central_core_ind=central_core_ind,
-                                                           g0_array=g0_array,
-                                                           psat_array=psat_array,
-                                                           display_debug_info=display_debug_info)
-
-    # ─── масштабы и временное окно ──────────────────────────────
-    time_scale = np.sqrt(0.5 * abs(beta2) / coupling_coefficient)  # [ps]
+    # ─── характерные длины ───────────────────────────────────────
+    L_D, L_NL, L_coupling, L_gain = compute_characteristic_lengths(
+        beta2_ps2_m=beta2,
+        gamma_1_w_m=gamma,
+        coupling_coefficient=coupling_coefficient,
+        data_in=data_in,
+        time_step_ps=time_step_ps,
+        central_core_ind=central_core_ind,
+        g0_array=g0_array,
+        psat_array=psat_array,
+        display_debug_info=display_debug_info
+    )
+    time_scale = np.sqrt(0.5 * abs(beta2) / coupling_coefficient) if beta2 != 0 else 0.0  # [ps]
     length_scale = np.min([L_D, L_NL, L_coupling, L_gain])  # [m]
 
+    # ─── масштабы и временное окно ──────────────────────────────
     fiber_length_dimensionless = fiber_length_m / length_scale
-    n_z = step_number_per_dimensionless_distance * int(round(fiber_length_dimensionless))
+    n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
+    esat_array = np.asarray(psat_array) * window_size * time_step_ps
 
-    esat_array = np.asarray(psat_array) * 2 * T # TODO : хз, какой тут интервал правильный. По идее,
-                                                # модель усиления тут должна быть без esat
+    # --- режим без дисперсии (beta2=0) с оконным стримингом ---
+    if not use_dispersion:
+        n_batches = int(np.ceil(M / window_size))
 
-    if display_debug_info:
-        print("data_in.shape=", data_in.shape)
-        print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
-        print("fiber_propagation_time =", fiber_propagation_time, "ps")
-        print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
-        print("fiber_length_dimensionless =", fiber_length_dimensionless)
-        print("length_scale =", length_scale)
-        print("n_z =", n_z)
-        print("esat = ", esat_array)
+        T_half_stream = (window_size * time_step_ps) / 2.0
 
-    # ─── Solver и параметры уравнения ────────────────────────────
+        comp = ComputationalParameters(N=n_z, M=window_size,
+                                       L1=0.0, L2=fiber_length_m,
+                                       T1=-T_half_stream, T2=T_half_stream,
+                                       method="ssfm_order2_dnd_windowed_short",
+                                       window_size=window_size,
+                                       offset_size=0)
 
-    comp = ComputationalParameters(N=n_z, M=data_in.shape[1],
-                                   L1=0.0, L2=fiber_length_m,
-                                   T1=-T, T2=T)
+        eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
+                                ring_count=layer_count,
+                                coupling_matrix=coupling_matrix,
+                                beta1=0, beta2=0.0, gamma=gamma,
+                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
+                                display_debug_info=display_debug_info)
 
-    eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
-                            ring_count=layer_count,
-                            coupling_coefficient=coupling_coefficient, beta1=0,
-                            beta2=beta2, gamma=gamma,
-                            E_sat=esat_array, alpha=0.0, g_0=g0_array,
-                            display_debug_info=display_debug_info)
+        data_out_stream = np.zeros((eq_size, M), dtype=np.complex128)
+        seg = data_in[:, 0:window_size]  # первое окно
 
-    solver = Solver(comp, eq,
-                    initial_condition=None, # !!!!!!!!!!!!!!!!!!!!!
-                    # stored_steps_count=None if display_debug_info else 2,
-                    use_dimensional=True,
-                    use_gpu=use_gpu,
-                    use_torch=use_gpu,
-                    display_debug_info=display_debug_info)
+        solver = Solver(comp, eq,
+                        initial_condition=seg,
+                        stored_steps_count=2,
+                        use_dimensional=True,
+                        use_gpu=use_gpu,
+                        use_torch=use_gpu,
+                        precision='float64',
+                        display_debug_info=display_debug_info)
+        solver.linear_coeffs_array = coupling_matrix
 
-    solver.linear_coeffs_array = coupling_matrix
+        # ВАЖНО: буфер предыдущего окна (для feedback) — определён заранее
+        fb_buf = np.zeros((eq_size, window_size), dtype=np.complex128)
 
-    ############################################
+        for batch_index in range(n_batches):
+            if batch_index > 0:
+                s = batch_index * window_size
+                e = min(s + window_size, M)
+                seg = data_in[:, s:e]
+                if seg.shape[1] < window_size:
+                    tmp = np.zeros((eq_size, window_size), dtype=np.complex128)
+                    tmp[:, :seg.shape[1]] = seg
+                    seg = tmp
+                solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
 
-    dz = solver.com.h  # шаг по z
-    vmax = abs(solver.eq.beta1).max()  # макс. скорость характеристики
-    dt_cfl = 0.8 * dz * vmax  # безопасность 0.8
-    rhoA = (4 * vmax) / (3 * dz)
-    dt_rk4 = 2.78 / rhoA
+            dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
+            if (batch_index == 0) and (max_hours_total is not None):
+                est_total_sec = dt_b * n_batches
+                if est_total_sec > float(max_hours_total) * 3600.0:
+                    raise RuntimeError(
+                        f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
+                        f"max_hours_total={float(max_hours_total):.3f}; "
+                        f"windows={n_batches}, dt_first={dt_b:.3f}s"
+                    )
 
-    if display_debug_info:
-        print("\ntau =", solver.com.tau, "ps")
-        print("h =", solver.com.h, "m")
-        print("beta1*h =", beta1 * solver.com.h, "ps")
+            fb_buf = solver.numerical_solution[-1]
+            s = batch_index * window_size
+            e = min(s + window_size, M)
+            data_out_stream[:, s:e] = fb_buf[:, :e - s]
 
-    solver.feedback_coefficient = kappa * np.exp(1j * beta1_air * feedback_length_m)
-    solver.feedback_delay_ps = feedback_length_m * beta1_air
-    solver.boundary_condition = data_in  # (C, M_t)
+        if display_debug_plots:
+            plot2D_plotly(
+                np.fft.fftshift(solver.omega),
+                np.abs(np.fft.fftshift(np.fft.fft(data_out_stream[central_core_ind]))) ** 2,
+                names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
+                x_axis_label=r'$\omega, \text{rad/s}$',
+                y_axis_label='spectrum intensity [W]', yscale="log", title_text="Spectrum"
+            )
 
-    solver.run_numerical_simulation_time(draw_modulus=display_debug_info,
-                                    draw_interval=1,
-                                    save_gif=save_gif,
-                                    yscale="linear")
+        if display_debug_plots:
+            plot2D_plotly(
+                solver.t * 1e-3,
+                np.abs(data_out_stream[central_core_ind]) ** 2,
+                names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
+                x_axis_label='t [ns]', y_axis_label='power [W]'
+            )
 
-    #############################################
+        params = {
+            "gamma": float(gamma),
+            "beta1": float(beta1),
+            "beta2": 0.0,
+            "beta1_air": float(beta1_air),
+            "feedback_length_m": feedback_length_m,
+        }
+        return {
+            "data_out": data_out_stream,
+            "params": params,
+        }
 
-    result = solver.numerical_solution[-1][:, ::upsampling] # TODO сделать правильно: снять поле с правой границы
-    result *= np.exp(1j * beta1_air * feedback_length_m)
+    # =============================== beta2 != 0 ==========================================
+    else:
+        if display_debug_info:
+            print("data_in.shape=", data_in.shape)
+            print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
+            print("fiber_propagation_time =", fiber_propagation_time, "ps")
+            print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
+            print("fiber_length_dimensionless =", fiber_length_dimensionless)
+            print("length_scale =", length_scale)
+            print("n_z =", n_z)
+            print("esat = ", esat_array)
+            print("\nwindow_size * time_step_ps =", window_size * time_step_ps)
 
-    if display_debug_plots:
-        energies = [solver.energy[i, :] for i in range(solver.eq.size)]
-        names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
-        plot2D_plotly(solver.z, energies, names=names, x_axis_label='z [m]', y_axis_label='energy [pJ]')
+        # ─── Solver и параметры уравнения ────────────────────────────
 
-        peak_powers = [solver.peak_power[i, :] for i in range(solver.eq.size)]
-        names = [f'$P_{{{i}}}$' for i in range(solver.eq.size)]
-        plot2D_plotly(solver.z, peak_powers, names=names, x_axis_label='z [m]', y_axis_label='peak power [W]')
+        # Выбираем размер «обрезки»/добивки: теперь подгоняем длину под быстрый FFT
+        # и при этом offset_part гарантированно >= 0.1.
+        offset_size0, offset_part, _target_len = _fft_padding_params(M, min_fraction=0.1)
+        initial_data = np.zeros((data_in.shape[0], (M + offset_size0) * 2), dtype=np.complex128)
+        initial_data[:, offset_size0:M + offset_size0] = data_in
 
-        plot2D_plotly(solver.t, [np.abs(solver.numerical_solution[0][central_core_ind]) ** 2,
-                                 np.abs(solver.numerical_solution[-1][central_core_ind]) ** 2],
-                      names=[f"$|U_3(z=0,t)|^2$", f"$|U_3(z=L,t)|^2$"], x_axis_label='t [ps]', y_axis_label='power [W]',
-                      linewidth=0.5)
+        # upsampling
+        if upsampling != 1:
+            initial_data = np.repeat(initial_data, upsampling, axis=1)
 
-        # plot3D_plotly(solver.t, solver.z, np.abs(solver.numerical_solution[central_core_ind]) ** 2, f"$|U_3(z,t)|^2$")
+        M_final = initial_data.shape[1]
+        offset_size = offset_size0 * upsampling
 
-    return result, feedback_length_m
+        T_half = (M_final * time_step_ps) / (2.0 * upsampling)
+
+        comp = ComputationalParameters(N=n_z, M=M_final,
+                                       L1=0.0, L2=fiber_length_m,
+                                       T1=-T_half, T2=T_half,
+                                       method="ssfm_order2_dnd_windowed_short",  # "ssfm_order2_dnd_compact_windowed",
+                                       # damp_length=offset_part * 0.5,
+                                       window_size=window_size * upsampling,
+                                       offset_size=offset_size)
+
+        eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
+                                ring_count=layer_count,
+                                coupling_matrix=coupling_matrix,
+                                beta1=0,
+                                beta2=beta2, gamma=gamma,
+                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
+                                display_debug_info=display_debug_info)
+
+        solver = Solver(comp, eq,
+                        initial_condition=initial_data,
+                        stored_steps_count=2,  # None if display_debug_info else 2,
+                        use_dimensional=True,
+                        use_gpu=use_gpu,
+                        use_torch=use_gpu,
+                        precision='float64',
+                        num_threads=num_threads,
+                        display_debug_info=display_debug_info)
+
+        if display_debug_plots:
+            number_of_points_for_display = solver.com.M  # np.min([5000, solver.com.M])
+            step = int(solver.com.M / number_of_points_for_display)
+
+        iteration_count = int(np.ceil(M / window_size))
+
+        if display_debug_info:
+            print("\niteration_count =", iteration_count)
+
+        # ── подготовка метрики сходимости по окнам ───────────────────
+        w_mask = int(window_size * upsampling)  # ширина окна в отсчётах solver'а
+        main_start = int(offset_size)  # начало «полезной» области
+        main_len = int(M * upsampling)  # длина «полезной» области
+        main_end = main_start + main_len
+        _prev_int_main = None  # интенсивности |U|^2 из пред. итерации (C, main_len)
+        _last_max_nrmse = 0.0
+
+        for iteration_index in range(iteration_count + 1):  # одна доп. итерация для окончательного установления
+            if display_debug_info:
+                print("\niteration", iteration_index, "of", iteration_count)
+
+            dt_b = solver.run_numerical_simulation(
+                # draw_modulus=display_debug_info,
+                draw_interval=10,
+                save_gif=save_gif,
+                yscale="linear"
+            )
+
+            # — оценка общего времени на итерации 1 (после прогрева) —
+            if (iteration_index == 0) and (max_hours_total is not None):
+                est_total_sec = dt_b * (iteration_count + 1)
+                if est_total_sec > float(max_hours_total) * 3600.0:
+                    raise RuntimeError(
+                        f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
+                        f"max_hours_total={float(max_hours_total):.3f}; "
+                        f"iter_count={iteration_count + 1}, dt1={dt_b:.3f}s"
+                    )
+
+            # ── метрика сходимости: NRMSE по окнам (между итерациями) ──
+            cur_main = solver.numerical_solution[-1][:, main_start:main_end]  # (C, main_len)
+            cur_int = (np.abs(cur_main) ** 2).astype(np.float64, copy=False)  # (C, main_len)
+
+            if _prev_int_main is not None:
+                errs = []
+                Lm = cur_int.shape[1]
+                for k in range(iteration_count):
+                    s = k * w_mask
+                    if s >= Lm:
+                        break
+                    e = min(s + w_mask, Lm)
+                    a = _prev_int_main[:, s:e].ravel()
+                    b = cur_int[:, s:e].ravel()
+                    denom = (a.max() - a.min()) or 1.0
+                    errs.append(float(np.sqrt(np.mean((a - b) ** 2)) / denom))
+                if errs:
+                    _last_max_nrmse = float(np.max(errs))
+                if display_debug_info:
+                    print(f"NRMSE per window (iter {iteration_index} vs {iteration_index - 1}): "
+                          f"{[f'{e:.1e}' for e in np.asarray(errs, float)]}")
+
+            _prev_int_main = cur_int  # обновляем эталон для следующей итерации
+
+            # if display_debug_plots:
+            #     plot2D_plotly(
+            #         solver.t[::step] * 1e-3,
+            #         [np.abs(solver.numerical_solution[0][central_core_ind][::step]) ** 2,
+            #          np.abs(solver.numerical_solution[-1][central_core_ind][::step]) ** 2],
+            #         names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
+            #         x_axis_label='t [ns]', y_axis_label='power [W]'
+            #     )
+
+            solver.numerical_solution[0] = initial_data + np.roll(solver.numerical_solution[-1],
+                                                                  window_size * upsampling, axis=1) * feedback_coeff
+
+        # — проверка сходимости по последней паре итераций —
+        if _last_max_nrmse > 1e-2:
+            raise RuntimeError(
+                f"ITERATION_NOT_CONVERGED: max_nrmse_last={_last_max_nrmse:.6g} > 1e-2"
+            )
+
+        if display_debug_plots:
+            plot2D_plotly(
+                np.fft.fftshift(solver.omega),
+                np.abs(np.fft.fftshift(np.fft.fft(solver.numerical_solution[-1][central_core_ind]))) ** 2,
+                names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
+                x_axis_label=r'$\omega, \text{rad/s}$',
+                y_axis_label='spectrum intensity [W]', yscale="log", title_text="Spectrum"
+            )
+
+        if display_debug_plots:
+            plot2D_plotly(
+                solver.t * 1e-3,
+                np.abs(solver.numerical_solution[-1][central_core_ind][
+                       offset_size * upsampling:(offset_size + data_in.shape[1]) * upsampling]) ** 2,
+                names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
+                x_axis_label='t [ns]', y_axis_label='power [W]'
+            )
+
+        return {
+            "data_out": (solver.numerical_solution[-1][:,
+                         offset_size * upsampling:(offset_size + data_in.shape[1]) * upsampling:upsampling]),
+            "params": {
+                "gamma": float(gamma),
+                "beta1": float(beta1),
+                "beta2": float(beta2),
+                "beta1_air": float(beta1_air),
+                "feedback_length_m": feedback_length_m,
+            },
+        }
 
 
 # if __name__ == '__main__':
@@ -911,12 +760,38 @@ from typing import Dict, Any, Tuple, Literal, Optional
 
 CACHE_DIR = Path("./mcf_rc_cache")
 
-def json_dumps_compact(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+def json_dumps_compact(obj):
+    """
+    Компактная JSON-сериализация с безопасным приведением numpy-типов:
+    - numpy scalars (np.int64, np.float64, np.bool_) -> обычные int/float/bool через .item()
+    - numpy.ndarray -> list через .tolist()
+    - коллекции и словари обходим рекурсивно
+    """
+    def _to_jsonable(x):
+        # numpy скаляры → базовые типы
+        if isinstance(x, np.generic):
+            return x.item()
+        # numpy массивы → списки
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        # словари → рекурсивно
+        if isinstance(x, dict):
+            # ключи на всякий случай приводим к строке (если вдруг попались не-строки)
+            return {str(k): _to_jsonable(v) for k, v in x.items()}
+        # последовательности/множества → рекурсивно в список
+        if isinstance(x, (list, tuple, set)):
+            return [_to_jsonable(v) for v in x]
+        # остальное — как есть
+        return x
+
+    return json.dumps(_to_jsonable(obj), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
 
 def sha256_of_json(obj: Any) -> str:
     s = json_dumps_compact(obj).encode("utf-8")
     return hashlib.sha256(s).hexdigest()
+
 
 def nrmse(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
     """
@@ -941,7 +816,7 @@ def nrmse(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
     diff = y_true - y_pred
     rmse = float(np.sqrt((diff * diff).mean()))  # безопасно: массив гарантированно непустой
 
-    s = float(np.std(y_true))                    # безопасно: массив гарантированно непустой
+    s = float(np.std(y_true))  # безопасно: массив гарантированно непустой
     if not np.isfinite(s) or s < eps:
         return 0.0 if rmse < eps else float('inf')
 
@@ -956,6 +831,7 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
     I = np.eye(Xb.shape[1])
     return np.linalg.solve(Xb.T @ Xb + alpha * I, Xb.T @ y)
 
+
 def apply_readout(X: np.ndarray, W: np.ndarray, add_bias: bool = True) -> np.ndarray:
     if add_bias:
         Xb = np.hstack([X, np.ones((X.shape[0], 1))])
@@ -963,11 +839,14 @@ def apply_readout(X: np.ndarray, W: np.ndarray, add_bias: bool = True) -> np.nda
         Xb = X
     return Xb @ W
 
+
 # =========================
 # Конфиги
 # =========================
 
 MaskVariant = Literal["temporal_same_all_cores", "temporal_unique_per_core", "spatial_only"]
+
+
 # "temporal_same_all_cores"     → одна и та же временная маска для всех ядер
 # "temporal_unique_per_core"    → своя временная маска для каждого ядра
 # "spatial_only"                → без временной маски; только разные постоянные веса по ядрам
@@ -993,6 +872,7 @@ class MGConfig:
     dt: float = 1.0
     warmup: int = 300
 
+
 @dataclass
 class MaskConfig:
     """
@@ -1016,10 +896,11 @@ class MaskConfig:
     seed: Optional[int] = 42
     gain_in: float = 1.0
 
+
 @dataclass
 class ReservoirConfig:
     fiber_length_m: float
-    time_step_ps: float # сигнал - кусочно-постоянная функция, time_step_ps - длительность одного элемента этого сигнала
+    time_step_ps: float  # сигнал - кусочно-постоянная функция, time_step_ps - длительность одного элемента этого сигнала
     step_number_per_dimensionless_distance: int = 20
     upsampling: int = 2
     layer_count: float = 1.0
@@ -1034,7 +915,10 @@ class ReservoirConfig:
     save_gif: bool = False
     delay_factor_in_symbols: int | None = None  # число символов в петле обратной связи
     delay_additional_in_mask_steps: int = 0  # дополнительный фазовый сдвиг в шагах маски в петле обратной связи (0..mask_size-1); для spatial_only эффекта не даст
-    window_size: Optional[int] = None # Пользователь НЕ задаёт руками; вычисляется из delay_factor_in_symbols/phase внутри запуска
+    window_size: Optional[
+        int] = None  # Пользователь НЕ задаёт руками; вычисляется из delay_factor_in_symbols/phase внутри запуска
+    max_hours_total: Optional[float] = None  # ОГРАНИЧЕНИЕ: оценка общего времени прогона (часы)
+    use_dispersion: Optional[bool] = None  # Включать ли слагаемое с дисперсией в модель
 
 @dataclass
 class TrainingConfig:
@@ -1267,7 +1151,7 @@ def debug_plot_post_training_comparison(y_true: np.ndarray,
 
     # NRMSE на видимом отрезке
     denom = float(np.std(y_true[start:end])) + 1e-12
-    err = float(np.sqrt(np.mean((y_true[start:end] - y_pred[start:end])**2)) / denom)
+    err = float(np.sqrt(np.mean((y_true[start:end] - y_pred[start:end]) ** 2)) / denom)
 
     fig, ax = plt.subplots(figsize=(12, 4), constrained_layout=True)
     ax.plot(x, y_true[start:end], lw=1.0, label="истина")
@@ -1333,6 +1217,7 @@ def debug_plot_readout_train_val_test(res: dict,
     # зоны теми же цветами, что в overview:
     def span(lo, hi, color, label):
         ax.axvspan(lo, hi, color=color, alpha=0.18, label=label)
+
     span(*b_tr, "#2ca02c", f"train  (NRMSE={m['nrmse_train']:.4f})")
     if n_va > 0:
         span(*b_va, "#9467bd", f"val    (NRMSE={m['nrmse_val']:.4f})")
@@ -1359,7 +1244,6 @@ def debug_plot_readout_train_val_test(res: dict,
         plt.show()
 
     return m
-
 
 
 # =========================
@@ -1412,6 +1296,7 @@ _VOLATILE_FIELDS = {
     ("reservoir", "display_debug_info"),
     ("reservoir", "display_debug_plots"),
     ("reservoir", "save_gif"),
+    ("reservoir", "max_hours_total"),
     ("training",),
 }
 
@@ -1422,11 +1307,12 @@ _DEFAULT_FLOAT_DIGITS = 3
 _FIELD_DIGITS = {
     ("reservoir", "time_step_ps"): 3,
     ("reservoir", "fiber_length_m"): 3,
-    ("reservoir", "psat_array"): 3,
+    ("reservoir", "psat_array"): 5,
     ("reservoir", "g0_array"): 3,
     ("reservoir", "kappa"): 3,
     ("mask", "gain_in"): 3,
 }
+
 
 def _quantize_for_hash(obj, path=()) -> Any:
     """Рекурсивно: округляет float, приводит np-числа к python-типа, массивы к спискам;
@@ -1462,6 +1348,7 @@ def _quantize_for_hash(obj, path=()) -> Any:
     # остальные типы (int/str/bool/None)
     return obj
 
+
 def _params_for_cache(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig,
                       reservoir_cfg: ReservoirConfig, variant: MaskVariant) -> Dict[str, Any]:
     d = dict(
@@ -1475,32 +1362,174 @@ def _params_for_cache(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig,
             "layer_radii_array": list(reservoir_cfg.layer_radii_array),
             "g0_array": list(reservoir_cfg.g0_array),
             "psat_array": list(reservoir_cfg.psat_array),
+            "use_dispersion": bool(getattr(reservoir_cfg, "use_dispersion", True)),
         },
     )
     # ВАЖНО: возвращаем «сырой» словарь для записи в артефакты,
     # а для ключа кэша используем _quantize_for_hash(d) внутри _cache_path().
     return d
 
+
 def _cache_path(params_dict: Dict[str, Any]) -> Path:
     # Ключ строим НЕ по «сырому», а по канонизированному словарю:
     key = sha256_of_json(_quantize_for_hash(params_dict))
     return CACHE_DIR / f"{key}.npz"
 
+
+def reconstruct_data_in_from_compact(core_count: int,
+                                     variant: str,
+                                     mg_series: np.ndarray,
+                                     mask_cfg: MaskConfig,
+                                     *,
+                                     mask_time: Optional[np.ndarray] = None,
+                                     masks_time: Optional[np.ndarray] = None,
+                                     core_weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Восстановление data_in по компактному представлению:
+      • mg_series — ряд Маккея–Гласса длиной S (после нормировки и warmup);
+      • для temporal_same_all_cores: mask_time формы (M,);
+      • для temporal_unique_per_core: masks_time формы (C,M);
+      • для spatial_only: core_weights формы (C,).
+
+    Возвращает массив data_in формы:
+      • temporal_*  → (C, S*M)
+      • spatial_only → (C, S)
+    """
+    S = int(mg_series.shape[0])
+    C = int(core_count)
+
+    if variant == "temporal_same_all_cores":
+        if mask_time is None:
+            rng = np.random.default_rng(mask_cfg.seed)
+            mask_time = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind)  # (M,)
+        pattern = np.kron(mg_series, mask_time) * float(mask_cfg.gain_in)  # (S*M,)
+        data_in = np.tile(pattern, (C, 1))  # (C,S*M)
+        return data_in
+
+    if variant == "temporal_unique_per_core":
+        if masks_time is None:
+            rng = np.random.default_rng(mask_cfg.seed)
+            masks_time = np.empty((C, mask_cfg.mask_size), dtype=float)
+            for c in range(C):
+                masks_time[c] = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind)
+        out = np.empty((C, S * mask_cfg.mask_size), dtype=float)
+        for c in range(C):
+            out[c] = np.kron(mg_series, masks_time[c])
+        out *= float(mask_cfg.gain_in)
+        return out
+
+    if variant == "spatial_only":
+        if core_weights is None:
+            rng = np.random.default_rng(mask_cfg.seed)
+            core_weights = rng.uniform(-1.0, 1.0, size=C)
+        return (np.asarray(core_weights, dtype=float).reshape(C, 1) * mg_series.reshape(1, S)) * float(mask_cfg.gain_in)
+
+    raise ValueError(f"Unknown variant: {variant}")
+
+
 def run_mcf_with_cache(data_in: np.ndarray,
                        params_dict: Dict[str, Any],
-                       force_rerun: bool = False) -> Tuple[np.ndarray, float, str]:
+                       force_rerun: bool = False,
+                       cache_bits: int = 64) -> Tuple[np.ndarray, float, str]:
     """
-    Возвращает (data_out[C,M], feedback_length_m, cache_key).
-    Кэш содержит params_json, data_in, data_out, feedback_length_m.
+    Возвращает (data_out[C,M], params, cache_key).
+
+    КЭШ (НОВЫЙ формат):
+      • params_json (строка JSON в uint8);
+      • cache_bits (int: 16/32/64);
+      • mg_series (float{16,32,64});
+      • mask_time (если temporal_same_all_cores) ИЛИ
+        masks_time (если temporal_unique_per_core) ИЛИ
+        core_weights (если spatial_only);
+      • data_out — комплекс:
+          - при 64 бит: data_out_c64  (complex128);
+          - при 32 бит: data_out_c32  (complex64);
+          - при 16 бит: data_out_re_f16, data_out_im_f16 (float16);
+      • params (dict).
     """
+
+    def _pack_complex(arr: np.ndarray, bits: int) -> Dict[str, np.ndarray]:
+        if bits == 64:
+            return {"data_out_c64": np.asarray(arr, dtype=np.complex128)}
+        if bits == 32:
+            return {"data_out_c32": np.asarray(arr, dtype=np.complex64)}
+        if bits == 16:
+            a = np.asarray(arr)
+            return {
+                "data_out_re_f16": a.real.astype(np.float16, copy=False),
+                "data_out_im_f16": a.imag.astype(np.float16, copy=False),
+            }
+        raise ValueError("cache_bits must be one of {16,32,64}")
+
+    def _unpack_complex(z: np.lib.npyio.NpzFile) -> Tuple[np.ndarray, Dict[str, Any]]:
+        if "data_out_c64" in z.files:
+            data_out = z["data_out_c64"]
+        elif "data_out_c32" in z.files:
+            data_out = z["data_out_c32"]
+        elif "data_out_re_f16" in z.files and "data_out_im_f16" in z.files:
+            data_out = z["data_out_re_f16"].astype(np.float32, copy=False) \
+                       + 1j * z["data_out_im_f16"].astype(np.float32, copy=False)
+        else:
+            raise KeyError("cache archive: missing data_out_* arrays (c64/c32 or re_f16+im_f16)")
+
+        if "fiber_params_json" not in z.files:
+            params = {}
+        else:
+            try:
+                params = json.loads(z["fiber_params_json"].tobytes().decode("utf-8"))
+            except Exception:
+                params = {}
+
+        return data_out, params
+
+    def _real_dtype(bits: int) -> np.dtype:
+        if bits == 64:
+            return np.float64
+        if bits == 32:
+            return np.float32
+        if bits == 16:
+            return np.float16
+        raise ValueError("cache_bits must be one of {16,32,64}")
+
     p = _cache_path(params_dict)
     key = p.stem
-    if p.exists() and not force_rerun:
-        z = np.load(p, allow_pickle=False)
-        return z["data_out"], float(z["feedback_length_m"]), key
+
+    # --- ЕДИНООБРАЗНЫЙ ПУТЬ К КЭШУ: (корень проекта)/scripts/mcf_rc_cache ---
+    from pathlib import Path as _Path
+    _base_dir = _Path(__file__).parent.resolve()  # ./scripts
+    _p_scripts = (_base_dir / "mcf_rc_cache" / p.name)  # ./scripts/mcf_rc_cache/<hash>.npz
+    _p_scripts.parent.mkdir(parents=True, exist_ok=True)
+
+    if _p_scripts.exists() and not force_rerun:
+        z = np.load(_p_scripts, allow_pickle=False)
+
+        if "mg_series" in z.files:
+            mg_series = z["mg_series"]
+            variant = params_dict["variant"]
+            mask_cfg = MaskConfig(**params_dict["mask"])
+            C = int(params_dict["core_count"])
+
+            mask_time = z["mask_time"] if "mask_time" in z.files else None
+            masks_time = z["masks_time"] if "masks_time" in z.files else None
+            core_weights = z["core_weights"] if "core_weights" in z.files else None
+
+            _ = reconstruct_data_in_from_compact(
+                core_count=C,
+                variant=variant,
+                mg_series=mg_series.astype(float, copy=False),
+                mask_cfg=mask_cfg,
+                mask_time=mask_time,
+                masks_time=masks_time,
+                core_weights=core_weights
+            )
+            data_out, params = _unpack_complex(z)
+            return data_out, params, key
+
+        data_out, params = _unpack_complex(z)
+        return data_out, params, key
 
     rc = params_dict["reservoir"]
-    data_out, feedback_length_m = mcf_nn_reservoir_computing(
+    res = mcf_nn_reservoir_computing(
         data_in=np.array(data_in, dtype=np.complex128),
         fiber_length_m=rc["fiber_length_m"],
         window_size=rc["window_size"],
@@ -1517,16 +1546,54 @@ def run_mcf_with_cache(data_in: np.ndarray,
         display_debug_info=bool(rc["display_debug_info"]),
         display_debug_plots=bool(rc["display_debug_plots"]),
         save_gif=bool(rc["save_gif"]),
+        max_hours_total=rc.get("max_hours_total", None),
+        use_dispersion=bool(rc.get("use_dispersion", True)),
     )
 
+    data_out = res["data_out"]
+    params_out = res.get("params", {})
+    fiber_params_json = json.dumps(params_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    C = int(params_dict["core_count"])
+    mg_cfg = MGConfig(**params_dict["mg"])
+    mask_cfg = MaskConfig(**params_dict["mask"])
+    variant = params_dict["variant"]
+
+    mg_series = _mg_series_from_cfg(mg_cfg).astype(_real_dtype(cache_bits), copy=False)
+
+    mask_time = None
+    masks_time = None
+    core_weights = None
+
+    rng = np.random.default_rng(mask_cfg.seed)
+    if variant == "temporal_same_all_cores":
+        mask_time = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind).astype(_real_dtype(cache_bits),
+                                                                                         copy=False)
+    elif variant == "temporal_unique_per_core":
+        masks_time = np.empty((C, mask_cfg.mask_size), dtype=_real_dtype(cache_bits))
+        for c in range(C):
+            masks_time[c] = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind).astype(
+                _real_dtype(cache_bits),
+                copy=False)
+    elif variant == "spatial_only":
+        core_weights = rng.uniform(-1.0, 1.0, size=C).astype(_real_dtype(cache_bits), copy=False)
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
+
     np.savez_compressed(
-        p,
+        _p_scripts,
         params_json=np.frombuffer(json_dumps_compact(params_dict).encode("utf-8"), dtype=np.uint8),
-        data_in=np.asarray(data_in),
-        data_out=np.asarray(data_out),
-        feedback_length_m=np.asarray(feedback_length_m, dtype=np.float64),
+        cache_bits=np.asarray(int(cache_bits), dtype=np.int32),
+        mg_series=mg_series,
+        **({"mask_time": mask_time} if mask_time is not None else {}),
+        **({"masks_time": masks_time} if masks_time is not None else {}),
+        **({"core_weights": core_weights} if core_weights is not None else {}),
+        **_pack_complex(data_out, cache_bits),
+        **({"fiber_params_json": np.frombuffer(fiber_params_json,
+                                               dtype=np.uint8)} if fiber_params_json is not None else {}),
     )
-    return data_out, feedback_length_m, key
+    return data_out, params_out, key
+
 
 # =========================
 # Признаки/таргет/сплиты + free-running
@@ -1545,11 +1612,20 @@ def make_states(data_out: np.ndarray,
 def split_train_val_test(N: int, train_frac: float, val_frac: float):
     n_train = int(N * train_frac)
     n_val = int(N * val_frac)
-    n_test = N - n_train - n_val
-    if n_test <= 0:
-        raise ValueError("val/train слишком велики — нет теста")
-    return slice(0, n_train + n_val), slice(0, n_train), slice(n_train, n_train + n_val), slice(n_train + n_val, N)
+
+    # аккуратно подрезаем под доступные N, чтобы не получить отрицательный test
+    n_train = max(0, min(n_train, N))
+    n_val = max(0, min(n_val, N - n_train))
+
+    # test может быть нулевым — это ок
     # Возвращаем (slice_trainval, slice_train, slice_val, slice_test)
+    return (
+        slice(0, n_train + n_val),
+        slice(0, n_train),
+        slice(n_train, n_train + n_val),
+        slice(n_train + n_val, N),
+    )
+
 
 def pseudo_free_run(y_seed: np.ndarray,
                     X_seq: np.ndarray,
@@ -1566,10 +1642,11 @@ def pseudo_free_run(y_seed: np.ndarray,
     start = int(y_seed.shape[0])  # обычно 1–5 стартовых точек
     t = start - 1
     while len(preds) < horizon and t < T - 1:
-        yhat = float(apply_readout(X_seq[t:t+1], W_out, add_bias=add_bias).ravel()[0])
+        yhat = float(apply_readout(X_seq[t:t + 1], W_out, add_bias=add_bias).ravel()[0])
         preds.append(yhat)
         t += 1
     return np.asarray(preds, dtype=np.float64).reshape(-1, 1)
+
 
 # =========================
 # Функции для оценок размеров данных для обучения
@@ -1587,6 +1664,7 @@ def compute_window_size_samples(cfg: ExperimentConfig) -> int:
     delay_syms = int(getattr(cfg.reservoir, "delay_factor_in_symbols", 30))
     return delay_syms * int(M_eff) + phase
 
+
 def auto_washout_samples(res_cfg: ReservoirConfig,
                          eps: float = 1e-3,
                          min_loops: int = 1,
@@ -1602,12 +1680,12 @@ def auto_washout_samples(res_cfg: ReservoirConfig,
       min_loops – нижняя граница числа оборотов (обычно 1);
       max_loops – верхняя граница (обычно 3; больше редко нужно).
     """
-    delay = int(res_cfg.window_size)         # число отсчётов в одном обходе петли
+    delay = int(res_cfg.window_size)  # число отсчётов в одном обходе петли
     kappa = float(res_cfg.kappa)
     # защитим расчёт для крайностей κ
-    k_eff = min(0.99, max(1e-6, kappa))      # κ ∈ (0, 0.99]
+    k_eff = min(0.99, max(1e-6, kappa))  # κ ∈ (0, 0.99]
     # требуемое число оборотов без клипов
-    n_loops_ideal = np.log(eps) / np.log(k_eff)   # оба логарифма < 0, отношение > 0
+    n_loops_ideal = np.log(eps) / np.log(k_eff)  # оба логарифма < 0, отношение > 0
     n_loops = int(np.ceil(np.clip(n_loops_ideal, min_loops, max_loops)))
     return max(delay * n_loops, delay)  # минимум один виток
 
@@ -1636,7 +1714,7 @@ def estimate_required_t_size_fast(cfg) -> int:
 
     # множитель признаков: intensity=1, field=2 (Re+Im)
     feat_mode = getattr(cfg.training, "feature_mode", "intensity").lower()
-    feat_mul = 2 if feat_mode == "field" else 1
+    feat_mul = 2 if feat_mode in ("field", "realimag") else 1
 
     # taps из конфига (дефолт 1)
     taps = int(getattr(cfg.training, "taps", 1))
@@ -1646,21 +1724,21 @@ def estimate_required_t_size_fast(cfg) -> int:
 
     # доли сплита
     train_frac = float(cfg.training.train_frac)
-    val_frac   = float(getattr(cfg.training, "val_frac", 0.0))
-    test_frac  = 1.0 - train_frac - val_frac
+    val_frac = float(getattr(cfg.training, "val_frac", 0.0))
+    test_frac = 1.0 - train_frac - val_frac
     if test_frac <= 0.0:
         raise ValueError("train_frac + val_frac must be < 1.0")
 
     # минимальные требования в символах (fast-политика)
     req_train = max(5 * D, 1000)
-    req_val   = max(2 * D,  500) if val_frac > 0.0 else 0
-    req_test  = max(2 * D,  500)
+    req_val = max(2 * D, 500) if val_frac > 0.0 else 0
+    req_test = max(2 * D, 500)
 
     # общее число символов до добавления служебных хвостов
     S_needed = max(
         np.ceil(req_train / train_frac),
-        np.ceil(req_val   / val_frac) if val_frac > 0.0 else 0,
-        np.ceil(req_test  / test_frac),
+        np.ceil(req_val / val_frac) if val_frac > 0.0 else 0,
+        np.ceil(req_test / test_frac),
     )
 
     # служебные хвосты
@@ -1711,7 +1789,10 @@ def run_single_experiment(cfg: ExperimentConfig,
     params_dict = _params_for_cache(cfg_with_ws.core_count, cfg_with_ws.mg, cfg_with_ws.mask,
                                     cfg_with_ws.reservoir, cfg_with_ws.variant)
     # основной запуск с кэшированием
-    data_out, feedback_length_m, cache_key = run_mcf_with_cache(data_in, params_dict, force_rerun=force_rerun)
+    data_out, params_out, cache_key = run_mcf_with_cache(data_in,
+                                                         params_dict,
+                                                         force_rerun=force_rerun,
+                                                         cache_bits=32)
 
     # ── признаки/таргеты: ПЕРЕХОД НА СИМВОЛЫ + taps
     X_full = make_states(data_out, feature_mode=cfg.training.feature_mode)  # (T,D)
@@ -1738,17 +1819,17 @@ def run_single_experiment(cfg: ExperimentConfig,
             raise ValueError("taps слишком велик для числа символов")
         Xt = np.empty((L, F * taps_), dtype=Xs.dtype)
         for k in range(taps_):
-            Xt[:, k*F:(k+1)*F] = Xs[(taps_ - 1 - k):(taps_ - 1 - k + L), :]
+            Xt[:, k * F:(k + 1) * F] = Xs[(taps_ - 1 - k):(taps_ - 1 - k + L), :]
         return Xt
 
-    X_tapped = _make_tapped(X_sym, int(cfg.training.taps))          # (S - taps + 1, F*taps)
-    y_sym = mg_series.reshape(-1, 1)                                 # (S,1)
+    X_tapped = _make_tapped(X_sym, int(cfg.training.taps))  # (S - taps + 1, F*taps)
+    y_sym = mg_series.reshape(-1, 1)  # (S,1)
 
     # сдвиг таргета на target_shift СИМВОЛОВ
     shift_syms = int(cfg.training.target_shift)
     if (cfg.training.taps - 1 + shift_syms) >= y_sym.shape[0]:
         raise ValueError("target_shift или taps слишком велики для длины ряда")
-    y_aligned = y_sym[(cfg.training.taps - 1 + shift_syms):, :]     # (S - (taps-1) - shift, 1)
+    y_aligned = y_sym[(cfg.training.taps - 1 + shift_syms):, :]  # (S - (taps-1) - shift, 1)
     X_aligned = X_tapped[:y_aligned.shape[0], :]
 
     # washout: авто в СЭМПЛАХ → переводим в СИМВОЛЫ
@@ -1767,8 +1848,8 @@ def run_single_experiment(cfg: ExperimentConfig,
         Xw.shape[0], cfg.training.train_frac, cfg.training.val_frac
     )
     Xtr, ytr = Xw[sl_train], yw[sl_train]
-    Xva, yva = Xw[sl_val],   yw[sl_val]
-    Xte, yte = Xw[sl_test],  yw[sl_test]
+    Xva, yva = Xw[sl_val], yw[sl_val]
+    Xte, yte = Xw[sl_test], yw[sl_test]
 
     # обучение рид-аута
     W = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True)
@@ -1781,7 +1862,6 @@ def run_single_experiment(cfg: ExperimentConfig,
         nrmse_train=nrmse(ytr, ytr_hat),
         nrmse_val=nrmse(yva, yva_hat),
         nrmse_test=nrmse(yte, yte_hat),
-        feedback_length_m=float(feedback_length_m),
         T_total=int(X_full.shape[0]),
         features_dim=int(Xw.shape[1]),
         taps=int(cfg.training.taps),
@@ -1800,8 +1880,8 @@ def run_single_experiment(cfg: ExperimentConfig,
         metrics=metrics,
         W_out=W,
         X_train=Xtr, y_train=ytr,
-        X_val=Xva,   y_val=yva,   y_val_hat=yva_hat,
-        X_test=Xte,  y_test=yte,  y_test_hat=yte_hat,
+        X_val=Xva, y_val=yva, y_val_hat=yva_hat,
+        X_test=Xte, y_test=yte, y_test_hat=yte_hat,
         data_in=data_in,
         data_out=data_out,
         mg_series=mg_series,
@@ -1827,10 +1907,6 @@ def run_single_experiment(cfg: ExperimentConfig,
 
 def optimize_hyperparams(base_cfg: ExperimentConfig,
                          n_trials: int,
-                         include_mask_size: bool = False,
-                         mask_size_range: Tuple[int, int] = (20, 80),
-                         include_window_size: bool = False,
-                         delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                          n_jobs: Optional[int] = None,
                          free_run_horizon: int = 0,
                          force_rerun: bool = False) -> Dict[str, Any]:
@@ -1842,35 +1918,68 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     Внутри trial все вычисления — в 1 поток (temporary_thread_limits(1)), чтобы не было nested parallelism.
     """
     import optuna
+    import warnings
+    try:
+        # публичного алиаса у класса нет, поэтому берем из _experimental
+        from optuna._experimental import ExperimentalWarning  # noqa: WPS433
+    except Exception:
+        class ExperimentalWarning(Warning):  # fallback на всякий случай
+            pass
+    warnings.filterwarnings("ignore", category=ExperimentalWarning)
 
+    from pathlib import Path
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+    from optuna.trial import TrialState
+    from optuna.exceptions import TrialPruned
+    import os
+    from datetime import datetime
+
+    # --- надёжное хранилище без конфликтов SQLite (журнал рядом со скриптом) ---
+    base_dir = Path(__file__).parent.resolve()
+    journal_path = (base_dir / "mcf_optuna.journal").resolve()
+    # На Windows избегаем symlink-локов: используем OpenLock (без прав на symlink).
+    lock_obj = JournalFileOpenLock(str(journal_path)) if os.name == "nt" else None
+    storage = JournalStorage(JournalFileBackend(str(journal_path), lock_obj=lock_obj))
+
+    # --- на всякий случай создадим каталог для кэша npz (если кэшер туда пишет) ---
+    try:
+        (base_dir / "mcf_rc_cache").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # --- определим n_jobs по умолчанию ---
     if n_jobs is None:
-        n_jobs = physical_cpu_count()
-    if n_jobs == 6: # ПК в НГУ. Гипертрединга нет, поэтому нельзя грузить все ядра
+        if os.getenv("MCF_BASH", ""):
+            # в распределённом bash-режиме один поток на процесс
+            n_jobs = 1
+        else:
+            # локальный режим: параллелим в одном процессе
+            n_jobs = max(1, physical_cpu_count())
+    # ваш спец-кейс для ПК НГУ
+    if n_jobs == 6:
         n_jobs = 5
-    print("n_jobs =", n_jobs)
+
+    print("n_trials =", n_trials)
+    print("n_jobs   =", n_jobs)
 
     best = dict(score=float("inf"), res=None, params=None)
+
+    def _round(x: float, digit=3) -> float:
+        return float(round(float(x), digit))
 
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
             # --- 1) основные гиперпараметры резерваура и усиления
-            kappa = trial.suggest_float("kappa", 0.01, 0.99)
-            g0 = trial.suggest_float("g0", 0.01, 20.0, log=True)
-            psat = trial.suggest_float("psat", 0.001, 0.1, log=True)
-            fiber_length = trial.suggest_float("fiber_length", 0.05, 1.5, log=True)
-            gain_in = trial.suggest_float("gain_in", 1e-2, 2e+1, log=True)
+            kappa = trial.suggest_float("kappa", 0.01, 0.99, step=1e-3)
+            g0 = _round(trial.suggest_float("g0", 0.01, 20.0, log=True))
+            psat = _round(trial.suggest_float("psat", 0.00001, 0.1, log=True), digit=5)
+            fiber_length = _round(trial.suggest_float("fiber_length", 0.05, 1.5, log=True))
+            gain_in = _round(trial.suggest_float("gain_in", 1e-2, 2e+1, log=True))
+            mask_size = trial.suggest_int("mask_size", 10, 300)
+            delay_factor = trial.suggest_int("delay_factor_in_symbols", 1, 100)
 
-            # --- 2) маска и задержка (через delay_factor_in_symbols)
-            mask_size = int(base_cfg.mask.mask_size)
-            if include_mask_size:
-                mask_size = trial.suggest_int("mask_size", int(mask_size_range[0]), int(mask_size_range[1]))
-
-            delay_factor = int(getattr(base_cfg.reservoir, "delay_factor_in_symbols", 30))
-            if include_window_size:
-                delay_factor = trial.suggest_int("delay_factor_in_symbols",
-                                                 int(delay_factor_in_symbols_range[0]), int(delay_factor_in_symbols_range[1]))
-
-            # --- 3) собираем конфиг trial'а (ВАЖНО: прокидываем delay_factor_in_symbols, а не window_size)
+            # --- 3) конфиг trial'а (прокидываем delay_factor_in_symbols, а не window_size)
             cfg = ExperimentConfig(
                 core_count=base_cfg.core_count,
                 mg=base_cfg.mg,  # длину ряда не меняем в оптимизации
@@ -1887,7 +1996,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     layer_radii_array=base_cfg.reservoir.layer_radii_array,
                     g0_array=tuple([g0] * base_cfg.core_count),
                     psat_array=tuple([psat] * base_cfg.core_count),
-                    kappa=kappa,
+                    kappa=_round(kappa),
                     use_gpu=base_cfg.reservoir.use_gpu,
                     num_threads=1,
                     display_debug_info=False,
@@ -1895,52 +2004,104 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     save_gif=False,
                     delay_factor_in_symbols=int(delay_factor),
                     delay_additional_in_mask_steps=base_cfg.reservoir.delay_additional_in_mask_steps,
-                    # window_size НЕ задаём — его вычислит run_single_experiment() из delay_factor/mask_size/phase
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
             )
 
-            # --- 4) запуск и метрика
-            res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+            # --- 4) запуск и метрика (плохие конфиги помечаем PRUNED, чтобы НЕ шли в COMPLETE)
+            try:
+                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+            except AssertionError as e:
+                msg = str(e).lower()
+                if ("feedback_length" in msg and "fiber" in msg) or ("feedback" in msg and "fiber" in msg):
+                    trial.set_user_attr("skip_reason", "feedback_length_le_fiber_length")
+                    raise TrialPruned("invalid_config: feedback_length <= fiber_length")
+                if "washout" in msg or "wash-out" in msg:
+                    trial.set_user_attr("skip_reason", "washout_too_small")
+                    raise TrialPruned("invalid_config: washout too small")
+                raise
+            except (ValueError, RuntimeError) as e:
+                msg = str(e).lower()
+                if ("feedback_length" in msg and "fiber" in msg) or "invalid_config" in msg:
+                    trial.set_user_attr("skip_reason", "feedback_length_le_fiber_length")
+                    raise TrialPruned("invalid_config: feedback_length <= fiber_length")
+                if "washout" in msg or "wash-out" in msg:
+                    trial.set_user_attr("skip_reason", "washout_too_small")
+                    raise TrialPruned("invalid_config: washout too small")
+                raise
 
             score = float(res["metrics"]["nrmse_val"])
             if not np.isfinite(score):
-                score = 1e9
+                raise TrialPruned("non-finite score")
 
-            # --- 5) обновим «лучшее»
             nonlocal best
             if score < best["score"]:
-                # вычислим окно задержки (для логов)
-                ws = compute_window_size_samples(cfg)
-                best = dict(
-                    score=score,
-                    res=res,
-                    params=dict(
-                        kappa=kappa, g0=g0, psat=psat,
-                        fiber_length=fiber_length,
-                        gain_in=gain_in,
-                        mask_size=mask_size,
-                        delay_factor_in_symbols=int(delay_factor),
-                        window_size=ws
-                    )
-                )
+                best["score"] = score
+                best["res"] = res
+                best["params"] = cfg
+
             return score
 
-    variant_str = str(base_cfg.variant)
-    core_count = int(base_cfg.core_count)
-    study_name = f"mcf_rc_{variant_str}_C{core_count}"
+    # --- имя исследования ---
+    env_name = os.getenv("MCF_STUDY_NAME")
+    if env_name:
+        study_name = env_name
+    else:
+        variant_str = str(base_cfg.variant)
+        core_count = int(base_cfg.core_count)
+        ts = datetime.now().strftime('%Y%m%d-%H%M')
+        study_name = f"mcf_rc_{variant_str}_C{core_count}_{ts}"
 
-    storage_url = "sqlite:///mcf_optuna.db"  # файл в текущей папке
+    sampler = optuna.samplers.TPESampler(
+        constant_liar=True,
+        multivariate=True,
+        group=True
+    )
+
     study = optuna.create_study(
         study_name=study_name,
         direction="minimize",
-        storage=storage_url,
-        load_if_exists=True
+        storage=storage,
+        load_if_exists=True,
+        sampler=sampler
     )
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True, catch=(AssertionError, ValueError))
+
+    print(f"[optimize] Target COMPLETE trials = {n_trials}")
+
+    # =========================
+    # ДВА РЕЖИМА ЗАПУСКА
+    # =========================
+    if os.getenv("MCF_BASH", ""):
+        # --- распределённый режим через bash/tmux: ручной цикл ask/tell с глобальным бюджетом по COMPLETE ---
+        print("[mode] Distributed ask/tell over shared Journal (MCF_BASH detected)")
+        while True:
+            complete_cnt = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
+            if complete_cnt >= n_trials:
+                break
+
+            trial = study.ask()  # sampler задан в create_study
+            try:
+                value = objective(trial)
+                study.tell(trial, value)
+            except TrialPruned:
+                study.tell(trial, state=TrialState.PRUNED)
+            except (AssertionError, ValueError, RuntimeError):
+                study.tell(trial, state=TrialState.FAIL)
+                continue
+    else:
+        # --- локальный режим: стандартный Optuna с многопоточностью n_jobs ---
+        print("[mode] Local study.optimize (no MCF_BASH)")
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            n_jobs=n_jobs,
+            show_progress_bar=True,
+            catch=(AssertionError, ValueError, RuntimeError),
+        )
 
     best_trial = study.best_trial
+
     return dict(
         best_cfg=best["res"]["cfg"],
         best_metrics=best["res"]["metrics"],
@@ -1958,66 +2119,45 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
 def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
                                  n_trials_opt: int = 0,
-                                 include_mask_size: bool = False,
-                                 include_window_size: bool = False,
-                                 mask_size_range: Tuple[int, int] = (20, 80),
-                                 delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                                  free_run_horizon: int = 0,
                                  force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "temporal_unique_per_core"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    include_mask_size=include_mask_size,
-                                    mask_size_range=mask_size_range,
-                                    include_window_size=include_window_size,
-                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
         return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
 
+
 def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
                                 n_trials_opt: int = 0,
-                                include_mask_size: bool = False,
-                                include_window_size: bool = False,
-                                mask_size_range: Tuple[int, int] = (20, 80),
-                                delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                                 free_run_horizon: int = 0,
                                 force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "temporal_same_all_cores"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    include_mask_size=include_mask_size,
-                                    mask_size_range=mask_size_range,
-                                    include_window_size=include_window_size,
-                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
         return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
 
+
 def run_spatial_only(base_cfg: ExperimentConfig,
                      n_trials_opt: int = 0,
-                     include_mask_size: bool = False,   # не актуально, но держим для единообразия
-                     include_window_size: bool = False,
-                     mask_size_range: Tuple[int, int] = (1, 1),
-                     delay_factor_in_symbols_range: Tuple[int, int] = (20, 60),
                      free_run_horizon: int = 0,
                      force_rerun=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "spatial_only"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    include_mask_size=include_mask_size,
-                                    mask_size_range=mask_size_range,
-                                    include_window_size=include_window_size,
-                                    delay_factor_in_symbols_range=delay_factor_in_symbols_range,
                                     n_jobs=physical_cpu_count(),
                                     free_run_horizon=free_run_horizon)
     else:
         return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+
 
 # =========================
 # Пример точки входа
@@ -2037,19 +2177,19 @@ if __name__ == "__main__":
     layer_radii_array = np.zeros(int(layer_count) + 1)
     for i in range(int(layer_count) + 1):
         if i == 0:
-            layer_radii_array[i] = 0 # [mkm]
+            layer_radii_array[i] = 0  # [mkm]
         if i == 1:
-            layer_radii_array[i] = 25 #17.3 # [mkm]
+            layer_radii_array[i] = 17.3 * 1  # 17.3 # [mkm]
         if i == 2:
-            layer_radii_array[i] = 17.3 * 2 # [mkm]
+            layer_radii_array[i] = 17.3 * 2  # [mkm]
         if i == 3:
-            layer_radii_array[i] = 17.3 * 3 # [mkm]
+            layer_radii_array[i] = 17.3 * 3  # [mkm]
 
         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
 
-    temporal_mask_modulation_frequency_ghz = 150 # GHz
+    temporal_mask_modulation_frequency_ghz = 40  # GHz
 
-    variant = "temporal_same_all_cores" # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = "temporal_same_all_cores"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
         temporal_mask_size = temporal_mask_modulation_frequency_ghz
@@ -2061,34 +2201,36 @@ if __name__ == "__main__":
     mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=2.57)
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=0.114, # 0.1
-        time_step_ps=1.0 / temporal_mask_size * 1e+3,
+        fiber_length_m=0.1,  # 0.1
+        time_step_ps=1.0 / temporal_mask_modulation_frequency_ghz * 1e+3,
         step_number_per_dimensionless_distance=20,
-        upsampling=1,
-        delay_factor_in_symbols=11,
+        upsampling=2,
+        delay_factor_in_symbols=100,
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([0.345]*core_count), # 10
-        psat_array=tuple([0.027]*core_count), # 0.02
-        kappa=0.5, # 0.9
+        g0_array=tuple([10] * core_count),  # 10
+        psat_array=tuple([0.02] * core_count),  # 0.02
+        kappa=0.9,  # 0.9
         use_gpu=False,
-        num_threads=1,
+        num_threads=4,
         display_debug_plots=True,
         display_debug_info=True,
+        max_hours_total=24,
+        use_dispersion=True,
     )
 
-    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-6, # washout=100,
+    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-6,  # washout=100,
                                   target_shift=1,
-                                  train_frac=0.8, val_frac=0.0) # для одиночного запуска
+                                  train_frac=0.8, val_frac=0.0)  # для одиночного запуска
 
     base_cfg = ExperimentConfig(core_count=core_count, mg=mg_cfg, mask=mask_cfg,
                                 reservoir=reservoir_cfg, training=training_cfg,
                                 variant=variant)
 
-    # t_size = estimate_required_t_size_fast(base_cfg)
-    # print("Estimated required symbol count =", t_size)
-    # mg_cfg.t_size = np.min([int(np.ceil(t_size / 1000.0)) * 1000, 5000])
+    t_size = estimate_required_t_size_fast(base_cfg)
+    print("Estimated required symbol count =", t_size)
+    mg_cfg.t_size = np.min([int(np.ceil(t_size / 1000.0)) * 1000, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
     # if variant == "spatial_only":
@@ -2100,25 +2242,21 @@ if __name__ == "__main__":
     #
     # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
-
     # === Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===
     # Вариант «temporal_same_all_cores» для одной сердцевины;
     # окно задержки и размер маски тоже можно подстроить.
     # Для запуска optuna dashboard установи
     # pip install optuna-dashboard
     # и выполни в отдельной консоли после запуска расчета (путь укажи свой до папки проекта)
-    # optuna-dashboard sqlite:///C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/mcf_optuna.db --port 8080
+    # optuna-dashboard "C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/scripts/mcf_optuna.journal" --port 8080
     # Открой в браузере http://127.0.0.1:8080/dashboard/
+    # На линуксе порт 18080
 
-    base_cfg.training.train_frac = 0.6
+    base_cfg.training.train_frac = 0.8
     base_cfg.training.val_frac = 0.2
     res = run_temporal_same_all_cores(
         base_cfg,
-        n_trials_opt=500,  # сколько попробовать конфигураций
-        include_mask_size=True,  # разрешить подбор mask_size
-        include_window_size=True,  # разрешить подбор window_size (через delay_factor)
-        mask_size_range=(10, 300),  # диапазон длин маски (точек на символ)
-        delay_factor_in_symbols_range=(1, 200),  # множитель для окна/задержки
+        n_trials_opt=10000,  # сколько попробовать конфигураций
         free_run_horizon=0,  # без свободного прогона после обучения
         force_rerun=False  # используй кэш, если ключ совпал
     )

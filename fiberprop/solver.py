@@ -1,3 +1,5 @@
+import time
+
 from tqdm import trange
 from scipy.fft import fftfreq
 from dataclasses import dataclass, field
@@ -25,9 +27,9 @@ from .threading_control import configure_threads, threading_report
 
 try:
     import torch
-    is_torch_available = True
+    _TORCH_AVAILABLE = True
 except ImportError:
-    is_torch_available = False
+    _TORCH_AVAILABLE = False
 
 from .ssfm_mcf_pytorch import ssfm_order2_pytorch, ssfm_order2_dnd_windowed_short_torch
 from .rk4_pytorch import rk4_step_torch
@@ -353,8 +355,8 @@ class Solver:
         self.eq = eq
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
         self.precision = precision
-        self.use_gpu = use_gpu and is_torch_available  # Устанавливаем режим GPU только если PyTorch доступен
-        self.use_torch = (use_torch and is_torch_available) or (self.use_gpu and is_torch_available)
+        self.use_gpu = use_gpu and _TORCH_AVAILABLE  # Устанавливаем режим GPU только если PyTorch доступен
+        self.use_torch = (use_torch and _TORCH_AVAILABLE) or (self.use_gpu and _TORCH_AVAILABLE)
         self.device = None
         if self.use_torch:
             self.device = torch.device('cuda' if self.use_gpu else 'cpu')
@@ -640,6 +642,13 @@ class Solver:
         """
         Строит обратную матрицу к D_half.
         """
+        # Поддержка обоих случаев:
+        # • D_half 3D: (n, n, M) – инвертируем покомпонентно по частоте
+        # • D_half 2D: (n, n)    – одна общая матрица для всех ω (β1=β2=0)
+        if self.D_half.ndim == 2:
+            self.invD_half = np.linalg.inv(self.D_half)
+            return
+
         n, M = self.eq.size, self.com.M
         self.invD_half = np.empty((n, n, M), dtype=self.D_half.dtype)
         for i in range(M):
@@ -773,7 +782,7 @@ class Solver:
             draw_interval: int = 10,
             save_gif: bool = False,
             yscale: str = "linear"
-    ):
+    ) -> float:
         """
         Основной цикл расчёта.
 
@@ -786,6 +795,8 @@ class Solver:
             – энергия,
             – пиковая мощность.
           Формат и значения идентичны прежней версии.
+
+          Возвращает время работы без учета создания и вычисления вспомогательных массивов
         """
 
         # ───── инициализация ────────────────────────────────────────────────────
@@ -799,9 +810,13 @@ class Solver:
                 self.calculate_D_matrix(self.com.h * 0.5)
                 self.D_half = self.D.copy()
 
-                d_perm = self.D_half.transpose(2, 0, 1)  # -> (M, n, n)
-                result_perm = d_perm @ d_perm
-                self.D = result_perm.transpose(1, 2, 0)  # -> (n, n, M)
+                if self.D_half.ndim == 3:
+                    d_perm = self.D_half.transpose(2, 0, 1)  # -> (M, n, n)
+                    result_perm = d_perm @ d_perm
+                    self.D = result_perm.transpose(1, 2, 0)  # -> (n, n, M)
+                else:
+                    # β1=β2=0: оператор не зависит от ω, D_half — (n,n)
+                    self.D = self.D_half @ self.D_half
 
             if self.invD_half is None:
                 self.calculate_invD_half()
@@ -828,6 +843,8 @@ class Solver:
 
         # ─────────────────────────────────────── CPU-ветка ───────────────
         psi_next = self.numerical_solution[0]
+
+        t_start = time.time()
 
         if not self.use_torch:
             if self.com.method == "ssfm_order2_dnd_windowed_short":
@@ -940,6 +957,8 @@ class Solver:
         # ───── финализация графика ───────────────────────────────────────
         if draw_modulus:
             finalize_plot()
+
+        return time.time() - t_start
 
     # Основная функция моделирования
     def run_numerical_simulation_in_frequency_domain(
@@ -1095,49 +1114,50 @@ class Solver:
 
         return (2.0 / self.eq.beta2[:, None]) * term
 
-    def _rhs_u_torch(self, u, v, dz_t):
-        # du/dt = v
-        return v
+    if _TORCH_AVAILABLE:
+        def _rhs_u_torch(self, u, v, dz_t):
+            # du/dt = v
+            return v
 
-    def _rhs_v_torch(self, u: torch.Tensor, v: torch.Tensor, dz_t: torch.Tensor):
-        Cn, Nz = u.shape
+        def _rhs_v_torch(self, u: torch.Tensor, v: torch.Tensor, dz_t: torch.Tensor):
+            Cn, Nz = u.shape
 
-        # ∂u/∂z: 2-й порядок внутри и на краях
-        du_dz = (torch.roll(u, -1, dims=1) - torch.roll(u, 1, dims=1)) / (2.0 * dz_t)
-        if Nz >= 3:
-            du_dz[:, 0] = (-3.0 * u[:, 0] + 4.0 * u[:, 1] - u[:, 2]) / (2.0 * dz_t)
-            du_dz[:, -1] = (3.0 * u[:, -1] - 4.0 * u[:, -2] + u[:, -3]) / (2.0 * dz_t)
-        elif Nz == 2:
-            du_dz[:, 0] = (u[:, 1] - u[:, 0]) / dz_t
-            du_dz[:, -1] = (u[:, -1] - u[:, 0]) / dz_t
-        else:
-            du_dz[:, 0] = 0.0
+            # ∂u/∂z: 2-й порядок внутри и на краях
+            du_dz = (torch.roll(u, -1, dims=1) - torch.roll(u, 1, dims=1)) / (2.0 * dz_t)
+            if Nz >= 3:
+                du_dz[:, 0] = (-3.0 * u[:, 0] + 4.0 * u[:, 1] - u[:, 2]) / (2.0 * dz_t)
+                du_dz[:, -1] = (3.0 * u[:, -1] - 4.0 * u[:, -2] + u[:, -3]) / (2.0 * dz_t)
+            elif Nz == 2:
+                du_dz[:, 0] = (u[:, 1] - u[:, 0]) / dz_t
+                du_dz[:, -1] = (u[:, -1] - u[:, 0]) / dz_t
+            else:
+                du_dz[:, 0] = 0.0
 
-        # i * C * u
-        C_t = torch.as_tensor(self.linear_coeffs_array, dtype=self.ctype, device=self.device)
-        coupling = torch.matmul(C_t, u)
+            # i * C * u
+            C_t = torch.as_tensor(self.linear_coeffs_array, dtype=self.ctype, device=self.device)
+            coupling = torch.matmul(C_t, u)
 
-        # Энергия по z (трапеция) -> (eq_size, 1)
-        abs2 = torch.abs(u) ** 2
-        if Nz == 1:
-            Ez = dz_t * abs2
-        elif Nz == 2:
-            Ez = dz_t * 0.5 * (abs2[:, :1] + abs2[:, 1:])
-        else:
-            edge = 0.5 * (abs2[:, :1] + abs2[:, -1:])
-            mid = abs2[:, 1:-1].sum(dim=1, keepdim=True)
-            Ez = dz_t * (edge + mid)
+            # Энергия по z (трапеция) -> (eq_size, 1)
+            abs2 = torch.abs(u) ** 2
+            if Nz == 1:
+                Ez = dz_t * abs2
+            elif Nz == 2:
+                Ez = dz_t * 0.5 * (abs2[:, :1] + abs2[:, 1:])
+            else:
+                edge = 0.5 * (abs2[:, :1] + abs2[:, -1:])
+                mid = abs2[:, 1:-1].sum(dim=1, keepdim=True)
+                Ez = dz_t * (edge + mid)
 
-        g = self.g0_t[:, None] / (1.0 + Ez / self.E_sat_t[:, None])
+            g = self.g0_t[:, None] / (1.0 + Ez / self.E_sat_t[:, None])
 
-        term = (1j * du_dz
-                + 1j * self.eq.beta1_t[:, None] * v
-                + self.eq.gamma_t[:, None] * abs2 * u
-                - 1j * 0.5 * g * u
-                + 1j * 0.5 * self.eq.alpha_t[:, None] * u
-                + 1j * coupling)
+            term = (1j * du_dz
+                    + 1j * self.eq.beta1_t[:, None] * v
+                    + self.eq.gamma_t[:, None] * abs2 * u
+                    - 1j * 0.5 * g * u
+                    + 1j * 0.5 * self.eq.alpha_t[:, None] * u
+                    + 1j * coupling)
 
-        return (2.0 / self.eq.beta2_t[:, None]) * term
+            return (2.0 / self.eq.beta2_t[:, None]) * term
 
     def run_numerical_simulation_time(self,
                                       draw_modulus: bool = False,

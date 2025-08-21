@@ -170,6 +170,19 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_plots=False)
     else:
         raise ValueError('This fiber configuration is not yet supported')
 
+    # --- Авто-подстройка оболочки: если край какого-либо ядра вылезает за текущий R, увеличиваем диаметр с запасом.
+    # Берём новый радиус оболочки R_new = d_max + 3 * core_radius (запас = три радиуса ядра).
+    if core_center_coords:
+        d_max = max(math.hypot(x, y) for (x, y) in core_center_coords)
+        R_core = fiber.core_radius
+        R_curr = 0.5 * fiber.cladding_diameter
+        if d_max + R_core > R_curr:
+            R_new = d_max + 3.0 * R_core
+            fiber.cladding_diameter = 2.0 * R_new
+
+    # После возможной подстройки оболочки обновляем R
+    R = 0.5 * fiber.cladding_diameter
+
     if display_debug_plots:
         plot_core_centers(core_center_coords, fiber.core_radius, fiber.cladding_diameter)
 
@@ -230,7 +243,8 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_plots=False)
             coup_mat[m][p] = coupling
             coup_mat[p][m] = coupling
 
-    return coup_mat * 1e+2
+    return np.abs(coup_mat) * 1e+2
+
 
 
 def get_coupling_coeff_2_core_fiber(fiber, light):
