@@ -434,6 +434,7 @@ def mcf_nn_reservoir_computing(
                 solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
 
             dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
+
             if (batch_index == 0) and (max_hours_total is not None):
                 est_total_sec = dt_b * n_batches
                 if est_total_sec > float(max_hours_total) * 3600.0:
@@ -2004,6 +2005,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     save_gif=False,
                     delay_factor_in_symbols=int(delay_factor),
                     delay_additional_in_mask_steps=base_cfg.reservoir.delay_additional_in_mask_steps,
+                    max_hours_total=base_cfg.reservoir.max_hours_total,
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
@@ -2054,9 +2056,10 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         study_name = f"mcf_rc_{variant_str}_C{core_count}_{ts}"
 
     sampler = optuna.samplers.TPESampler(
-        constant_liar=True,
-        multivariate=True,
-        group=True
+        # seed=seed,
+        constant_liar=True,  # рекомендовано для distributed
+        multivariate=True,   # если есть взаимозависимости гиперпараметров
+        group=True           # если есть условные/групповые параметры
     )
 
     study = optuna.create_study(
@@ -2069,12 +2072,9 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     print(f"[optimize] Target COMPLETE trials = {n_trials}")
 
-    # =========================
-    # ДВА РЕЖИМА ЗАПУСКА
-    # =========================
+    # --- ДВА РЕЖИМА: распределённый (MCF_BASH) и локальный ---
     if os.getenv("MCF_BASH", ""):
-        # --- распределённый режим через bash/tmux: ручной цикл ask/tell с глобальным бюджетом по COMPLETE ---
-        print("[mode] Distributed ask/tell over shared Journal (MCF_BASH detected)")
+        # РАСПРЕДЕЛЁННЫЙ: ручной цикл ask/tell с бюджетом по COMPLETE
         while True:
             complete_cnt = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
             if complete_cnt >= n_trials:
@@ -2083,10 +2083,15 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             trial = study.ask()  # sampler задан в create_study
             try:
                 value = objective(trial)
-                study.tell(trial, value)
+                study.tell(trial, value)  # COMPLETE
             except TrialPruned:
                 study.tell(trial, state=TrialState.PRUNED)
-            except (AssertionError, ValueError, RuntimeError):
+            except (AssertionError, ValueError, RuntimeError) as _e:
+                # Любая иная ошибка — явно FAIL (для наглядности в дашборде и исключаем из COMPLETE-бюджета)
+                study.tell(trial, state=TrialState.FAIL)
+                continue
+            except Exception as _e:
+                # На всякий случай всё прочее тоже считаем FAIL
                 study.tell(trial, state=TrialState.FAIL)
                 continue
     else:
@@ -2097,7 +2102,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             n_trials=n_trials,
             n_jobs=n_jobs,
             show_progress_bar=True,
-            catch=(AssertionError, ValueError, RuntimeError),
+            catch=(AssertionError, ValueError, RuntimeError, Exception)
         )
 
     best_trial = study.best_trial
@@ -2216,7 +2221,7 @@ if __name__ == "__main__":
         num_threads=4,
         display_debug_plots=True,
         display_debug_info=True,
-        max_hours_total=24,
+        max_hours_total=12,
         use_dispersion=True,
     )
 
@@ -2230,7 +2235,7 @@ if __name__ == "__main__":
 
     t_size = estimate_required_t_size_fast(base_cfg)
     print("Estimated required symbol count =", t_size)
-    mg_cfg.t_size = np.min([int(np.ceil(t_size / 1000.0)) * 1000, 5000])
+    mg_cfg.t_size = np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
     # if variant == "spatial_only":
