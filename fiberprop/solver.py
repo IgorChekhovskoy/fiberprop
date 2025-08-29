@@ -1,7 +1,9 @@
+import copy
 import time
 
 from tqdm import trange
 from scipy.fft import fftfreq
+from scipy.linalg import expm
 from dataclasses import dataclass, field
 from typing import Union
 from math import sqrt, pi
@@ -18,7 +20,8 @@ from .ssfm_compact_scheme_mcf import ssfm_order2_ndn_compact_windowed, prepare_c
     ssfm_order2_dnd_compact_windowed, ssfm_order2_dnd_compact_windowed_short
 from .ssfm_mcf import ssfm_order2_ndn, get_energy_rectangles, ssfm_order1_resonator_nocos, \
     ssfm_order1_resonator_fullcos, \
-    ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed_short
+    ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed_short, \
+    ssfm_order2_dnd_short
 from .stationary_solution_solver import find_stationary_solution
 from .utils import fft_derivative
 
@@ -31,7 +34,8 @@ try:
 except ImportError:
     _TORCH_AVAILABLE = False
 
-from .ssfm_mcf_pytorch import ssfm_order2_pytorch, ssfm_order2_dnd_windowed_short_torch
+from .ssfm_mcf_pytorch import ssfm_order2_dnd_pytorch, ssfm_order2_dnd_windowed_short_pytorch, \
+    ssfm_order2_dnd_short_pytorch
 from .rk4_pytorch import rk4_step_torch
 
 
@@ -350,9 +354,6 @@ class Solver:
 
         self._taper_np = None
         self._taper_t = None
-
-        self.com = com
-        self.eq = eq
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
         self.precision = precision
         self.use_gpu = use_gpu and _TORCH_AVAILABLE  # Устанавливаем режим GPU только если PyTorch доступен
@@ -360,18 +361,20 @@ class Solver:
         self.device = None
         if self.use_torch:
             self.device = torch.device('cuda' if self.use_gpu else 'cpu')
+            torch.set_default_device('cuda' if self.use_gpu else 'cpu')
+            torch.set_default_dtype(torch.float32 if self.precision == "float32" else torch.float64)
 
             self.dtype = torch.float32 if self.precision == "float32" else torch.float64
             self.ctype = torch.complex64 if self.precision == "float32" else torch.complex128
             # NumPy-эквиваленты — НУЖНЫ для осей/Numba/SciPy
-            self._np_rdtype = np.float32 if self.precision == "float32" else np.float64
-            self._np_cdtype = np.complex64 if self.precision == "float32" else np.complex128
+            self._np_dtype = np.float32 if self.precision == "float32" else np.float64
+            self._np_ctype = np.complex64 if self.precision == "float32" else np.complex128
         else:
             self.dtype = np.float32 if self.precision == "float32" else np.float64
             self.ctype = np.complex64 if self.precision == "float32" else np.complex128
             # при numpy-режиме это те же типы
-            self._np_rdtype = self.dtype
-            self._np_cdtype = self.ctype
+            self._np_dtype = self.dtype
+            self._np_ctype = self.ctype
 
         self.display_debug_info = display_debug_info
 
@@ -389,9 +392,18 @@ class Solver:
         self.linear_coeffs_array = None
         self.nonlinear_cubic_coeffs_array = None
 
+        self.eq = copy.deepcopy(eq)
+        self.com = copy.deepcopy(com)
+
         self.set_configuration()
 
-        self.has_beta = not (np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0))
+        self._autocast_obj_backend(self.eq)
+
+        if self.use_torch and _TORCH_AVAILABLE:
+            self.h_t = torch.tensor(self.com.h, dtype=self.dtype)
+            self.tau_t = torch.tensor(self.com.tau, dtype=self.dtype)
+
+        self.has_beta = not (self._all_zero_backend(self.eq.beta1) and self._all_zero_backend(self.eq.beta2))
 
         # Ensure pulses and pulse_params_list are lists or apply them to all equations
         if not isinstance(pulses, list):
@@ -416,9 +428,11 @@ class Solver:
         self.z = None
         self.omega = None
         self.omega2 = None
+
         self.D = None
         self.D_half = None
         self.invD_half = None
+
         self.numerical_solution = None
         self.numerical_solution_time = None
         self.energy = None
@@ -442,17 +456,133 @@ class Solver:
         # Обработка начальных условий
         if initial_condition is not None:
             self.validate_initial_condition(initial_condition)
-            self.apply_initial_condition(initial_condition)
+            self.numerical_solution[0] = initial_condition.astype(self._np_ctype, copy=False)
         elif pulses is not zero_pulse:
             self.initialize_with_pulses(pulses, pulse_params_list)
 
+        for k in range(self.eq.size):
+            abs2 = np.abs(self.numerical_solution[0][k]) ** 2
+            self.energy[k][0] = abs2.sum() * self.com.tau
+            self.peak_power[k][0] = abs2.max()
+
+            if 0 <= self.ind_by_z_for_phase < self.com.N:
+                self.phase_by_z[k][0] = np.angle(self.numerical_solution[0][k][self.ind_by_z_for_phase])
+
         self._prepare_taper()
+
+    def _autocast_obj_backend(self, obj) -> None:
+        """
+        In-place: приводит ВСЕ float/complex-поля obj к выбранному бэкенду и точности.
+        • use_torch=True  → torch.Tensor нужного dtype (self.dtype/self.ctype) и на self.device
+        • use_torch=False → numpy.ndarray/скаляры нужной точности (float32/64, complex64/128)
+        Не трогаем int/bool/str и нестандартные объекты. Работает даже если PyTorch не установлен.
+        """
+
+        if self.use_torch:
+            def cast_value(v):
+                # Уже torch.Tensor → привести dtype/device при необходимости
+                if torch.is_tensor(v):
+                    # Только float/complex меняем; целые/булевые не трогаем
+                    target_dtype = self.ctype if getattr(v, "is_complex", lambda: False)() else (
+                        self.dtype if getattr(getattr(v, "dtype", None), "is_floating_point", False) else None
+                    )
+                    return v.to(dtype=target_dtype) if target_dtype is not None else v
+
+                # NumPy массивы с float/complex → в torch на нужный device
+                if isinstance(v, np.ndarray):
+                    if np.issubdtype(v.dtype, np.floating):
+                        return torch.as_tensor(v, dtype=self.dtype)
+                    if np.issubdtype(v.dtype, np.complexfloating):
+                        return torch.as_tensor(v, dtype=self.ctype)
+                    return v
+
+                # Скаляры float/complex → torch.tensor(...)
+                if isinstance(v, (np.floating, float)):
+                    return torch.tensor(v, dtype=self.dtype)
+                if isinstance(v, (np.complexfloating, complex)):
+                    return torch.tensor(v, dtype=self.ctype)
+
+                # Контейнеры чисел → аккуратно в torch, если dtype контейнера float/complex
+                if isinstance(v, (list, tuple)):
+                    arr = np.asarray(v)
+                    if np.issubdtype(arr.dtype, np.floating):
+                        return torch.as_tensor(arr, dtype=self.dtype)
+                    if np.issubdtype(arr.dtype, np.complexfloating):
+                        return torch.as_tensor(arr, dtype=self.ctype)
+
+                return v
+        else:
+            np_float = np.float32 if self.precision == 'float32' else np.float64
+            np_complex = np.complex64 if self.precision == 'float32' else np.complex128
+
+            def cast_value(v):
+                # NumPy массивы → привести только float/complex
+                if isinstance(v, np.ndarray):
+                    if np.issubdtype(v.dtype, np.floating):
+                        return v.astype(np_float, copy=False)
+                    if np.issubdtype(v.dtype, np.complexfloating):
+                        return v.astype(np_complex, copy=False)
+                    return v
+
+                # NumPy/py скаляры → к целевому типу
+                if isinstance(v, (np.floating, float)):
+                    return np_float(v)
+                if isinstance(v, (np.complexfloating, complex)):
+                    return np_complex(v)
+
+                # Если внезапно встретился torch.Tensor — мягко в NumPy нужной точности
+                torch = globals().get('torch', None)
+                if torch is not None and torch.is_tensor(v):
+                    arr = v.detach().cpu().numpy()
+                    if np.issubdtype(arr.dtype, np.floating):
+                        return arr.astype(np_float, copy=False)
+                    if np.issubdtype(arr.dtype, np.complexfloating):
+                        return arr.astype(np_complex, copy=False)
+                    return arr
+
+                # Контейнеры чисел → в NumPy нужной точности, если это float/complex
+                if isinstance(v, (list, tuple)):
+                    arr = np.asarray(v)
+                    if np.issubdtype(arr.dtype, np.floating):
+                        return arr.astype(np_float, copy=False)
+                    if np.issubdtype(arr.dtype, np.complexfloating):
+                        return arr.astype(np_complex, copy=False)
+
+                return v
+
+        for name, val in list(vars(obj).items()):
+            try:
+                new_val = cast_value(val)
+                if new_val is not val:
+                    setattr(obj, name, new_val)
+            except Exception:
+                # безопасно игнорируем экзотические поля
+                continue
+
+    def _all_zero_backend(self, x) -> bool:
+        """
+        True, если массив/тензор/скаляр равен нулю. Работает и для NumPy, и для Torch (если доступен).
+        """
+        torch = globals().get('torch', None)
+        if self.use_torch and (torch is not None) and torch.is_tensor(x):
+            return bool(torch.all(x == 0))
+
+        if isinstance(x, np.ndarray):
+            return bool((x == 0).all())
+
+        try:
+            return float(x) == 0.0
+        except Exception:
+            return False
 
     def set_configuration(self):
 
-        # Initialize arrays
-        self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)  # dtype=complex)
-        self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=float)
+        if self.use_torch:
+            self.linear_coeffs_array = torch.zeros((self.eq.size, self.eq.size), dtype=self.dtype)  # dtype=complex)
+            self.nonlinear_cubic_coeffs_array = torch.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
+        else:
+            self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)  # dtype=complex)
+            self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
 
         cm = getattr(self.eq, "coupling_matrix", None)
         if cm is not None:
@@ -462,9 +592,6 @@ class Solver:
                     f"EquationParameters.coupling_matrix must have shape {(self.eq.size, self.eq.size)}, "
                     f"got {A.shape}"
                 )
-            # симметризуем на всякий случай (реальные связи), приводим к float (у нас dtype=float)
-            A = 0.5 * (A + A.T)
-            self.linear_coeffs_array[:, :] = A.real
         else:
             central_coef = 0.0 if self.use_dimensional else 1.0  # у размерной задачи на диагонали должны быть нули
             if self.eq.core_configuration is CoreConfig.ring_with_center:
@@ -535,19 +662,24 @@ class Solver:
 
     def initialize_arrays(self, initial_condition=None, pulses=None):
         """Создает пустые массивы для хранения результатов"""
-        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False, dtype=self._np_rdtype)
-        self.z = np.linspace(self.com.L1, self.com.L2, self.com.N + 1, dtype=self._np_rdtype)
-        self.omega = (fftfreq(self.com.M, self.com.tau) * 2 * pi).astype(self._np_rdtype)
-        self.omega2 = (self.omega ** 2).astype(self._np_rdtype)
+        self.t = np.linspace(self.com.T1, self.com.T2, self.com.M, endpoint=False, dtype=self._np_dtype)
+        self.z = np.linspace(self.com.L1, self.com.L2, self.com.N + 1, dtype=self._np_dtype)
+
+        if self.use_torch:
+            self.omega = torch.fft.fftfreq(self.com.M, self.com.tau) * 2 * pi
+        else:
+            self.omega = (fftfreq(self.com.M, self.com.tau) * 2 * pi).astype(self.dtype)
+
+        self.omega2 = self.omega ** 2
 
         if initial_condition is not None or pulses is not zero_pulse:
-            self.numerical_solution = np.zeros((self.stored_steps_count, self.eq.size, self.com.M), dtype=self._np_cdtype)
+            self.numerical_solution = np.zeros((self.stored_steps_count, self.eq.size, self.com.M), dtype=self._np_ctype)
         else:
-            self.numerical_solution_time = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_cdtype)
+            self.numerical_solution_time = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_ctype)
 
-        self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
-        self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
-        self.phase_by_z = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_rdtype)
+        self.energy = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_dtype)
+        self.peak_power = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_dtype)
+        self.phase_by_z = np.zeros((self.eq.size, self.com.N + 1), dtype=self._np_dtype)
 
     def validate_initial_condition(self, initial_condition: np.ndarray):
         """Проверяет корректность начального условия"""
@@ -560,18 +692,6 @@ class Solver:
                 f"Invalid initial condition shape: {initial_condition.shape}. "
                 f"Expected: {expected_shape}"
             )
-
-    def apply_initial_condition(self, initial_condition: np.ndarray):
-        """Применяет заданное начальное условие"""
-        # Конвертируем в комплексный тип если нужно
-        self.numerical_solution[0] = initial_condition.astype(self._np_cdtype, copy=False)
-
-        # Рассчитываем начальные характеристики
-        for k in range(self.eq.size):
-            self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
-            self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
-            if 0 <= self.ind_by_z_for_phase < self.com.N:
-                self.phase_by_z[k][0] = np.angle(self.numerical_solution[0][k][self.ind_by_z_for_phase])
 
     def initialize_with_pulses(self, pulses, pulse_params_list):
         """Инициализация с помощью функций-генераторов импульсов"""
@@ -603,93 +723,138 @@ class Solver:
             else:
                 self.numerical_solution[0][k] = self.pulses[k](t=self.t, **pulse_params)
 
-        for k in range(self.eq.size):
-            self.energy[k][0] = get_energy_rectangles(self.numerical_solution[0][k], self.com.tau)
-            self.peak_power[k][0] = np.max(np.abs(self.numerical_solution[0][k]) ** 2)
-            if 0 <= self.ind_by_z_for_phase < self.com.N:
-                self.phase_by_z[k][0] = np.angle(self.numerical_solution[0][k][self.ind_by_z_for_phase])
+    # ─── solver.py ─────────────────────────────────────────────
+    def calculate_D_matrix(self, h: float):
+        """
+        Считает оператор D(h) и кладёт в self.D.
+        • Если β1=β2=0 → self.D имеет форму (n, n).
+        • Если β≠0     → self.D имеет форму (n, n, M).
+        Никаких других матриц (D_half, invD_half) здесь не считаем.
+        """
+        n, M = self.eq.size, self.com.M
+
+        # ─────────────────────── Torch backend ───────────────────────
+        if self.use_torch and _TORCH_AVAILABLE:
+            device, rdtype, cdtype = self.device, self.dtype, self.ctype
+
+            C = torch.as_tensor(self.linear_coeffs_array, dtype=rdtype, device=device)  # (n, n)
+            alpha = torch.as_tensor(self.eq.alpha, dtype=rdtype, device=device)  # (n,)
+            g0 = torch.as_tensor(self.eq.g_0, dtype=rdtype, device=device)  # (n,)
+            b1 = torch.as_tensor(self.eq.beta1, dtype=rdtype, device=device)  # (n,)
+            b2 = torch.as_tensor(self.eq.beta2, dtype=rdtype, device=device)  # (n,)
+
+            if torch.all(b1 == 0) and torch.all(b2 == 0):
+                # β1=β2=0 → D(h) = exp( h*i*C + diag( -h*(α+g0)/2 ) )
+                A = (h * (1j * C)).to(cdtype) + torch.diag((-(h * 0.5) * (alpha + g0)).to(cdtype))
+                self.D = torch.linalg.matrix_exp(A)  # (n, n)
+                return self.D
+
+            # β ≠ 0 → частотнозависимая матрица (n,n,M)
+            omega = torch.as_tensor(self.omega, dtype=rdtype, device=device)  # (M,)
+            base = (1j * C).to(cdtype).unsqueeze(0).expand(M, n, n)  # (M, n, n)
+            # diag_term(ω) = ( -2i b1 ω + i b2 ω² - α - g0 ) / 2
+            diag_term = (-2j * b1[None, :] * omega[:, None] + 1j * b2[None, :] * (omega[:, None] ** 2)
+                         - (alpha + g0)[None, :]) * 0.5  # (M, n)
+            A = h * (base + torch.diag_embed(diag_term.to(cdtype)))  # (M, n, n)
+            D_m = torch.linalg.matrix_exp(A)  # (M, n, n)
+            self.D = D_m.permute(1, 2, 0).contiguous()  # (n, n, M)
+            return self.D
+
+        # ─────────────────────── NumPy/SciPy backend ───────────────────────
+        # β=0: оператор не зависит от ω
+        if np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0):
+            # create_simple_dispersion_free_matrix(...) → (n,n); внутри expm для одной матрицы
+            self.D = create_simple_dispersion_free_matrix(
+                self.linear_coeffs_array, self.eq.alpha, self.eq.g_0, h
+            )  # (n, n)
+            return self.D
+
+        # β≠0: строим A(ω) и считаем expm батчево
+        # create_freq_matrix(...) возвращает плоский массив (n*n, M) элементов матриц A(ω)
+        A_flat = create_freq_matrix(
+            self.linear_coeffs_array, self.eq.beta1, self.eq.beta2,
+            self.eq.alpha, self.eq.g_0, self.omega, h
+        )  # (n*n, M), complex128
+
+        # представление (M, n, n) для батчевой expm в SciPy
+        A_n_n_M = A_flat.reshape(n, n, M)  # (n, n, M)
+        A_M_n_n = np.moveaxis(A_n_n_M, -1, 0)  # (M, n, n)
+
+        # SciPy expm поддерживает вход (..., n, n) и возвращает ту же форму (M, n, n)
+        D_M_n_n = expm(A_M_n_n)  # (M, n, n)
+
+        # возвращаем форму (n, n, M), принятую в остальном коде
+        self.D = np.moveaxis(D_M_n_n, 0, -1)  # (n, n, M)
+        return self.D
+
+    def calculate_invD_half(self):
+        """
+        Считает только invD_half из self.D_half.
+        • Если D_half имеет форму (n,n,M) → инверсия батчево по частотам.
+        • Если (n,n) → обычная матричная инверсия.
+        """
+        if self.D_half is None:
+            raise RuntimeError("calculate_invD_half(): self.D_half is None — сначала посчитайте self.D_half")
+
+        # ─────────────────────── Torch backend ───────────────────────
+        if self.use_torch and _TORCH_AVAILABLE and torch.is_tensor(self.D_half):
+            if self.D_half.ndim == 3:  # (n,n,M) → (M,n,n) → inv → (n,n,M)
+                d_m = self.D_half.permute(2, 0, 1).contiguous()
+                inv_m = torch.linalg.inv(d_m)
+                self.invD_half = inv_m.permute(1, 2, 0).contiguous()
+            else:  # (n,n)
+                self.invD_half = torch.linalg.inv(self.D_half)
+            return self.invD_half
+
+        # ─────────────────────── NumPy backend ───────────────────────
+        if self.D_half.ndim == 3:  # (n,n,M) → (M,n,n) → inv → (n,n,M)
+            d_m = np.moveaxis(self.D_half, -1, 0)  # (M, n, n)
+            inv_m = np.linalg.inv(d_m)  # (M, n, n) — батч поддерживается
+            self.invD_half = np.moveaxis(inv_m, 0, -1)  # (n, n, M)
+        else:  # (n,n)
+            self.invD_half = np.linalg.inv(self.D_half)
+
+        return self.invD_half
 
     # ─── solver.py ─────────────────────────────────────────────
-    def calculate_D_matrix(self, h) -> None:
-        n, M = self.eq.size, self.com.M
-
-        if np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0):
-            # build in double
-            D64 = create_simple_dispersion_free_matrix(
-                self.linear_coeffs_array.astype(np.float64, copy=False),
-                self.eq.alpha.astype(np.float64, copy=False),
-                self.eq.g_0.astype(np.float64, copy=False),
-                float(h)
-            )  # (n,n), complex128
-            self.D = D64.astype(self._np_cdtype, copy=False)
-        else:
-            C64 = self.linear_coeffs_array.astype(np.float64, copy=False)
-            b1 = self.eq.beta1.astype(np.float64, copy=False)
-            b2 = self.eq.beta2.astype(np.float64, copy=False)
-            a = self.eq.alpha.astype(np.float64, copy=False)
-            g0 = self.eq.g_0.astype(np.float64, copy=False)
-            om = self.omega.astype(np.float64, copy=False)
-
-            D_flat64 = get_pade_exponential2(
-                create_freq_matrix(C64, b1, b2, a, g0, om, float(h))
-            )  # (n², M), complex128
-            self.D = D_flat64.reshape(n, n, M).astype(self._np_cdtype, copy=False)
-
-        if self.use_torch:
-            self.D_pytorch = torch.as_tensor(self.D, dtype=self.ctype, device=self.device)
-
-    def calculate_invD_half(self) -> None:
-        """
-        Строит обратную матрицу к D_half.
-        """
-        # Поддержка обоих случаев:
-        # • D_half 3D: (n, n, M) – инвертируем покомпонентно по частоте
-        # • D_half 2D: (n, n)    – одна общая матрица для всех ω (β1=β2=0)
-        if self.D_half.ndim == 2:
-            self.invD_half = np.linalg.inv(self.D_half)
-            return
-
-        n, M = self.eq.size, self.com.M
-        self.invD_half = np.empty((n, n, M), dtype=self.D_half.dtype)
-        for i in range(M):
-            self.invD_half[:, :, i] = np.linalg.inv(self.D_half[:, :, i])
-
     def prepare_halfstep_constants(self):
         if self.gamma_h_half is not None:
             return
 
-            # ── 1. CPU-массивы ───────────────────────────────────────────────
-        self.gamma_h = self.eq.gamma *  self.com.h
-        self.g0_h = self.eq.g_0 *  self.com.h
-        self.exp_g0h = np.exp(self.g0_h)
-        self.exp_2g0h = np.exp(2.0 * self.g0_h)
+        h = self.com.h
 
-        self.gamma_h_half = 0.5 * self.gamma_h  # (n,)
-        self.g0_h_half = 0.5 * self.g0_h
-        self.exp_g0h_half = np.exp(self.g0_h_half)
-        self.exp_2g0h_half = np.exp(2.0 * self.g0_h_half)
-
-        # ── 2. PyTorch-тензоры (если используем torch) ───────────────────
         if self.use_torch:
-            to_t = lambda arr: torch.as_tensor(arr,
-                                               dtype=self.dtype,
-                                               device=self.device)
+            # torch
+            xp = torch
+            dtype = self.dtype
+            device = self.device
 
-            self.gamma_h_t = to_t(self.gamma_h)
-            self.g0_h_t = to_t(self.g0_h)
-            self.exp_g0h_t = to_t(self.exp_g0h)
-            self.exp_2g0h_t = to_t(self.exp_2g0h)
+            gamma = xp.as_tensor(self.eq.gamma, dtype=dtype, device=device)
+            g0 = xp.as_tensor(self.eq.g_0, dtype=dtype, device=device)
 
-            self.gamma_h_half_t = to_t(self.gamma_h_half)
-            self.g0_h_half_t = to_t(self.g0_h_half)
-            self.exp_g0h_half_t = to_t(self.exp_g0h_half)
-            self.exp_2g0h_half_t = to_t(self.exp_2g0h_half)
+            self.gamma_h = gamma * h
+            self.g0_h = g0 * h
 
-            # Дополнительно кешируем E_sat и g0 на том же устройстве
-            if self.E_sat_t is None:
-                self.E_sat_t = to_t(self.eq.E_sat)
-            if self.g0_t is None:
-                self.g0_t = to_t(self.eq.g_0)
+            self.exp_g0h = xp.exp(self.g0_h)
+            self.exp_2g0h = xp.exp(2.0 * self.g0_h)
+
+            self.gamma_h_half = 0.5 * self.gamma_h
+            self.g0_h_half = 0.5 * self.g0_h
+            self.exp_g0h_half = xp.exp(self.g0_h_half)
+            self.exp_2g0h_half = xp.exp(2.0 * self.g0_h_half)
+
+        else:
+            # NumPy
+            self.gamma_h = self.eq.gamma * h
+            self.g0_h = self.eq.g_0 * h
+
+            self.exp_g0h = np.exp(self.g0_h)
+            self.exp_2g0h = np.exp(2.0 * self.g0_h)
+
+            self.gamma_h_half = 0.5 * self.gamma_h
+            self.g0_h_half = 0.5 * self.g0_h
+            self.exp_g0h_half = np.exp(self.g0_h_half)
+            self.exp_2g0h_half = np.exp(2.0 * self.g0_h_half)
 
     def _prepare_taper(self):
         """
@@ -742,12 +907,12 @@ class Solver:
         exp_part = np.exp(-(σ + 1j * κ) * x ** q)
         edge = cos_part# * exp_part
 
-        taper = np.ones(self.com.M, dtype=self._np_cdtype)
-        taper[:L] = edge.astype(self._np_rdtype)
-        taper[-L:] = edge[::-1].astype(self._np_rdtype)
+        taper = np.ones(self.com.M, dtype=self.dtype)
+        taper[:L] = edge.astype(self.dtype)
+        taper[-L:] = edge[::-1].astype(self.dtype)
         self._taper_np = taper
         if self.use_torch:
-            self._taper_t = torch.as_tensor(taper, dtype=self.ctype, device=self.device)
+            self._taper_t = torch.as_tensor(taper, dtype=self.ctype)
 
     def filter_params(self, func, pulse_params):
         # Получаем список параметров, которые принимает функция
@@ -758,8 +923,35 @@ class Solver:
         filtered_params.update({k: v for k, v in pulse_params.items() if k in func_params})
         return filtered_params
 
-
     def calculate_metrics(self, psi, n, save_every, save_idx):
+        """
+        Два сценария:
+          • psi — torch.Tensor (GPU/CPU) → считаем на том же устройстве, на CPU копируем только (C,)
+          • psi — numpy.ndarray          → считаем в NumPy
+        Итоговое поле для логирования храним в self.numerical_solution на CPU (как и раньше).
+        """
+        # Torch-сценарий (во время шага): psi — тензор
+        if self.use_torch and _TORCH_AVAILABLE and torch.is_tensor(psi):
+            abs2 = psi.abs() ** 2
+            # маленькие векторы метрик на устройство → CPU
+            energy = (abs2.sum(dim=1) * self.tau_t).detach().cpu().numpy()
+            peak = (abs2.max(dim=1).values).detach().cpu().numpy()
+            self.energy[:, n + 1] = energy
+            self.peak_power[:, n + 1] = peak
+
+            if 0 <= self.ind_by_z_for_phase < self.com.M:
+                phase = torch.angle(psi[:, self.ind_by_z_for_phase]).detach().cpu().numpy()
+                self.phase_by_z[:, n + 1] = phase  # [rad]
+
+            # сохраняем шаг по расписанию — в CPU-хранилище
+            is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
+            if is_save_step:
+                save_idx += 1
+                if save_idx < self.stored_steps_count:
+                    self.numerical_solution[save_idx] = psi.detach().cpu().numpy()
+            return
+
+        # NumPy-сценарий (итоговое поле или CPU-ветка)
         abs2 = np.abs(psi) ** 2
         self.energy[:, n + 1] = abs2.sum(1) * self.com.tau
         self.peak_power[:, n + 1] = abs2.max(1)
@@ -767,13 +959,11 @@ class Solver:
         if 0 <= self.ind_by_z_for_phase < self.com.M:
             self.phase_by_z[:, n + 1] = np.angle(psi[:, self.ind_by_z_for_phase])
 
-        # ---------- сохранить шаг? -------------------------------
         is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
         if is_save_step:
             save_idx += 1
             if save_idx < self.stored_steps_count:
                 self.numerical_solution[save_idx] = psi
-
 
     # Основная функция моделирования
     def run_numerical_simulation(
@@ -801,25 +991,37 @@ class Solver:
 
         # ───── инициализация ────────────────────────────────────────────────────
 
+        t1 = time.time()
+
         if self.com.method == "ssfm_order2_ndn" or self.com.method == "ssfm_order2_ndn_windowed":
             if self.D is None:
                 self.calculate_D_matrix(self.com.h)
 
-        if self.com.method == "ssfm_order2_dnd" or self.com.method == "ssfm_order2_dnd_windowed_short":
+        if (self.com.method == "ssfm_order2_dnd"
+                or self.com.method == "ssfm_order2_dnd_short"
+                or self.com.method == "ssfm_order2_dnd_windowed_short"):
             if self.D_half is None:
-                self.calculate_D_matrix(self.com.h * 0.5)
-                self.D_half = self.D.copy()
+                # Посчитать D для половинного шага и СРАЗУ положить в D_half
+                self.D_half = self.calculate_D_matrix(self.com.h * 0.5)
 
+                # Полный шаг: D = D_half @ D_half (с учётом формы)
                 if self.D_half.ndim == 3:
-                    d_perm = self.D_half.transpose(2, 0, 1)  # -> (M, n, n)
-                    result_perm = d_perm @ d_perm
-                    self.D = result_perm.transpose(1, 2, 0)  # -> (n, n, M)
+                    # (n,n,M) → (M,n,n) @ (M,n,n) батчево
+                    if self.use_torch and torch.is_tensor(self.D_half):
+                        d_m = self.D_half.permute(2, 0, 1)  # (M,n,n)
+                        self.D = (d_m @ d_m).permute(1, 2, 0).contiguous()
+                    else:
+                        d_m = np.transpose(self.D_half, (2, 0, 1))  # (M,n,n)
+                        self.D = np.transpose(d_m @ d_m, (1, 2, 0))  # (n,n,M)
                 else:
-                    # β1=β2=0: оператор не зависит от ω, D_half — (n,n)
+                    # (n,n)
                     self.D = self.D_half @ self.D_half
 
             if self.invD_half is None:
                 self.calculate_invD_half()
+
+        # if self.display_debug_info:
+        #     print("Time of D computing =", time.time() - t1)
 
         if self.com.method == "ssfm_order2_ndn_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h)
@@ -847,7 +1049,11 @@ class Solver:
         t_start = time.time()
 
         if not self.use_torch:
-            if self.com.method == "ssfm_order2_dnd_windowed_short":
+            if self.com.method == "ssfm_order2_dnd_short":
+                self.numerical_solution[-1] = ssfm_order2_dnd_short(self, damp_length=self.com.damp_length,
+                                                                             disable_progress_bar=not self.display_debug_info)
+                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+            elif self.com.method == "ssfm_order2_dnd_windowed_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size,
                                                                              damp_length=self.com.damp_length,
                                                                              disable_progress_bar=not self.display_debug_info)
@@ -904,12 +1110,21 @@ class Solver:
         # ─────────────────────────────────────── GPU-ветка ───────────────
         else:
             psi_gpu = torch.as_tensor(
-                self.numerical_solution[0], dtype=self.ctype, device=self.device
+                self.numerical_solution[0], dtype=self.ctype
             )
 
-            if self.com.method == "ssfm_order2_dnd_windowed_short":
+            if self.com.method == "ssfm_order2_dnd_short":
 
-                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short_torch(
+                self.numerical_solution[-1] = ssfm_order2_dnd_short_pytorch(
+                    self,
+                    self.com.damp_length,
+                    disable_progress_bar=not self.display_debug_info
+                ).cpu().numpy()
+
+                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+            elif self.com.method == "ssfm_order2_dnd_windowed_short":
+
+                self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short_pytorch(
                     self,
                     self.com.window_size,
                     self.com.damp_length,
@@ -920,7 +1135,7 @@ class Solver:
             else:
                 for n in trange(self.com.N, disable=not self.display_debug_info):
                     # ---------- очередной шаг (GPU) --------------------------
-                    psi_gpu = ssfm_order2_pytorch(
+                    psi_gpu = ssfm_order2_dnd_pytorch(
                         psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
                         self,
                         self.com.h, tau,
@@ -936,7 +1151,7 @@ class Solver:
                     self.peak_power[:, n + 1] = peak_step
 
                     if 0 <= self.ind_by_z_for_phase < self.com.M:
-                        self.phase_by_z[:, n + 1] = np.angle(psi_gpu[:, self.ind_by_z_for_phase])
+                        self.phase_by_z[:, n + 1] = torch.angle(psi_gpu[:, self.ind_by_z_for_phase]).detach().cpu().numpy()
 
                     # ---------- сохранить шаг? -------------------------------
                     is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
@@ -990,7 +1205,6 @@ class Solver:
 
         save_every = self._save_every  # шаг между сохранёнными
         save_idx = 0  # 0-й шаг уже записан
-        tau = self.com.tau
 
         # ───── график │ опционально ──────────────────────────────────────
         if draw_modulus:
@@ -1003,6 +1217,9 @@ class Solver:
         psi_next = self.numerical_solution[0]
 
         if not self.use_torch:
+
+            tau = self.com.tau
+
             for n in trange(self.com.N, disable=not self.display_debug_info):
                 # ---------- очередной шаг --------------------------------
                 psi_next = ssfm_order2_2_in_fourier_space(
@@ -1030,13 +1247,16 @@ class Solver:
 
         # ─────────────────────────────────────── GPU-ветка ───────────────
         else:
+
+            tau = self.tau_t
+
             psi_gpu = torch.as_tensor(
-                self.numerical_solution[0], dtype=self.ctype, device=self.device
+                self.numerical_solution[0], dtype=self.ctype
             )
 
             for n in trange(self.com.N, disable=not self.display_debug_info):
                 # ---------- очередной шаг (GPU) --------------------------
-                psi_gpu = ssfm_order2_pytorch(
+                psi_gpu = ssfm_order2_dnd_pytorch(
                     psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
                     self,
                     self.com.h, tau,
@@ -1134,7 +1354,7 @@ class Solver:
                 du_dz[:, 0] = 0.0
 
             # i * C * u
-            C_t = torch.as_tensor(self.linear_coeffs_array, dtype=self.ctype, device=self.device)
+            C_t = torch.as_tensor(self.linear_coeffs_array, dtype=self.ctype)
             coupling = torch.matmul(C_t, u)
 
             # Энергия по z (трапеция) -> (eq_size, 1)
@@ -1192,7 +1412,7 @@ class Solver:
 
         # ---------- поля u, v = du/dt ------------------------------------
         if self.use_torch:
-            u = torch.zeros((C, Nz), dtype=ctype, device=self.device)
+            u = torch.zeros((C, Nz), dtype=ctype)
             v = torch.zeros_like(u)
         else:
             u = np.zeros((C, Nz), dtype=self.ctype)
@@ -1203,10 +1423,10 @@ class Solver:
         bc_prime  = fft_derivative(self.boundary_condition, dt, axis=1) # np.gradient(bc, self.com.tau, axis=1)
 
         if self.use_torch:
-            bc_t       = torch.as_tensor(bc,       dtype=ctype, device=self.device)
-            bc_prime_t = torch.as_tensor(bc_prime, dtype=ctype, device=self.device)
+            bc_t       = torch.as_tensor(bc,       dtype=ctype)
+            bc_prime_t = torch.as_tensor(bc_prime, dtype=ctype)
             fb_coef_t  = torch.as_tensor(self.feedback_coefficient,
-                                         dtype=ctype, device=self.device)
+                                         dtype=ctype)
 
         # ------------------------------------------------------------------
 
@@ -1235,7 +1455,7 @@ class Solver:
             first_unsaved = 0
 
             energy_gpu = torch.zeros((C, self.com.M + 1),
-                                     dtype=self.dtype, device=self.device)
+                                     dtype=self.dtype)
             peak_gpu   = torch.zeros_like(energy_gpu)
 
             energy_gpu[:, 0] = 0.0

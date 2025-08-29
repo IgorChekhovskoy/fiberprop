@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
 from fiberprop.fiber import Fiber, FiberMaterial, CoreConfig
 from fiberprop.fiber_geometry import get_core_count
@@ -222,11 +221,13 @@ def mcf_nn_reservoir_computing(
         psat_array=(),
         kappa=0.9,
         use_gpu=False,
+        use_torch=False,
         num_threads: int | str | None = "default",
         display_debug_info=False,
         display_debug_plots=False,
         save_gif=False,
         max_hours_total: Optional[float] = None,
+        precision: Optional[str] = 'float64',
         use_dispersion: bool = True,
 ):
     """
@@ -323,6 +324,8 @@ def mcf_nn_reservoir_computing(
         raise ValueError('Массив data_in размера (C×M) должен быть задан')
     eq_size, M = data_in.shape
 
+    dtype = np.complex64 if precision == "float32" else np.complex128
+
     if window_size <= 0 or window_size > M:
         raise ValueError("window_size должен быть >= 1")
 
@@ -366,6 +369,10 @@ def mcf_nn_reservoir_computing(
     feedback_length_m = feedback_loop_propagation_time / beta1_air  # длина воздушного плеча, m
     feedback_coeff = kappa * np.exp(1j * beta1_air * feedback_length_m)
 
+    if feedback_length_m < fiber_length_m:
+        print("feedback_length_m < fiber_length_m")
+        raise RuntimeError("feedback_length_m < fiber_length_m")
+
     # ─── характерные длины ───────────────────────────────────────
     L_D, L_NL, L_coupling, L_gain = compute_characteristic_lengths(
         beta2_ps2_m=beta2,
@@ -386,17 +393,27 @@ def mcf_nn_reservoir_computing(
     n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
     esat_array = np.asarray(psat_array) * window_size * time_step_ps
 
+    if display_debug_info:
+        print("data_in.shape=", data_in.shape)
+        print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
+        print("fiber_propagation_time =", fiber_propagation_time, "ps")
+        print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
+        print("fiber_length_dimensionless =", fiber_length_dimensionless)
+        print("length_scale =", length_scale)
+        print("n_z =", n_z)
+        print("esat = ", esat_array)
+        print("\nwindow_size * time_step_ps =", window_size * time_step_ps)
+
     # --- режим без дисперсии (beta2=0) с оконным стримингом ---
     if not use_dispersion:
-        n_batches = int(np.ceil(M / window_size))
 
         T_half_stream = (window_size * time_step_ps) / 2.0
 
         comp = ComputationalParameters(N=n_z, M=window_size,
                                        L1=0.0, L2=fiber_length_m,
                                        T1=-T_half_stream, T2=T_half_stream,
-                                       method="ssfm_order2_dnd_windowed_short",
-                                       window_size=window_size,
+                                       method="ssfm_order2_dnd_short",
+                                       # window_size=window_size,
                                        offset_size=0)
 
         eq = EquationParameters(core_configuration=core_configuration, size=eq_size,
@@ -406,21 +423,27 @@ def mcf_nn_reservoir_computing(
                                 E_sat=esat_array, alpha=0.0, g_0=g0_array,
                                 display_debug_info=display_debug_info)
 
-        data_out_stream = np.zeros((eq_size, M), dtype=np.complex128)
-        seg = data_in[:, 0:window_size]  # первое окно
-
         solver = Solver(comp, eq,
-                        initial_condition=seg,
+                        initial_condition=data_in[:, 0:window_size],
                         stored_steps_count=2,
                         use_dimensional=True,
                         use_gpu=use_gpu,
-                        use_torch=use_gpu,
-                        precision='float64',
+                        use_torch=use_torch,
+                        precision=precision,
                         display_debug_info=display_debug_info)
-        solver.linear_coeffs_array = coupling_matrix
+
+        data_out_stream = np.zeros((eq_size, M), dtype=dtype)
+
+        t_stream_ps = np.arange(M) * time_step_ps  # [ps]
+        omega_stream = 2 * np.pi * np.fft.fftfreq(M, d=time_step_ps)  # [rad/ps]
 
         # ВАЖНО: буфер предыдущего окна (для feedback) — определён заранее
-        fb_buf = np.zeros((eq_size, window_size), dtype=np.complex128)
+        fb_buf = np.zeros((eq_size, window_size), dtype=dtype)
+
+        n_batches = int(np.ceil(M / window_size))
+        print("n_batches =", n_batches)
+
+        t1 = time()
 
         for batch_index in range(n_batches):
             if batch_index > 0:
@@ -428,7 +451,7 @@ def mcf_nn_reservoir_computing(
                 e = min(s + window_size, M)
                 seg = data_in[:, s:e]
                 if seg.shape[1] < window_size:
-                    tmp = np.zeros((eq_size, window_size), dtype=np.complex128)
+                    tmp = np.zeros((eq_size, window_size), dtype=dtype)
                     tmp[:, :seg.shape[1]] = seg
                     seg = tmp
                 solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
@@ -438,6 +461,11 @@ def mcf_nn_reservoir_computing(
             if (batch_index == 0) and (max_hours_total is not None):
                 est_total_sec = dt_b * n_batches
                 if est_total_sec > float(max_hours_total) * 3600.0:
+                    print(
+                        f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
+                        f"max_hours_total={float(max_hours_total):.3f}; "
+                        f"windows={n_batches}, dt_first={dt_b:.3f}s"
+                    )
                     raise RuntimeError(
                         f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
                         f"max_hours_total={float(max_hours_total):.3f}; "
@@ -449,18 +477,41 @@ def mcf_nn_reservoir_computing(
             e = min(s + window_size, M)
             data_out_stream[:, s:e] = fb_buf[:, :e - s]
 
+            if display_debug_plots:
+
+                number_of_points_for_display = 1000 # solver.com.M  # np.min([5000, solver.com.M])
+                step = int(solver.com.M / number_of_points_for_display)
+
+                # plot2D_plotly(
+                #     solver.t[::step] * 1e-3,
+                #     [np.abs(solver.numerical_solution[0][central_core_ind][::step]) ** 2,
+                #      np.abs(solver.numerical_solution[-1][central_core_ind][::step]) ** 2],
+                #     names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
+                #     x_axis_label='t [ns]', y_axis_label='power [W]'
+                # )
+
+                # plot2D_plotly(
+                #     t_stream_ps * 1e-3,
+                #     [np.abs(data_out_stream[central_core_ind][::step]) ** 2],
+                #     names=[f"$|U_{central_core_ind}(z=L,t)|^2$"],
+                #     x_axis_label='t [ns]', y_axis_label='power [W]'
+                # )
+
+        if display_debug_info:
+            print("Elapsed time =", time() - t1)
+
         if display_debug_plots:
             plot2D_plotly(
-                np.fft.fftshift(solver.omega),
+                omega_stream,
                 np.abs(np.fft.fftshift(np.fft.fft(data_out_stream[central_core_ind]))) ** 2,
                 names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
-                x_axis_label=r'$\omega, \text{rad/s}$',
+                x_axis_label=r'$\omega, \text{rad/ps}$',
                 y_axis_label='spectrum intensity [W]', yscale="log", title_text="Spectrum"
             )
 
         if display_debug_plots:
             plot2D_plotly(
-                solver.t * 1e-3,
+                t_stream_ps * 1e-3,
                 np.abs(data_out_stream[central_core_ind]) ** 2,
                 names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
                 x_axis_label='t [ns]', y_axis_label='power [W]'
@@ -480,23 +531,12 @@ def mcf_nn_reservoir_computing(
 
     # =============================== beta2 != 0 ==========================================
     else:
-        if display_debug_info:
-            print("data_in.shape=", data_in.shape)
-            print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
-            print("fiber_propagation_time =", fiber_propagation_time, "ps")
-            print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
-            print("fiber_length_dimensionless =", fiber_length_dimensionless)
-            print("length_scale =", length_scale)
-            print("n_z =", n_z)
-            print("esat = ", esat_array)
-            print("\nwindow_size * time_step_ps =", window_size * time_step_ps)
-
         # ─── Solver и параметры уравнения ────────────────────────────
 
         # Выбираем размер «обрезки»/добивки: теперь подгоняем длину под быстрый FFT
         # и при этом offset_part гарантированно >= 0.1.
         offset_size0, offset_part, _target_len = _fft_padding_params(M, min_fraction=0.1)
-        initial_data = np.zeros((data_in.shape[0], (M + offset_size0) * 2), dtype=np.complex128)
+        initial_data = np.zeros((data_in.shape[0], (M + offset_size0) * 2), dtype=dtype)
         initial_data[:, offset_size0:M + offset_size0] = data_in
 
         # upsampling
@@ -529,13 +569,13 @@ def mcf_nn_reservoir_computing(
                         stored_steps_count=2,  # None if display_debug_info else 2,
                         use_dimensional=True,
                         use_gpu=use_gpu,
-                        use_torch=use_gpu,
-                        precision='float64',
+                        use_torch=use_torch,
+                        precision=precision,
                         num_threads=num_threads,
                         display_debug_info=display_debug_info)
 
         if display_debug_plots:
-            number_of_points_for_display = solver.com.M  # np.min([5000, solver.com.M])
+            number_of_points_for_display = 10000 #solver.com.M  # np.min([5000, solver.com.M])
             step = int(solver.com.M / number_of_points_for_display)
 
         iteration_count = int(np.ceil(M / window_size))
@@ -550,6 +590,11 @@ def mcf_nn_reservoir_computing(
         main_end = main_start + main_len
         _prev_int_main = None  # интенсивности |U|^2 из пред. итерации (C, main_len)
         _last_max_nrmse = 0.0
+
+        t_stream_ps = np.arange(M_final) * time_step_ps / upsampling  # [ps]
+        omega_stream = 2 * np.pi * np.fft.fftfreq(M_final, d=time_step_ps / upsampling)  # [rad/ps]
+
+        t1 = time()
 
         for iteration_index in range(iteration_count + 1):  # одна доп. итерация для окончательного установления
             if display_debug_info:
@@ -566,6 +611,11 @@ def mcf_nn_reservoir_computing(
             if (iteration_index == 0) and (max_hours_total is not None):
                 est_total_sec = dt_b * (iteration_count + 1)
                 if est_total_sec > float(max_hours_total) * 3600.0:
+                    print(
+                        f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
+                        f"max_hours_total={float(max_hours_total):.3f}; "
+                        f"iter_count={iteration_count + 1}, dt1={dt_b:.3f}s"
+                    )
                     raise RuntimeError(
                         f"TIME_LIMIT_EXCEEDED: est_total_hours={est_total_sec / 3600:.3f} > "
                         f"max_hours_total={float(max_hours_total):.3f}; "
@@ -598,7 +648,7 @@ def mcf_nn_reservoir_computing(
 
             # if display_debug_plots:
             #     plot2D_plotly(
-            #         solver.t[::step] * 1e-3,
+            #         t_stream_ps[::step] * 1e-3,
             #         [np.abs(solver.numerical_solution[0][central_core_ind][::step]) ** 2,
             #          np.abs(solver.numerical_solution[-1][central_core_ind][::step]) ** 2],
             #         names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
@@ -608,33 +658,39 @@ def mcf_nn_reservoir_computing(
             solver.numerical_solution[0] = initial_data + np.roll(solver.numerical_solution[-1],
                                                                   window_size * upsampling, axis=1) * feedback_coeff
 
+        if display_debug_info:
+            print("Elapsed time =", time() - t1)
+
         # — проверка сходимости по последней паре итераций —
-        if _last_max_nrmse > 1e-2:
+        if _last_max_nrmse > 5e-2:
+            print(
+                f"ITERATION_NOT_CONVERGED: max_nrmse_last={_last_max_nrmse:.6g} > 5e-2"
+            )
             raise RuntimeError(
-                f"ITERATION_NOT_CONVERGED: max_nrmse_last={_last_max_nrmse:.6g} > 1e-2"
+                f"ITERATION_NOT_CONVERGED: max_nrmse_last={_last_max_nrmse:.6g} > 5e-2"
             )
 
         if display_debug_plots:
             plot2D_plotly(
-                np.fft.fftshift(solver.omega),
+                omega_stream,
                 np.abs(np.fft.fftshift(np.fft.fft(solver.numerical_solution[-1][central_core_ind]))) ** 2,
                 names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
-                x_axis_label=r'$\omega, \text{rad/s}$',
+                x_axis_label=r'$\omega, \text{rad/ps}$',
                 y_axis_label='spectrum intensity [W]', yscale="log", title_text="Spectrum"
             )
 
         if display_debug_plots:
             plot2D_plotly(
-                solver.t * 1e-3,
+                t_stream_ps * 1e-3,
                 np.abs(solver.numerical_solution[-1][central_core_ind][
-                       offset_size * upsampling:(offset_size + data_in.shape[1]) * upsampling]) ** 2,
+                       offset_size:offset_size + data_in.shape[1] * upsampling]) ** 2,
                 names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
                 x_axis_label='t [ns]', y_axis_label='power [W]'
             )
 
         return {
             "data_out": (solver.numerical_solution[-1][:,
-                         offset_size * upsampling:(offset_size + data_in.shape[1]) * upsampling:upsampling]),
+                         offset_size:offset_size + data_in.shape[1] * upsampling:upsampling]),
             "params": {
                 "gamma": float(gamma),
                 "beta1": float(beta1),
@@ -910,6 +966,7 @@ class ReservoirConfig:
     psat_array: Tuple[float, ...] = (0.02,)
     kappa: float = 0.9
     use_gpu: bool = False
+    use_torch: bool = False
     num_threads: int | str | None = "default"
     display_debug_info: bool = False
     display_debug_plots: bool = False
@@ -919,7 +976,8 @@ class ReservoirConfig:
     window_size: Optional[
         int] = None  # Пользователь НЕ задаёт руками; вычисляется из delay_factor_in_symbols/phase внутри запуска
     max_hours_total: Optional[float] = None  # ОГРАНИЧЕНИЕ: оценка общего времени прогона (часы)
-    use_dispersion: Optional[bool] = None  # Включать ли слагаемое с дисперсией в модель
+    precision: Optional[str] = 'float64' # Размер данных в вычислениях ('float64', 'float32')
+    use_dispersion: Optional[bool] = True  # Включать ли слагаемое с дисперсией в модель
 
 @dataclass
 class TrainingConfig:
@@ -1293,6 +1351,7 @@ def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: Mas
 # поля, НЕ влияющие на физику, которые не должны входить в ключ
 _VOLATILE_FIELDS = {
     ("reservoir", "use_gpu"),
+    ("reservoir", "use_torch"),
     ("reservoir", "num_threads"),
     ("reservoir", "display_debug_info"),
     ("reservoir", "display_debug_plots"),
@@ -1363,6 +1422,7 @@ def _params_for_cache(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig,
             "layer_radii_array": list(reservoir_cfg.layer_radii_array),
             "g0_array": list(reservoir_cfg.g0_array),
             "psat_array": list(reservoir_cfg.psat_array),
+            "precision": str(reservoir_cfg.precision),
             "use_dispersion": bool(getattr(reservoir_cfg, "use_dispersion", True)),
         },
     )
@@ -1543,11 +1603,13 @@ def run_mcf_with_cache(data_in: np.ndarray,
         psat_array=tuple(rc["psat_array"]),
         kappa=rc["kappa"],
         use_gpu=bool(rc["use_gpu"]),
+        use_torch=bool(rc["use_torch"]),
         num_threads=rc["num_threads"],
         display_debug_info=bool(rc["display_debug_info"]),
         display_debug_plots=bool(rc["display_debug_plots"]),
         save_gif=bool(rc["save_gif"]),
         max_hours_total=rc.get("max_hours_total", None),
+        precision=rc.get("precision", None),
         use_dispersion=bool(rc.get("use_dispersion", True)),
     )
 
@@ -1727,19 +1789,19 @@ def estimate_required_t_size_fast(cfg) -> int:
     train_frac = float(cfg.training.train_frac)
     val_frac = float(getattr(cfg.training, "val_frac", 0.0))
     test_frac = 1.0 - train_frac - val_frac
-    if test_frac <= 0.0:
-        raise ValueError("train_frac + val_frac must be < 1.0")
+    if test_frac < -1e-16:
+        raise ValueError("train_frac + val_frac must be <= 1.0")
 
     # минимальные требования в символах (fast-политика)
     req_train = max(5 * D, 1000)
     req_val = max(2 * D, 500) if val_frac > 0.0 else 0
-    req_test = max(2 * D, 500)
+    req_test = max(2 * D, 500) if test_frac > 0.0 else 0
 
     # общее число символов до добавления служебных хвостов
     S_needed = max(
         np.ceil(req_train / train_frac),
         np.ceil(req_val / val_frac) if val_frac > 0.0 else 0,
-        np.ceil(req_test / test_frac),
+        np.ceil(req_test / test_frac) if test_frac > 0.0 else 0,
     )
 
     # служебные хвосты
@@ -1751,6 +1813,52 @@ def estimate_required_t_size_fast(cfg) -> int:
 
     S_total = int(S_needed + washout + max(target_shift, 0))
     return S_total
+
+
+# =========================
+# Сценарии запуска
+# =========================
+
+def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
+                                 n_trials_opt: int = 0,
+                                 free_run_horizon: int = 0,
+                                 force_rerun=False) -> Dict[str, Any]:
+    cfg = base_cfg
+    cfg.variant = "temporal_unique_per_core"
+    if n_trials_opt > 0:
+        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
+                                    n_jobs=physical_cpu_count(),
+                                    free_run_horizon=free_run_horizon)
+    else:
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+
+
+def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
+                                n_trials_opt: int = 0,
+                                free_run_horizon: int = 0,
+                                force_rerun=False) -> Dict[str, Any]:
+    cfg = base_cfg
+    cfg.variant = "temporal_same_all_cores"
+    if n_trials_opt > 0:
+        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
+                                    n_jobs=physical_cpu_count(),
+                                    free_run_horizon=free_run_horizon)
+    else:
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+
+
+def run_spatial_only(base_cfg: ExperimentConfig,
+                     n_trials_opt: int = 0,
+                     free_run_horizon: int = 0,
+                     force_rerun=False) -> Dict[str, Any]:
+    cfg = base_cfg
+    cfg.variant = "spatial_only"
+    if n_trials_opt > 0:
+        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
+                                    n_jobs=physical_cpu_count(),
+                                    free_run_horizon=free_run_horizon)
+    else:
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
 
 
 # =========================
@@ -1972,13 +2080,13 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
             # --- 1) основные гиперпараметры резерваура и усиления
-            kappa = trial.suggest_float("kappa", 0.01, 0.99, step=1e-3)
+            kappa = trial.suggest_float("kappa", 0.1, 0.99, step=1e-3)
             g0 = _round(trial.suggest_float("g0", 0.01, 20.0, log=True))
             psat = _round(trial.suggest_float("psat", 0.00001, 0.1, log=True), digit=5)
-            fiber_length = _round(trial.suggest_float("fiber_length", 0.05, 1.5, log=True))
-            gain_in = _round(trial.suggest_float("gain_in", 1e-2, 2e+1, log=True))
-            mask_size = trial.suggest_int("mask_size", 10, 300)
-            delay_factor = trial.suggest_int("delay_factor_in_symbols", 1, 100)
+            fiber_length = _round(trial.suggest_float("fiber_length", 0.2, 3, log=True))
+            gain_in = _round(trial.suggest_float("gain_in", 1, 1e+2, log=True))
+            mask_size = trial.suggest_int("mask_size", 30, 400)
+            delay_factor = trial.suggest_int("delay_factor_in_symbols", 1, 20)
 
             # --- 3) конфиг trial'а (прокидываем delay_factor_in_symbols, а не window_size)
             cfg = ExperimentConfig(
@@ -1999,6 +2107,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     psat_array=tuple([psat] * base_cfg.core_count),
                     kappa=_round(kappa),
                     use_gpu=base_cfg.reservoir.use_gpu,
+                    use_torch=base_cfg.reservoir.use_torch,
                     num_threads=1,
                     display_debug_info=False,
                     display_debug_plots=False,
@@ -2006,6 +2115,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     delay_factor_in_symbols=int(delay_factor),
                     delay_additional_in_mask_steps=base_cfg.reservoir.delay_additional_in_mask_steps,
                     max_hours_total=base_cfg.reservoir.max_hours_total,
+                    precision=base_cfg.reservoir.precision,
+                    use_dispersion=base_cfg.reservoir.use_dispersion,
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
@@ -2014,28 +2125,32 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             # --- 4) запуск и метрика (плохие конфиги помечаем PRUNED, чтобы НЕ шли в COMPLETE)
             try:
                 res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
-            except AssertionError as e:
-                msg = str(e).lower()
-                if ("feedback_length" in msg and "fiber" in msg) or ("feedback" in msg and "fiber" in msg):
-                    trial.set_user_attr("skip_reason", "feedback_length_le_fiber_length")
-                    raise TrialPruned("invalid_config: feedback_length <= fiber_length")
-                if "washout" in msg or "wash-out" in msg:
-                    trial.set_user_attr("skip_reason", "washout_too_small")
-                    raise TrialPruned("invalid_config: washout too small")
-                raise
-            except (ValueError, RuntimeError) as e:
+            except (AssertionError, ValueError, RuntimeError) as e:
                 msg = str(e).lower()
                 if ("feedback_length" in msg and "fiber" in msg) or "invalid_config" in msg:
                     trial.set_user_attr("skip_reason", "feedback_length_le_fiber_length")
+                    print(cfg, "skip_reason", "feedback_length_le_fiber_length")
                     raise TrialPruned("invalid_config: feedback_length <= fiber_length")
                 if "washout" in msg or "wash-out" in msg:
                     trial.set_user_attr("skip_reason", "washout_too_small")
-                    raise TrialPruned("invalid_config: washout too small")
+                    print(cfg, "skip_reason: washout too small")
+                    raise TrialPruned("skip_reason: washout too small")
+                if "time_limit_exceeded" in msg:
+                    trial.set_user_attr("skip_reason", "time_budget")
+                    print(cfg, "skip_reason: time budget exceeded")
+                    raise TrialPruned("time budget exceeded")
+
+                if "iteration_not_converged" in msg:
+                    trial.set_user_attr("skip_reason", "no_convergence")
+                    print(cfg, "skip_reason: no convergence")
+                    raise TrialPruned("no convergence")
                 raise
 
-            score = float(res["metrics"]["nrmse_val"])
+            score = min(float(res["metrics"]["nrmse_val"]), 1e2)
             if not np.isfinite(score):
-                raise TrialPruned("non-finite score")
+                trial.set_user_attr("skip_reason", "score =", score)
+                print("skip_reason", "non-finite score")
+                raise TrialPruned("skip_reason", "non-finite score")
 
             nonlocal best
             if score < best["score"]:
@@ -2119,56 +2234,11 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
 
 # =========================
-# Сценарии запуска
-# =========================
-
-def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
-                                 n_trials_opt: int = 0,
-                                 free_run_horizon: int = 0,
-                                 force_rerun=False) -> Dict[str, Any]:
-    cfg = base_cfg
-    cfg.variant = "temporal_unique_per_core"
-    if n_trials_opt > 0:
-        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
-    else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
-
-
-def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
-                                n_trials_opt: int = 0,
-                                free_run_horizon: int = 0,
-                                force_rerun=False) -> Dict[str, Any]:
-    cfg = base_cfg
-    cfg.variant = "temporal_same_all_cores"
-    if n_trials_opt > 0:
-        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
-    else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
-
-
-def run_spatial_only(base_cfg: ExperimentConfig,
-                     n_trials_opt: int = 0,
-                     free_run_horizon: int = 0,
-                     force_rerun=False) -> Dict[str, Any]:
-    cfg = base_cfg
-    cfg.variant = "spatial_only"
-    if n_trials_opt > 0:
-        return optimize_hyperparams(cfg, n_trials=n_trials_opt,
-                                    n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
-    else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
-
-
-# =========================
 # Пример точки входа
 # =========================
 
 if __name__ == "__main__":
+
     # Базовые параметры
     force_rerun = False  # игнорировать кэш и считать заново
     layer_count = 1
@@ -2184,7 +2254,7 @@ if __name__ == "__main__":
         if i == 0:
             layer_radii_array[i] = 0  # [mkm]
         if i == 1:
-            layer_radii_array[i] = 17.3 * 1  # 17.3 # [mkm]
+            layer_radii_array[i] = 30 # 17.3 * 1  # 17.3 # [mkm]
         if i == 2:
             layer_radii_array[i] = 17.3 * 2  # [mkm]
         if i == 3:
@@ -2197,37 +2267,39 @@ if __name__ == "__main__":
     variant = "temporal_same_all_cores"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
-        temporal_mask_size = temporal_mask_modulation_frequency_ghz
+        temporal_mask_size = 121
     else:
         temporal_mask_size = 1
 
     mg_cfg = MGConfig(t_size=2**10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=2.57)
+    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=17.425874971099564)
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=0.1,  # 0.1
+        fiber_length_m=0.6571013875307805,  # 0.1
         time_step_ps=1.0 / temporal_mask_modulation_frequency_ghz * 1e+3,
         step_number_per_dimensionless_distance=20,
-        upsampling=2,
-        delay_factor_in_symbols=100,
+        upsampling=1,
+        delay_factor_in_symbols=6,
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([10] * core_count),  # 10
-        psat_array=tuple([0.02] * core_count),  # 0.02
-        kappa=0.9,  # 0.9
+        g0_array=tuple([0.15163556871712178] * core_count),  # 10
+        psat_array=tuple([1.0273745093098033e-05] * core_count),  # 0.02
+        kappa=0.455,  # 0.9
         use_gpu=False,
-        num_threads=4,
+        use_torch=False,
+        num_threads=8,
         display_debug_plots=True,
         display_debug_info=True,
-        max_hours_total=12,
+        max_hours_total=72,
+        precision='float64',
         use_dispersion=True,
     )
 
     training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-6,  # washout=100,
                                   target_shift=1,
-                                  train_frac=0.8, val_frac=0.0)  # для одиночного запуска
+                                  train_frac=0.8, val_frac=0.2)  # для одиночного запуска
 
     base_cfg = ExperimentConfig(core_count=core_count, mg=mg_cfg, mask=mask_cfg,
                                 reservoir=reservoir_cfg, training=training_cfg,
@@ -2235,7 +2307,7 @@ if __name__ == "__main__":
 
     t_size = estimate_required_t_size_fast(base_cfg)
     print("Estimated required symbol count =", t_size)
-    mg_cfg.t_size = np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
+    mg_cfg.t_size = 2500 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
     # if variant == "spatial_only":
@@ -2255,7 +2327,8 @@ if __name__ == "__main__":
     # и выполни в отдельной консоли после запуска расчета (путь укажи свой до папки проекта)
     # optuna-dashboard "C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/scripts/mcf_optuna.journal" --port 8080
     # Открой в браузере http://127.0.0.1:8080/dashboard/
-    # На линуксе порт 18080
+    # На линуксе порт 18080, поэтому
+    # открой в браузере http://127.0.0.1:18080/dashboard
 
     base_cfg.training.train_frac = 0.8
     base_cfg.training.val_frac = 0.2

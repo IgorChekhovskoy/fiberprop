@@ -7,7 +7,8 @@ from numba import njit
 import os
 try:
     # вариант с MKL (если пакет установлен)
-    from numpy.fft import fft as _fft_impl, ifft as _ifft_impl
+    # from numpy.fft import fft as _fft_impl, ifft as _ifft_impl  # Не используй NUMPY.FFT: он поддерживает только 64-битные вычисления!
+    from mkl_fft.interfaces.numpy_fft import fft as _fft_impl, ifft as _ifft_impl
     # from mkl_fft import fft as _fft_impl, ifft as _ifft_impl
     def _fft_mt(x, axis):  return _fft_impl(x, axis=axis)
     def _ifft_mt(x, axis): return _ifft_impl(x, axis=axis)
@@ -269,6 +270,38 @@ def ssfm_order2_dnd(psi, current_energy, solver,
     return psi
 
 
+def ssfm_order2_dnd_short(solver, damp_length=0.0, disable_progress_bar=False):
+
+    psi = linear_step(solver.numerical_solution[0], solver.has_beta, solver.D_half)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    g0 = solver.eq.g_0
+    gain = g0 != 0.0
+    current_energy = np.zeros(psi.shape[0], dtype=solver.dtype)
+
+    for _ in trange(solver.com.N, disable=disable_progress_bar):
+        if gain.any():
+            current_energy[gain] = (np.abs(psi[gain]) ** 2).sum(1) * solver.com.tau
+
+        nonlinear_step(psi, solver.gamma_h, solver.g0_h,
+                                solver.exp_g0h, solver.exp_2g0h,
+                                solver.eq.E_sat, solver.eq.g_0, current_energy)
+
+        psi = linear_step(psi, solver.has_beta, solver.D)
+
+        if damp_length:
+            psi = apply_absorbing_boundary(psi, solver=solver)
+
+    psi = linear_step(psi, solver.has_beta, solver.invD_half)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    return psi
+
+
 def nonlinear_step_in_fourier_space(psi: np.ndarray,
                    gamma_h, g0_h, exp_g0h, exp_2g0h, tau,
                    E_sat: np.ndarray,
@@ -396,13 +429,15 @@ def ssfm_order2_ndn_windowed(psi, current_energy, solver,
 
     nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
                             solver.exp_g0h_half, solver.exp_2g0h_half,
-                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+                            solver.eq.E_sat, solver.eq.g_0, tau, window_size,
+                            offset_left=solver.com.offset_size)
 
     psi = linear_step(psi, solver.has_beta, solver.D)
 
     nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
                             solver.exp_g0h_half, solver.exp_2g0h_half,
-                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+                            solver.eq.E_sat, solver.eq.g_0, tau, window_size,
+                            offset_left=solver.com.offset_size)
 
     # current_energy[:] = np.sum(np.abs(psi)**2, axis=1)*tau
 
