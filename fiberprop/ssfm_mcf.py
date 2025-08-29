@@ -342,7 +342,7 @@ def ssfm_order2_2_in_fourier_space(psi, current_energy, solver, h, tau):
 
 def apply_absorbing_boundary(psi: np.ndarray, *, solver) -> np.ndarray:
     """Использует заранее посчитанный taper из solver."""
-    taper = solver._taper_np
+    taper = solver.taper
     if taper is None:
         return psi
     psi *= taper          # broadcasting (M,) → (C,M)

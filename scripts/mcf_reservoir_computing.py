@@ -441,11 +441,16 @@ def mcf_nn_reservoir_computing(
         fb_buf = np.zeros((eq_size, window_size), dtype=dtype)
 
         n_batches = int(np.ceil(M / window_size))
-        print("n_batches =", n_batches)
+        if display_debug_info:
+            print("n_batches =", n_batches)
 
         t1 = time()
 
         for batch_index in range(n_batches):
+
+            if display_debug_info:
+                print("batch_index =", batch_index)
+
             if batch_index > 0:
                 s = batch_index * window_size
                 e = min(s + window_size, M)
@@ -1491,6 +1496,7 @@ def reconstruct_data_in_from_compact(core_count: int,
 def run_mcf_with_cache(data_in: np.ndarray,
                        params_dict: Dict[str, Any],
                        force_rerun: bool = False,
+                       save_cache: bool = False,
                        cache_bits: int = 64) -> Tuple[np.ndarray, float, str]:
     """
     Возвращает (data_out[C,M], params, cache_key).
@@ -1643,18 +1649,19 @@ def run_mcf_with_cache(data_in: np.ndarray,
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
-    np.savez_compressed(
-        _p_scripts,
-        params_json=np.frombuffer(json_dumps_compact(params_dict).encode("utf-8"), dtype=np.uint8),
-        cache_bits=np.asarray(int(cache_bits), dtype=np.int32),
-        mg_series=mg_series,
-        **({"mask_time": mask_time} if mask_time is not None else {}),
-        **({"masks_time": masks_time} if masks_time is not None else {}),
-        **({"core_weights": core_weights} if core_weights is not None else {}),
-        **_pack_complex(data_out, cache_bits),
-        **({"fiber_params_json": np.frombuffer(fiber_params_json,
-                                               dtype=np.uint8)} if fiber_params_json is not None else {}),
-    )
+    if save_cache:
+        np.savez_compressed(
+            _p_scripts,
+            params_json=np.frombuffer(json_dumps_compact(params_dict).encode("utf-8"), dtype=np.uint8),
+            cache_bits=np.asarray(int(cache_bits), dtype=np.int32),
+            mg_series=mg_series,
+            **({"mask_time": mask_time} if mask_time is not None else {}),
+            **({"masks_time": masks_time} if masks_time is not None else {}),
+            **({"core_weights": core_weights} if core_weights is not None else {}),
+            **_pack_complex(data_out, cache_bits),
+            **({"fiber_params_json": np.frombuffer(fiber_params_json,
+                                                   dtype=np.uint8)} if fiber_params_json is not None else {}),
+        )
     return data_out, params_out, key
 
 
@@ -1822,43 +1829,46 @@ def estimate_required_t_size_fast(cfg) -> int:
 def run_temporal_unique_per_core(base_cfg: ExperimentConfig,
                                  n_trials_opt: int = 0,
                                  free_run_horizon: int = 0,
-                                 force_rerun=False) -> Dict[str, Any]:
+                                 force_rerun=False,
+                                 save_cache=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "temporal_unique_per_core"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
                                     n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
+                                    free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
     else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
 
 
 def run_temporal_same_all_cores(base_cfg: ExperimentConfig,
                                 n_trials_opt: int = 0,
                                 free_run_horizon: int = 0,
-                                force_rerun=False) -> Dict[str, Any]:
+                                force_rerun=False,
+                                save_cache=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "temporal_same_all_cores"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
                                     n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
+                                    free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
     else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
 
 
 def run_spatial_only(base_cfg: ExperimentConfig,
                      n_trials_opt: int = 0,
                      free_run_horizon: int = 0,
-                     force_rerun=False) -> Dict[str, Any]:
+                     force_rerun=False,
+                     save_cache=False) -> Dict[str, Any]:
     cfg = base_cfg
     cfg.variant = "spatial_only"
     if n_trials_opt > 0:
         return optimize_hyperparams(cfg, n_trials=n_trials_opt,
                                     n_jobs=physical_cpu_count(),
-                                    free_run_horizon=free_run_horizon)
+                                    free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
     else:
-        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+        return run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
 
 
 # =========================
@@ -1867,7 +1877,8 @@ def run_spatial_only(base_cfg: ExperimentConfig,
 
 def run_single_experiment(cfg: ExperimentConfig,
                           free_run_horizon: int = 0,
-                          force_rerun: bool = False) -> Dict[str, Any]:
+                          force_rerun: bool = False,
+                          save_cache: bool =False) -> Dict[str, Any]:
     """
     1) генерируем вход/ряд MG,
     2) считаем/читаем из кэша MCF,
@@ -1901,6 +1912,7 @@ def run_single_experiment(cfg: ExperimentConfig,
     data_out, params_out, cache_key = run_mcf_with_cache(data_in,
                                                          params_dict,
                                                          force_rerun=force_rerun,
+                                                         save_cache=save_cache,
                                                          cache_bits=32)
 
     # ── признаки/таргеты: ПЕРЕХОД НА СИМВОЛЫ + taps
@@ -2018,7 +2030,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                          n_trials: int,
                          n_jobs: Optional[int] = None,
                          free_run_horizon: int = 0,
-                         force_rerun: bool = False) -> Dict[str, Any]:
+                         force_rerun: bool = False,
+                         save_cache: bool = False) -> Dict[str, Any]:
     """
     Подбор гиперпараметров с Optuna.
 
@@ -2124,7 +2137,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
             # --- 4) запуск и метрика (плохие конфиги помечаем PRUNED, чтобы НЕ шли в COMPLETE)
             try:
-                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun)
+                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
             except (AssertionError, ValueError, RuntimeError) as e:
                 msg = str(e).lower()
                 if ("feedback_length" in msg and "fiber" in msg) or "invalid_config" in msg:
@@ -2146,7 +2159,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     raise TrialPruned("no convergence")
                 raise
 
-            score = min(float(res["metrics"]["nrmse_val"]), 1e2)
+            score = min(float(res["metrics"]["nrmse_val"]), 1e+1)
             if not np.isfinite(score):
                 trial.set_user_attr("skip_reason", "score =", score)
                 print("skip_reason", "non-finite score")
@@ -2241,6 +2254,7 @@ if __name__ == "__main__":
 
     # Базовые параметры
     force_rerun = False  # игнорировать кэш и считать заново
+    save_cache = True
     layer_count = 1
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
@@ -2310,14 +2324,14 @@ if __name__ == "__main__":
     mg_cfg.t_size = 2500 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
-    # if variant == "spatial_only":
-    #     res = run_spatial_only(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
-    # elif variant == "temporal_same_all_cores":
-    #     res = run_temporal_same_all_cores(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
-    # elif variant == "temporal_unique_per_core":
-    #     res = run_temporal_unique_per_core(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun)
-    #
-    # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+    if variant == "spatial_only":
+        res = run_spatial_only(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun, save_cache=save_cache)
+    elif variant == "temporal_same_all_cores":
+        res = run_temporal_same_all_cores(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun, save_cache=save_cache)
+    elif variant == "temporal_unique_per_core":
+        res = run_temporal_unique_per_core(base_cfg, n_trials_opt=0, free_run_horizon=0, force_rerun=force_rerun, save_cache=save_cache)
+
+    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # === Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===
     # Вариант «temporal_same_all_cores» для одной сердцевины;
@@ -2330,12 +2344,13 @@ if __name__ == "__main__":
     # На линуксе порт 18080, поэтому
     # открой в браузере http://127.0.0.1:18080/dashboard
 
-    base_cfg.training.train_frac = 0.8
-    base_cfg.training.val_frac = 0.2
-    res = run_temporal_same_all_cores(
-        base_cfg,
-        n_trials_opt=10000,  # сколько попробовать конфигураций
-        free_run_horizon=0,  # без свободного прогона после обучения
-        force_rerun=False  # используй кэш, если ключ совпал
-    )
-    print("Лучший результат Optuna:\n", res)
+    # base_cfg.training.train_frac = 0.8
+    # base_cfg.training.val_frac = 0.2
+    # res = run_temporal_same_all_cores(
+    #     base_cfg,
+    #     n_trials_opt=10000,  # сколько попробовать конфигураций
+    #     free_run_horizon=0,  # без свободного прогона после обучения
+    #     force_rerun=False,  # используй кэш, если ключ совпал
+    #     save_cache=False,
+    # )
+    # print("Лучший результат Optuna:\n", res)

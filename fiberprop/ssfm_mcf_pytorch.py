@@ -85,7 +85,7 @@ else:
             return torch.matmul(D, psi)
 
     def apply_absorbing_boundary_pytorch(psi: Tensor, *, solver):
-        taper = solver._taper_t
+        taper = solver.taper
         if taper is None:
             return psi
         psi.mul_(taper)  # in-place, broadcasting

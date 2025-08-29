@@ -352,8 +352,7 @@ class Solver:
         self.E_sat_t = None
         self.g0_t = None
 
-        self._taper_np = None
-        self._taper_t = None
+        self.taper = None
         self.use_dimensional = use_dimensional  # безразмерная или размерная задача
         self.precision = precision
         self.use_gpu = use_gpu and _TORCH_AVAILABLE  # Устанавливаем режим GPU только если PyTorch доступен
@@ -578,20 +577,24 @@ class Solver:
     def set_configuration(self):
 
         if self.use_torch:
-            self.linear_coeffs_array = torch.zeros((self.eq.size, self.eq.size), dtype=self.dtype)  # dtype=complex)
-            self.nonlinear_cubic_coeffs_array = torch.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
+            self.linear_coeffs_array = torch.zeros((self.eq.size, self.eq.size))
+            self.nonlinear_cubic_coeffs_array = torch.zeros((self.eq.size, self.eq.size))
         else:
-            self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)  # dtype=complex)
-            self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
+            self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size))
+            self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size))
 
         cm = getattr(self.eq, "coupling_matrix", None)
         if cm is not None:
-            A = np.asarray(cm)
-            if A.shape != (self.eq.size, self.eq.size):
+            if self.use_torch:
+                coupling_matrix = torch.as_tensor(cm)
+            else:
+                coupling_matrix = np.asarray(cm)
+            if coupling_matrix.shape != (self.eq.size, self.eq.size):
                 raise ValueError(
                     f"EquationParameters.coupling_matrix must have shape {(self.eq.size, self.eq.size)}, "
-                    f"got {A.shape}"
+                    f"got {coupling_matrix.shape}"
                 )
+            self.linear_coeffs_array[:, :] = coupling_matrix
         else:
             central_coef = 0.0 if self.use_dimensional else 1.0  # у размерной задачи на диагонали должны быть нули
             if self.eq.core_configuration is CoreConfig.ring_with_center:
@@ -864,11 +867,6 @@ class Solver:
         ▸ Маска рассчитывается **один раз** при инициализации Solver
           или после изменения self.com.damp_length / self.com.M.
 
-        ▸ Хранится
-            self._taper_np : ndarray(M,)        – для CPU/NumPy
-            self._taper_t  : torch.Tensor(M,)   – для PyTorch-ветки,
-                                                 на том же device, dtype.
-
         ▸ Алгоритм:
             1. Доля узлов с поглощением  L = int(M * damp_length).
             2. Левая/правая кромка — окно cos⁶:
@@ -882,14 +880,12 @@ class Solver:
         ▸ После изменения размерности сетки или damp_length
           вызовите повторно self._prepare_taper().
 
-        Возвращаемое значение: None (побочный эффект — заполнены
-        self._taper_np / self._taper_t).
+        Возвращаемое значение: None (побочный эффект — заполнен self.taper).
         """
         M = self.com.M
         Lp = self.com.damp_length  # доля PML
         if Lp == 0.0:
-            self._taper_np = None
-            self._taper_t = None
+            self.taper = None
             return
 
         p = 1  # степень косинуса
@@ -907,12 +903,17 @@ class Solver:
         exp_part = np.exp(-(σ + 1j * κ) * x ** q)
         edge = cos_part# * exp_part
 
-        taper = np.ones(self.com.M, dtype=self.dtype)
-        taper[:L] = edge.astype(self.dtype)
-        taper[-L:] = edge[::-1].astype(self.dtype)
-        self._taper_np = taper
         if self.use_torch:
-            self._taper_t = torch.as_tensor(taper, dtype=self.ctype)
+            edge = torch.as_tensor(edge)
+            taper = torch.ones(self.com.M)
+            taper[:L] = edge
+            taper[-L:] = edge.flip(dims=[0])
+            self.taper = taper
+        else:
+            taper = np.ones(self.com.M, dtype=self.dtype)
+            taper[:L] = edge.astype(self.dtype)
+            taper[-L:] = edge[::-1].astype(self.dtype)
+            self.taper = taper
 
     def filter_params(self, func, pulse_params):
         # Получаем список параметров, которые принимает функция
@@ -1454,8 +1455,7 @@ class Solver:
             pend   : list[torch.cuda.Event] = []
             first_unsaved = 0
 
-            energy_gpu = torch.zeros((C, self.com.M + 1),
-                                     dtype=self.dtype)
+            energy_gpu = torch.zeros((C, self.com.M + 1))
             peak_gpu   = torch.zeros_like(energy_gpu)
 
             energy_gpu[:, 0] = 0.0
