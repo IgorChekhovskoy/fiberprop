@@ -1026,23 +1026,54 @@ class ExperimentConfig:
 # Графики
 # =========================
 
-def _plot_temporal_masks(ax, masks: np.ndarray, mask_kind: str):
+def _plot_temporal_masks(ax, masks: np.ndarray, mask_kind: str, labelpad_shift: int):
     """Heatmap временных масок: ось X — индекс внутри символа, ось Y — ядро."""
     C, M = masks.shape
     im = ax.imshow(masks, aspect="auto", interpolation="nearest",
                    extent=[0, M, C, 0], cmap="coolwarm")
     ax.set_title(f"Временные маски (mask_size={M}, kind='{mask_kind}')", loc="left")
-    ax.set_xlabel("индекс маски (внутри символа)")
-    ax.set_ylabel("ядро")
+    ax.set_xlabel("индекс маски (внутри символа)", labelpad=labelpad_shift)
+    ax.set_ylabel("ядро", labelpad=labelpad_shift)
     return im
 
-def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Пространственные веса на ядрах"):
+def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Пространственные веса на ядрах", labelpad_shift: int = -2):
     """Bar-чарт по ядрам."""
     C = weights.shape[0]
-    ax.bar(np.arange(C), weights, width=0.7)
+    ax.bar(np.arange(C), weights, width=0.7, color='royalblue')
     ax.set_title(title, loc="left")
-    ax.set_xlabel("ядро")
-    ax.set_ylabel("вес")
+    ax.set_xlabel("ядро", labelpad=labelpad_shift)
+    ax.set_ylabel("вес", labelpad=labelpad_shift)
+
+def plot_attractor(mc_series, tau_param, colors, labels, boundaries):
+    """3D визуализация ряда Макея-Гласса."""
+    labelpad_shift = -1
+    legend_font_size = 12
+    axes_font_size = 10
+    axes_labels_font_size = 16
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.view_init(elev=20, azim=-15)
+    ax.spines['bottom'].set_color('black')
+    ax.spines['top'].set_color('black')
+    ax.spines['right'].set_color('black')
+    ax.spines['left'].set_color('black')
+    ax.tick_params(axis='x', labelsize=axes_font_size)
+    ax.tick_params(axis='y', labelsize=axes_font_size)
+    ax.tick_params(axis='z', labelsize=axes_font_size)
+    ax.set(facecolor='w')
+
+    x, y, z = mc_series[2*tau_param:], mc_series[tau_param:-tau_param], mc_series[:-2*tau_param]
+    for i, bounds in enumerate(boundaries):
+        a, b = bounds
+        ax.plot(x[a:b], y[a:b], z[a:b], color=colors[i], lw=2, label=labels[i])  # scatter
+    ax.set_xlabel('y', labelpad=labelpad_shift, fontsize=axes_labels_font_size)
+    ax.set_ylabel('x', labelpad=labelpad_shift, fontsize=axes_labels_font_size)
+    ax.set_zlabel('z', labelpad=labelpad_shift, fontsize=axes_labels_font_size)
+    ax.set_title('Mackey-Glass attractor', loc="center")
+    ax.legend(bbox_to_anchor=(0.0, 0.95), loc='upper left', borderaxespad=0.0, title='Data labels:',
+              ncols=1, fontsize=legend_font_size, title_fontsize=legend_font_size, facecolor='w')
+    plt.show()
 
 def _reconstruct_masks_or_weights(core_count: int,
                                   variant: str,
@@ -1084,6 +1115,7 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
       1) Полный ряд MG (нормированный так же, как используется в расчёте),
          с пометками: warmup, shift, washout, train/val/test.
       2) Маски (по времени) для каждого ядра или пространственные веса (bar).
+         + аттрактор
     """
     # --- восстановим полный MG, чтобы показать warmup слева
     warmup = cfg.mg.warmup
@@ -1135,34 +1167,59 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     i_te_L = i_va_R
     i_te_R = i_te_L + (N_eff - n_train - n_val)
 
+    plt.rcParams['font.family'] = 'serif'  # Times New Roman
+    plt.rcParams['font.style'] = 'normal'
+    plt.rcParams['font.size'] = 14
+    axes_font_size = 7
+    labelpad_shift = -1
+    legend_font_size = 9
+    heatmap_colorbar_label_shift = -42
+    plt.rcParams['text.color'] = 'black'
+    plt.rcParams['xtick.color'] = 'black'
+    plt.rcParams['ytick.color'] = 'black'
+    plt.rcParams['axes.labelcolor'] = 'black'
+
     # --- рисуем
-    fig = plt.figure(figsize=(12, 7))
+    fig = plt.figure(figsize=(15, 7))
     gs = fig.add_gridspec(2, 1, height_ratios=[2.2, 1.6], hspace=0.35)
 
     # (1) полный MG с разметкой
     ax1 = fig.add_subplot(gs[0, 0])
+    ax1.spines['bottom'].set_color('black')
+    ax1.spines['top'].set_color('black')
+    ax1.spines['right'].set_color('black')
+    ax1.spines['left'].set_color('black')
+
+    ax1.tick_params(axis='x', labelsize=axes_font_size)
+    ax1.tick_params(axis='y', labelsize=axes_font_size)
+    ax1.set(facecolor='w')
+    ax1.grid('axis = "both"', color='gray')
+
     t_full = np.arange(x_full_norm.shape[0])
-    ax1.plot(t_full, x_full_norm, lw=1.0, label="MG (норм.)")
+    ax1.plot(t_full, x_full_norm, lw=1.0, label="MG (норм.)", color='royalblue')
     ax1.set_xlim(t_full[0], t_full[-1])  # жёстко фиксируем границы
     ax1.margins(x=0.0)  # убираем автополя по X
 
-    def span(a, b, color, label, alpha=0.18):
+    def span(bounds, color, label, alpha=0.18):
+        a, b = bounds
         ax1.axvspan(a, b, color=color, alpha=alpha, label=label)
 
-    span(i_warmup_L, i_warmup_R, "#888888", "warmup (отброшено)")
-    span(i_shift_L,  i_shift_R,  "#1f77b4", "target shift")
-    span(i_wash_L,   i_wash_R,   "#ff7f0e", "washout")
-    span(i_tr_L,     i_tr_R,     "#2ca02c", "train")
-    span(i_va_L,     i_va_R,     "#9467bd", "val")
-    span(i_te_L,     i_te_R,     "#d62728", "test")
+    colors = ["#888888", "#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#d62728"]
+    labels = ["warmup (отброшено)", "target shift", "washout", "train", "val", "test"]
+    boundaries = [(i_warmup_L, i_warmup_R), (i_shift_L, i_shift_R), (i_wash_L, i_wash_R),
+                  (i_tr_L, i_tr_R), (i_va_L, i_va_R), (i_te_L, i_te_R)]
+
+    spans_num = len(colors)
+    for i in range(spans_num):
+        span(boundaries[i], colors[i], labels[i])
 
     ax1.set_title("Ряд Маккея–Гласса: warmup/shift/washout/train/val/test", loc="left")
-    ax1.set_xlabel("индекс по времени")
-    ax1.set_ylabel("норм. амплитуда")
+    ax1.set_xlabel("индекс по времени", labelpad=labelpad_shift)
+    ax1.set_ylabel("норм. амплитуда", labelpad=labelpad_shift)
     # Уберём дубликаты в легенде
     handles, labels = ax1.get_legend_handles_labels()
     uniq = dict(zip(labels, handles))
-    ax1.legend(uniq.values(), uniq.keys(), ncols=3, fontsize=9)
+    ax1.legend(uniq.values(), uniq.keys(), ncols=3, fontsize=legend_font_size, loc='lower center', facecolor='w')
 
     # (2) маски / пространственные веса
     masks_info = _reconstruct_masks_or_weights(core_count=cfg.core_count,
@@ -1176,19 +1233,40 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
         # два подграфика внизу: слева heatmap масок, справа бар-чарт «весов»
         gs_bottom = gs[1, 0].subgridspec(1, 2, wspace=0.25, width_ratios=[3, 2])
         ax2 = fig.add_subplot(gs_bottom[0, 0])
+        ax2.spines['bottom'].set_color('black')
+        ax2.spines['top'].set_color('black')
+        ax2.spines['right'].set_color('black')
+        ax2.spines['left'].set_color('black')
+        ax2.tick_params(axis='x', labelsize=axes_font_size)
+        ax2.tick_params(axis='y', labelsize=axes_font_size)
+        ax2.set(facecolor='w')
+        ax2.grid(False)
+
         ax3 = fig.add_subplot(gs_bottom[0, 1])
+        ax3.spines['bottom'].set_color('black')
+        ax3.spines['top'].set_color('black')
+        ax3.spines['right'].set_color('black')
+        ax3.spines['left'].set_color('black')
+        ax3.tick_params(axis='x', labelsize=axes_font_size)
+        ax3.tick_params(axis='y', labelsize=axes_font_size)
+        ax3.set(facecolor='w')
+        ax3.grid(False)
 
-        im = _plot_temporal_masks(ax2, masks_info["masks"], cfg.mask.mask_kind)
+        im = _plot_temporal_masks(ax2, masks_info["masks"], cfg.mask.mask_kind, labelpad_shift)
         cbar = fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
-        cbar.set_label("величина маски")
+        cbar_labels = cbar.ax.get_yticklabels()
+        for label in cbar_labels:
+            label.set_fontsize(axes_font_size)
+        cbar.set_label("величина маски", labelpad=heatmap_colorbar_label_shift)
 
-        _plot_spatial_weights(ax3, masks_info["weights"], title="Эфф. веса по ядрам (⟨|mask|⟩)")
+        _plot_spatial_weights(ax3, masks_info["weights"], title="Эфф. веса по ядрам (⟨|mask|⟩)", labelpad_shift=labelpad_shift)
     else:
         # только пространственные веса
         ax2 = fig.add_subplot(gs[1, 0])
-        _plot_spatial_weights(ax2, masks_info["weights"], title="Пространственные веса на ядрах (без временной маски)")
+        _plot_spatial_weights(ax2, masks_info["weights"], title="Пространственные веса на ядрах (без временной маски)", labelpad_shift=labelpad_shift)
 
     plt.show()
+    return x_full_norm, cfg.mg.tau, colors[-3:], labels[-3:], boundaries[-3:]
 
 
 def debug_plot_post_training_comparison(y_true: np.ndarray,
@@ -1903,7 +1981,8 @@ def run_single_experiment(cfg: ExperimentConfig,
 
     # 2) рисовалка уже с заполненным window_size
     if cfg.reservoir.display_debug_plots:
-        debug_plot_input_overview(cfg_with_ws, mg_series_used=mg_series)
+        norm_series, my_tau, colors, labels, bounds = debug_plot_input_overview(cfg_with_ws, mg_series_used=mg_series)
+        plot_attractor(norm_series, my_tau, colors, labels, bounds)
 
     # ключ кэша
     params_dict = _params_for_cache(cfg_with_ws.core_count, cfg_with_ws.mg, cfg_with_ws.mask,
@@ -2321,7 +2400,7 @@ if __name__ == "__main__":
 
     t_size = estimate_required_t_size_fast(base_cfg)
     print("Estimated required symbol count =", t_size)
-    mg_cfg.t_size = 2500 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
+    mg_cfg.t_size = 5000 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
     if variant == "spatial_only":
