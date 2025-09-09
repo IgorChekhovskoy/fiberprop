@@ -55,7 +55,7 @@ def calculate_error(num: np.ndarray, ana: np.ndarray, tau: float) -> float:
 
 def make_solver(pulse: str, *, M: int, N: int) -> Solver:
     """Return a configured `Solver` instance for given grid sizes."""
-    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0, method="ssfm_order2_dnd_compact_windowed")
+    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0, method="ssfm_order2_dnd_short")
 
     if pulse == "fundamental":
         # Classic NLSE – only dispersion & Kerr non‑linearity

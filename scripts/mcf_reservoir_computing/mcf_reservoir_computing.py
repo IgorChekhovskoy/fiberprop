@@ -1,4 +1,7 @@
 from __future__ import annotations
+import os
+from datetime import datetime
+from typing import Optional, Union
 
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
 from fiberprop.fiber import Fiber, FiberMaterial, CoreConfig
@@ -6,12 +9,19 @@ from fiberprop.fiber_geometry import get_core_count
 from fiberprop.light import Light
 from fiberprop.base_functions import get_coupling_coefficients
 from fiberprop.drawing import *
+from fiberprop.threading_control import physical_cpu_count, temporary_thread_limits
+
 from time import time
 import numpy as np #; np.show_config()
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 
-from fiberprop.threading_control import physical_cpu_count, temporary_thread_limits
+from pathlib import Path
+STYLE_PATH = Path(__file__).with_name("styles") / "mcf.mplstyle"
+plt.style.use(str(STYLE_PATH))
+
+MM = 1/25.4
+COL1, COL15, COL2 = 89*MM, 136*MM, 183*MM   # Nature: 1, 1.5, 2 колонки
 
 
 def mackey_glass(t_size, tau=17.0, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0):
@@ -507,7 +517,7 @@ def mcf_nn_reservoir_computing(
 
         if display_debug_plots:
             plot2D_plotly(
-                omega_stream,
+                np.fft.fftshift(omega_stream),
                 np.abs(np.fft.fftshift(np.fft.fft(data_out_stream[central_core_ind]))) ** 2,
                 names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
                 x_axis_label=r'$\omega, \text{rad/ps}$',
@@ -527,7 +537,24 @@ def mcf_nn_reservoir_computing(
             "beta1": float(beta1),
             "beta2": 0.0,
             "beta1_air": float(beta1_air),
-            "feedback_length_m": feedback_length_m,
+            "feedback_length_m": float(feedback_length_m),
+            "feedback_loop_propagation_time_ps": float(feedback_loop_propagation_time),
+            "fiber_propagation_time_ps": float(fiber_propagation_time),
+            # характерные длины и масштабы:
+            "L_D": float(L_D), "L_NL": float(L_NL),
+            "L_coupling": float(L_coupling), "L_gain": float(L_gain),
+            "time_scale_ps": float(time_scale),
+            "length_scale_m": float(length_scale),
+            "fiber_length_dimensionless": float(fiber_length_dimensionless),
+            "n_z": int(n_z),
+            # расчётные настройки окна:
+            "window_size": int(window_size),
+            "upsampling": int(upsampling),
+            "step_number_per_dimensionless_distance": int(step_number_per_dimensionless_distance),
+            # итерационная информация (стриминг по окнам):
+            "iteration_count": int(n_batches),
+            "offset_size": 0,
+            "offset_part": 0.0,
         }
         return {
             "data_out": data_out_stream,
@@ -677,7 +704,7 @@ def mcf_nn_reservoir_computing(
 
         if display_debug_plots:
             plot2D_plotly(
-                omega_stream,
+                np.fft.fftshift(omega_stream),
                 np.abs(np.fft.fftshift(np.fft.fft(solver.numerical_solution[-1][central_core_ind]))) ** 2,
                 names=[rf"$|U_{central_core_ind}(z=L,\omega)|^2$"],
                 x_axis_label=r'$\omega, \text{rad/ps}$',
@@ -701,7 +728,24 @@ def mcf_nn_reservoir_computing(
                 "beta1": float(beta1),
                 "beta2": float(beta2),
                 "beta1_air": float(beta1_air),
-                "feedback_length_m": feedback_length_m,
+                "feedback_length_m": float(feedback_length_m),
+                "feedback_loop_propagation_time_ps": float(feedback_loop_propagation_time),
+                "fiber_propagation_time_ps": float(fiber_propagation_time),
+                # характерные длины и масштабы:
+                "L_D": float(L_D), "L_NL": float(L_NL),
+                "L_coupling": float(L_coupling), "L_gain": float(L_gain),
+                "time_scale_ps": float(time_scale),
+                "length_scale_m": float(length_scale),
+                "fiber_length_dimensionless": float(fiber_length_dimensionless),
+                "n_z": int(n_z),
+                # расчётные настройки окна:
+                "window_size": int(window_size),
+                "upsampling": int(upsampling),
+                "step_number_per_dimensionless_distance": int(step_number_per_dimensionless_distance),
+                # итерационная информация (оконная итерация по задержке):
+                "iteration_count": int(iteration_count + 1),  # с учётом финальной
+                "offset_size": int(offset_size),
+                "offset_part": float(offset_part),
             },
         }
 
@@ -820,7 +864,7 @@ from typing import Dict, Any, Tuple, Literal, Optional
 # Утилиты, метрики, кэш
 # =========================
 
-CACHE_DIR = Path("./mcf_rc_cache")
+CACHE_DIR = Path("mcf_rc_cache")
 
 
 def json_dumps_compact(obj):
@@ -885,13 +929,58 @@ def nrmse(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
     return rmse / s
 
 
-def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: bool = True) -> np.ndarray:
+def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: bool = True):
     if add_bias:
         Xb = np.hstack([X, np.ones((X.shape[0], 1))])
     else:
         Xb = X
-    I = np.eye(Xb.shape[1])
-    return np.linalg.solve(Xb.T @ Xb + alpha * I, Xb.T @ y)
+
+    # Убедимся, что используем float64
+    Xb = Xb.astype(np.float64)
+    y = y.astype(np.float64)
+
+    # Вычисляем матрицу системы
+    A = Xb.T @ Xb
+    n_features = A.shape[0]
+
+    # Добавляем регуляризацию
+    A_reg = A + alpha * np.eye(n_features)
+
+    # Вычисляем число обусловленности
+    cond_number = np.linalg.cond(A_reg)
+    print(f"Alpha: {alpha}, Condition number: {cond_number}")
+
+    # Если число обусловленности слишком высокое, увеличиваем alpha
+    if cond_number > 1e15:
+        print("Condition number too high, increasing alpha...")
+        # Находим оптимальное alpha через итерации
+        for new_alpha in [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]:
+            A_reg_new = A + new_alpha * np.eye(n_features)
+            new_cond = np.linalg.cond(A_reg_new)
+            print(f"Trying alpha={new_alpha}, condition={new_cond}")
+            if new_cond < 1e15:
+                alpha = new_alpha
+                A_reg = A_reg_new
+                print(f"Using alpha={alpha}")
+                break
+
+    # Используем псевдообратную матрицу для устойчивого решения
+    try:
+        # Пробуем решить систему
+        W = np.linalg.solve(A_reg, Xb.T @ y)
+    except np.linalg.LinAlgError:
+        # Если не получается, используем SVD-решение
+        print("Using SVD solution due to numerical issues")
+        U, s, Vt = np.linalg.svd(A_reg, full_matrices=False)
+        # Отсекаем очень малые сингулярные значения
+        s_inv = np.zeros_like(s)
+        threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
+        for i in range(len(s)):
+            if s[i] > threshold:
+                s_inv[i] = 1.0 / s[i]
+        W = Vt.T @ np.diag(s_inv) @ U.T @ Xb.T @ y
+
+    return W, alpha
 
 
 def apply_readout(X: np.ndarray, W: np.ndarray, add_bias: bool = True) -> np.ndarray:
@@ -975,6 +1064,7 @@ class ReservoirConfig:
     num_threads: int | str | None = "default"
     display_debug_info: bool = False
     display_debug_plots: bool = False
+    save_figs: bool = False
     save_gif: bool = False
     delay_factor_in_symbols: int | None = None  # число символов в петле обратной связи
     delay_additional_in_mask_steps: int = 0  # дополнительный фазовый сдвиг в шагах маски в петле обратной связи (0..mask_size-1); для spatial_only эффекта не даст
@@ -1031,18 +1121,18 @@ def _plot_temporal_masks(ax, masks: np.ndarray, mask_kind: str):
     C, M = masks.shape
     im = ax.imshow(masks, aspect="auto", interpolation="nearest",
                    extent=[0, M, C, 0], cmap="coolwarm")
-    ax.set_title(f"Временные маски (mask_size={M}, kind='{mask_kind}')", loc="left")
-    ax.set_xlabel("индекс маски (внутри символа)")
-    ax.set_ylabel("ядро")
+    ax.set_title(f"Temporal masks (size={M})", loc="left")
+    ax.set_xlabel("mask element index")
+    ax.set_ylabel("core index")
     return im
 
-def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Пространственные веса на ядрах"):
+def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Spatial weights by cores"):
     """Bar-чарт по ядрам."""
     C = weights.shape[0]
     ax.bar(np.arange(C), weights, width=0.7)
     ax.set_title(title, loc="left")
-    ax.set_xlabel("ядро")
-    ax.set_ylabel("вес")
+    ax.set_xlabel("core index")
+    ax.set_ylabel("weight")
 
 def _reconstruct_masks_or_weights(core_count: int,
                                   variant: str,
@@ -1051,8 +1141,8 @@ def _reconstruct_masks_or_weights(core_count: int,
                                   seed: int | None) -> dict:
     """
     Возвращает один из словарей:
-      • {'type':'temporal','masks': (C,M), 'weights': (C,)}
-      • {'type':'spatial','weights': (C,)}
+      • {'type':'temporal', 'masks': (C,M)}        — для temporal_* (без каких-либо 'weights')
+      • {'type':'spatial',  'weights': (C,)}       — для spatial_only
     """
     rng = np.random.default_rng(seed)
 
@@ -1060,22 +1150,53 @@ def _reconstruct_masks_or_weights(core_count: int,
         masks = np.empty((core_count, mask_size), dtype=float)
         for c in range(core_count):
             masks[c] = create_mask(mask_size, rng, kind=mask_kind)
-        # «пространственное резюме»: эффективный вес каждого ядра
-        weights = np.mean(np.abs(masks), axis=1)
-        return {"type": "temporal", "masks": masks, "weights": weights}
+        # НИКАКИХ spatial weights для temporal-режимов
+        return {"type": "temporal", "masks": masks}
 
     if variant == "temporal_same_all_cores":
         mask = create_mask(mask_size, rng, kind=mask_kind)
         masks = np.tile(mask, (core_count, 1))
-        weights = np.mean(np.abs(masks), axis=1)
-        return {"type": "temporal", "masks": masks, "weights": weights}
+        # НИКАКИХ spatial weights для temporal-режимов
+        return {"type": "temporal", "masks": masks}
 
     if variant == "spatial_only":
-        # В spatial_only мы подавали постоянные веса на ядра (у тебя — uniform)
+        # В spatial_only подаём постоянные веса на ядра
         weights = rng.uniform(-1.0, 1.0, size=core_count)
         return {"type": "spatial", "weights": weights}
 
     raise ValueError(f"Unknown variant: {variant}")
+
+
+def _default_fig_path(basename: str) -> Path:
+    fmt = str(plt.rcParams.get("savefig.format", "png")).lower()
+    out_dir = Path(__file__).parent  # сохраняем рядом со скриптом
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / f"{basename}.{fmt}"
+    if p.exists():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        p = out_dir / f"{basename}_{ts}.{fmt}"
+    return p
+
+def _maybe_savefig(fig,
+                   basename: str,
+                   explicit_path: Optional[Union[str, Path]] = None,
+                   enabled: Optional[bool] = None) -> Optional[Path]:
+    """
+    explicit_path задан → сохраняем туда (игнорируем enabled).
+    explicit_path не задан → сохраняем в <папка скрипта>/<basename>.<fmt>, только если enabled=True.
+    Параметры сохранения полностью из rcParams (формат, dpi, bbox, прозрачность и т.д.).
+    """
+    try:
+        if explicit_path is not None:
+            fig.savefig(explicit_path)
+            return Path(explicit_path)
+        if enabled:
+            p = _default_fig_path(basename)
+            fig.savefig(p)
+            return p
+    except Exception as e:
+        print(f"[warn] savefig failed: {e}")
+    return None
 
 
 def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
@@ -1083,7 +1204,8 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     Рисует:
       1) Полный ряд MG (нормированный так же, как используется в расчёте),
          с пометками: warmup, shift, washout, train/val/test.
-      2) Маски (по времени) для каждого ядра или пространственные веса (bar).
+      2) Маски (по времени) для каждого ядра ИЛИ пространственные веса (bar),
+         в зависимости от варианта.
     """
     # --- восстановим полный MG, чтобы показать warmup слева
     warmup = cfg.mg.warmup
@@ -1136,69 +1258,184 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     i_te_R = i_te_L + (N_eff - n_train - n_val)
 
     # --- рисуем
-    fig = plt.figure(figsize=(12, 7))
+    fig = plt.figure(figsize=(COL2, COL2*0.62))  # соотношение ~3:2
     gs = fig.add_gridspec(2, 1, height_ratios=[2.2, 1.6], hspace=0.35)
 
     # (1) полный MG с разметкой
     ax1 = fig.add_subplot(gs[0, 0])
     t_full = np.arange(x_full_norm.shape[0])
-    ax1.plot(t_full, x_full_norm, lw=1.0, label="MG (норм.)")
+    ax1.plot(t_full, x_full_norm, label="Mackey-Glass")
     ax1.set_xlim(t_full[0], t_full[-1])  # жёстко фиксируем границы
     ax1.margins(x=0.0)  # убираем автополя по X
 
-    def span(a, b, color, label, alpha=0.18):
-        ax1.axvspan(a, b, color=color, alpha=alpha, label=label)
+    def span_if(a, b, color, label, alpha=0.18):
+        """Добавить заливку, только если пересекается с видимым диапазоном и длина ≥ 2."""
+        a, b = int(a), int(b)
+        if b - a < 2:
+            return False
+        a_plot = max(a, 0)
+        b_plot = min(b, int(t_full[-1]) + 1)
+        if b_plot - a_plot < 2:
+            return False
+        ax1.axvspan(a_plot, b_plot, color=color, alpha=alpha, label=label)
+        return True
 
-    span(i_warmup_L, i_warmup_R, "#888888", "warmup (отброшено)")
-    span(i_shift_L,  i_shift_R,  "#1f77b4", "target shift")
-    span(i_wash_L,   i_wash_R,   "#ff7f0e", "washout")
-    span(i_tr_L,     i_tr_R,     "#2ca02c", "train")
-    span(i_va_L,     i_va_R,     "#9467bd", "val")
-    span(i_te_L,     i_te_R,     "#d62728", "test")
+    shown = []
+    if span_if(i_warmup_L, i_warmup_R, "#888888", "warmup"):          shown.append("warmup")
+    if span_if(i_shift_L,  i_shift_R,  "#1f77b4", "target shift"):    shown.append("target shift")
+    if span_if(i_wash_L,   i_wash_R,   "#ff7f0e", "washout"):         shown.append("washout")
+    if span_if(i_tr_L,     i_tr_R,     "#2ca02c", "train"):           shown.append("train")
+    if span_if(i_va_L,     i_va_R,     "#9467bd", "val"):             shown.append("val")
+    if span_if(i_te_L,     i_te_R,     "#d62728", "test"):            shown.append("test")
 
-    ax1.set_title("Ряд Маккея–Гласса: warmup/shift/washout/train/val/test", loc="left")
-    ax1.set_xlabel("индекс по времени")
-    ax1.set_ylabel("норм. амплитуда")
-    # Уберём дубликаты в легенде
+    ax1.set_title("Mackey-Glass series: warmup/shift/washout/train/val/test", loc="left")
+    ax1.set_xlabel("symbol index")
+    ax1.set_ylabel("normalized amplitude")
+
+    # Легенда: только из реально добавленных элементов
     handles, labels = ax1.get_legend_handles_labels()
-    uniq = dict(zip(labels, handles))
-    ax1.legend(uniq.values(), uniq.keys(), ncols=3, fontsize=9)
+    if handles:
+        uniq = dict(zip(labels, handles))
+        leg = ax1.legend(uniq.values(), uniq.keys(),
+                         ncols=3,
+                         bbox_to_anchor=(0.98, 0.98),
+                         frameon=True)
+        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
-    # (2) маски / пространственные веса
+    # (2) маски / пространственные веса — БЕЗ лишних расчётов для temporal_*
     masks_info = _reconstruct_masks_or_weights(core_count=cfg.core_count,
                                                variant=cfg.variant,
                                                mask_size=cfg.mask.mask_size,
                                                mask_kind=cfg.mask.mask_kind,
                                                seed=cfg.mask.seed)
 
-    # --- нижний блок: один или два подграфика (heatmap + bar)
     if masks_info["type"] == "temporal":
-        # два подграфика внизу: слева heatmap масок, справа бар-чарт «весов»
-        gs_bottom = gs[1, 0].subgridspec(1, 2, wspace=0.25, width_ratios=[3, 2])
-        ax2 = fig.add_subplot(gs_bottom[0, 0])
-        ax3 = fig.add_subplot(gs_bottom[0, 1])
-
+        # только heatmap масок
+        ax2 = fig.add_subplot(gs[1, 0])
         im = _plot_temporal_masks(ax2, masks_info["masks"], cfg.mask.mask_kind)
         cbar = fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
-        cbar.set_label("величина маски")
-
-        _plot_spatial_weights(ax3, masks_info["weights"], title="Эфф. веса по ядрам (⟨|mask|⟩)")
+        cbar.set_label("mask value")
     else:
-        # только пространственные веса
+        # только пространственные веса (spatial_only)
         ax2 = fig.add_subplot(gs[1, 0])
-        _plot_spatial_weights(ax2, masks_info["weights"], title="Пространственные веса на ядрах (без временной маски)")
+        _plot_spatial_weights(ax2, masks_info["weights"], title="Spatial weights by cores")
 
+    _maybe_savefig(fig, f"input_overview_{cfg.variant}_C{cfg.core_count}",
+                   enabled=getattr(cfg.reservoir, "save_figs", False))
     plt.show()
 
 
-def debug_plot_post_training_comparison(y_true: np.ndarray,
-                                        y_pred: np.ndarray,
-                                        title: str = "Сравнение: истина vs прогноз (test)",
-                                        n_show: int = 2000,
-                                        start: int = 0,
-                                        save_path: str | None = None) -> float:
+def debug_plot_mg_attractor(cfg, mg_series_used: np.ndarray,
+                            title: str = "Mackey-Glass attractor (delay embedding)"):
     """
-    Рисует сравнение на тесте и возвращает NRMSE. Делает ранний выход для пустых данных без ворнингов.
+    3D-визуализация аттрактора Mackey–Glass по delay-embedding: (x(t), x(t-τ), x(t-2τ)).
+    Сегменты shift/washout/train/val/test подсвечиваются цветами проекта и
+    автоматически скрываются, если не входят в выборку или их длина < 2.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (для регистрации 3D-проекции)
+
+    x1d = np.asarray(mg_series_used, dtype=float).reshape(-1)
+    S = x1d.shape[0]
+    if S < 3:
+        print("debug_plot_mg_attractor: слишком короткая серия — нечего рисовать.")
+        return
+
+    # --- задержка в ОТСЧЁТАХ: τ_samples = round(τ / dt)
+    tau_samples = int(round(float(cfg.mg.tau) / float(cfg.mg.dt)))
+    tau_samples = max(1, tau_samples)
+    off = 2 * tau_samples
+    if S <= off + 1:
+        print(f"debug_plot_mg_attractor: серия короче 2τ (S={S}, 2τ={off}) — пропуск.")
+        return
+
+    # --- координаты delay-вложений (выровненные по времени t=2τ..S-1)
+    X = x1d[off:]                # x(t)
+    Y = x1d[tau_samples:-tau_samples]  # x(t-τ)
+    Z = x1d[:-off]               # x(t-2τ)
+    L = X.shape[0]               # одинаковая длина
+
+    # --- восстановим границы сегментов в ИНДЕКСАХ mg_series_used (0..S)
+    shift_syms = int(getattr(cfg.training, "target_shift", 0))
+    if cfg.training.washout is None:
+        w_samples = auto_washout_samples(cfg.reservoir, eps=1e-3, min_loops=1, max_loops=3)
+    else:
+        w_samples = int(cfg.training.washout)
+    M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
+    w_syms = int(np.ceil(w_samples / max(1, M_eff)))
+
+    N_eff = S - shift_syms - w_syms
+    n_train = int(N_eff * cfg.training.train_frac) if N_eff > 0 else 0
+    n_val   = int(N_eff * cfg.training.val_frac) if N_eff > 0 else 0
+    n_test  = max(0, N_eff - n_train - n_val)
+
+    i_shift = (0, max(0, shift_syms))
+    i_wash  = (i_shift[1], i_shift[1] + max(0, w_syms))
+    i_tr    = (i_wash[1],  i_wash[1]  + max(0, n_train))
+    i_va    = (i_tr[1],    i_tr[1]    + max(0, n_val))
+    i_te    = (i_va[1],    min(S, i_va[1] + max(0, n_test)))
+
+    segments = [
+        ("target shift", "#1f77b4", i_shift),
+        ("washout",      "#ff7f0e", i_wash),
+        ("train",        "#2ca02c", i_tr),
+        ("val",          "#9467bd", i_va),
+        ("test",         "#d62728", i_te),
+    ]
+
+    # --- рисуем
+    fig = plt.figure(figsize=(COL2*0.62, COL2*0.62))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.view_init(elev=20, azim=-15)
+    ax.set_title(title, loc="left")
+    ax.set_xlabel("x(t)", labelpad=2)
+    ax.set_ylabel("x(t - τ)", labelpad=2)
+    ax.set_zlabel("x(t - 2τ)", labelpad=2)
+
+    # helper: добавить линию сегмента, учитывая, что (X,Y,Z) начинаются с t=2τ
+    def plot_segment(name, color, bounds, min_len: int = 2):
+        a, b = int(bounds[0]), int(bounds[1])
+        aa, bb = max(a, off), min(b, S)
+        if bb - aa >= min_len:
+            lo = max(0, min(aa - off, L))
+            hi = max(0, min(bb - off, L))
+            if hi - lo >= min_len:
+                ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
+                return True
+        return False
+
+    for name, color, bounds in segments:
+        plot_segment(name, color, bounds)
+
+    # Легенда (только если есть что показывать) — полупрозрачный фон у границы
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        uniq = dict(zip(labels, handles))
+        leg = ax.legend(uniq.values(), uniq.keys(),
+                        bbox_to_anchor=(0.02, 0.98),
+                        frameon=True, title="Segments:")
+        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
+
+    plt.tight_layout()
+
+    _maybe_savefig(fig, f"mg_attractor_{cfg.variant}_C{cfg.core_count}",
+                   enabled=getattr(cfg.reservoir, "save_figs", False))
+    plt.show()
+
+
+def debug_plot_post_training_comparison(cfg,
+                                        y_true: np.ndarray,
+                                        y_pred: np.ndarray,
+                                        title: str = "Comparison: truth vs prediction",
+                                        n_show: int = 2000,
+                                        start: int = 0) -> float:
+    """
+    Рисует сравнение на тесте и возвращает NRMSE по видимому окну.
+    Устойчиво работает при коротких окнах: если точек < 2, вместо линии рисуется маркер,
+    легенда и NRMSE подавляются, а set_xlim не вызывается (чтобы не ловить warning).
     """
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
@@ -1209,51 +1446,75 @@ def debug_plot_post_training_comparison(y_true: np.ndarray,
         return float('nan')
 
     # окно отображения
-    start = max(0, min(start, N - 1))
-    end = min(start + n_show, N)
+    start = max(0, min(int(start), N - 1))
+    end = min(start + int(n_show), N)
     x = np.arange(start, end)
+    Lvis = int(end - start)
 
-    # NRMSE на видимом отрезке
-    denom = float(np.std(y_true[start:end])) + 1e-12
-    err = float(np.sqrt(np.mean((y_true[start:end] - y_pred[start:end]) ** 2)) / denom)
+    # <<< НОВОЕ: если окно < 2, но данных >= 2 — показываем хвост из 2 точек >>>
+    if Lvis < 2 and N >= 2:
+        start, end = max(0, N - 2), N
+        x = np.arange(start, end)
+        Lvis = end - start
 
-    fig, ax = plt.subplots(figsize=(12, 4), constrained_layout=True)
-    ax.plot(x, y_true[start:end], lw=1.0, label="истина")
-    ax.plot(x, y_pred[start:end], lw=1.0, label="прогноз")
-    ax.set_title(f"{title}   •   NRMSE={err:.4f}", loc="left")
-    ax.set_xlabel("индекс по времени (тест)")
-    ax.set_ylabel("значение")
-    ax.legend(loc="upper right", frameon=False)
-    ax.set_xlim(x[0], x[-1])
+    # NRMSE только если точек >= 2 и std > 0
+    if Lvis >= 2:
+        denom = float(np.std(y_true[start:end]))
+        err = (np.sqrt(np.mean((y_true[start:end] - y_pred[start:end]) ** 2)) /
+               (denom + 1e-12)) if denom > 0.0 else float('nan')
+    else:
+        err = float('nan')
+
+    fig, ax = plt.subplots(figsize=(COL2, COL2*0.33), constrained_layout=True)
+
+    if Lvis >= 2:
+        ax.plot(x, y_true[start:end], label="ground truth")
+        ax.plot(x, y_pred[start:end], label="prediction")
+        ax.set_xlim(x[0], x[-1])  # безопасно только при >= 2 точках
+    else:
+        # одна точка — аккуратные маркеры, без легенды
+        ax.plot(x, y_true[start:end], ls="none", marker="o", ms=3)
+        ax.plot(x, y_pred[start:end], ls="none", marker="o", ms=3)
+
+    ax.set_title(
+        f"{title}" + (f"   •   NRMSE={err:.4f}" if np.isfinite(err) else "   •   NRMSE=—"),
+        loc="left"
+    )
+    ax.set_xlabel("symbol index")
+    ax.set_ylabel("MG series value")
     ax.margins(x=0.0)
 
-    if save_path is not None:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
-    else:
-        plt.show()
+    # Легенда — только если были линии
+    if Lvis >= 2:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(loc="upper right", bbox_to_anchor=(0.98, 0.98), frameon=True)
+            leg.get_frame().set_facecolor((1, 1, 1, 0.6))  # полупрозрачный фон
+            leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
+
+    _maybe_savefig(fig, f"readout_train_val_test_{cfg.variant}_C{cfg.core_count}",
+                   enabled=getattr(cfg.reservoir, "save_figs", False))
+    plt.show()
 
     return err
 
 
 def debug_plot_readout_train_val_test(res: dict,
-                                      title: str = "MCF-RC: обученный рид-аут на train/val/test",
-                                      save_path: str | None = None) -> dict:
+                                      title: str = "Mackey-Glass series: prediction") -> dict:
     """
-    Рисует подряд train→val→test: истина и прогноз обученного рид-аута.
-    Цветовые зоны: train=#2ca02c, val=#9467bd, test=#d62728 (как в overview-графике).
-
-    Возвращает словарь с NRMSE по каждому сегменту.
+    Склейка train→val→test: истина и прогноз. Каждая зона и подпись добавляется
+    только если длина сегмента ≥ 2. Метрики для сегментов короче 2 точек → NaN.
+    Легенда с полупрозрачным фоном у кромки.
     """
-    # --- извлекаем данные
+    # --- извлечение (оставляем вашу схему имён) ---
     W = res["W_out"]
     Xtr, ytr = res["X_train"], res["y_train"].reshape(-1, 1)
     Xva, yva = res["X_val"],   res["y_val"].reshape(-1, 1)
     Xte, yte = res["X_test"],  res["y_test"].reshape(-1, 1)
 
-    # предсказания (если где-то уже лежат — всё равно пересчёт дёшевый)
+    # предсказания
     ytr_hat = apply_readout(Xtr, W)
-    yva_hat = apply_readout(Xva, W)
+    yva_hat = apply_readout(Xva, W) if Xva.size else np.zeros_like(yva)
     yte_hat = apply_readout(Xte, W)
 
     # склейка
@@ -1265,47 +1526,70 @@ def debug_plot_readout_train_val_test(res: dict,
     b_va = (n_tr, n_tr + n_va)
     b_te = (n_tr + n_va, n_tr + n_va + n_te)
 
-    # метрики
+    # безопасный NRMSE: только если длина ≥ 2 и std > 0
+    def _nrmse_safe(y, yhat):
+        y = np.asarray(y).ravel(); yhat = np.asarray(yhat).ravel()
+        if y.size < 2 or yhat.size < 2:
+            return float('nan')
+        s = float(np.std(y))
+        if s == 0.0:
+            return float('nan')
+        return float(np.sqrt(np.mean((yhat - y) ** 2)) / (s + 1e-12))
+
     m = {
-        "nrmse_train": nrmse(ytr.ravel(), ytr_hat.ravel()),
-        "nrmse_val":   nrmse(yva.ravel(), yva_hat.ravel()),
-        "nrmse_test":  nrmse(yte.ravel(), yte_hat.ravel()),
+        "nrmse_train": _nrmse_safe(ytr, ytr_hat),
+        "nrmse_val":   _nrmse_safe(yva, yva_hat),
+        "nrmse_test":  _nrmse_safe(yte, yte_hat),
     }
 
-    # --- рисуем
-    fig, ax = plt.subplots(figsize=(12, 4), constrained_layout=True)
+    # --- рисуем ---
+    fig, ax = plt.subplots(figsize=(COL2, COL2*0.33), constrained_layout=True)
     x = np.arange(y_true.shape[0])
-    ax.plot(x, y_true, lw=1.0, label="истина")
-    ax.plot(x, y_pred, lw=1.0, label="прогноз")
 
-    # зоны теми же цветами, что в overview:
-    def span(lo, hi, color, label):
-        ax.axvspan(lo, hi, color=color, alpha=0.18, label=label)
+    ax.plot(x, y_true, label="ground truth")
+    ax.plot(x, y_pred, label="prediction")
 
-    span(*b_tr, "#2ca02c", f"train  (NRMSE={m['nrmse_train']:.4f})")
-    if n_va > 0:
-        span(*b_va, "#9467bd", f"val    (NRMSE={m['nrmse_val']:.4f})")
-    span(*b_te, "#d62728", f"test   (NRMSE={m['nrmse_test']:.4f})")
+    # зоны (рисуем и подписываем только если длина ≥ 2)
+    def span_if(bounds, color, label):
+        lo, hi = int(bounds[0]), int(bounds[1])
+        if hi - lo >= 2:
+            ax.axvspan(lo, hi, color=color, alpha=0.18, label=label)
+            return True
+        return False
 
-    # разделители
-    ax.axvline(b_tr[1], color="k", lw=0.6, alpha=0.6)
-    if n_va > 0:
-        ax.axvline(b_va[1], color="k", lw=0.6, alpha=0.6)
+    shown_any = False
+    if span_if(b_tr, "#2ca02c", f"train  (NRMSE={m['nrmse_train']:.4f})") and np.isfinite(m["nrmse_train"]):
+        shown_any = True
+    if n_va >= 2 and np.isfinite(m["nrmse_val"]):
+        shown_any |= span_if(b_va, "#9467bd", f"val    (NRMSE={m['nrmse_val']:.4f})")
+    if n_te >= 2 and np.isfinite(m["nrmse_test"]):
+        shown_any |= span_if(b_te, "#d62728", f"test   (NRMSE={m['nrmse_test']:.4f})")
+
+    # разделители — только если есть правая граница предыдущего сегмента
+    if n_tr >= 1: ax.axvline(b_tr[1], color="k", lw=1, alpha=0.6)
+    if n_va >= 1: ax.axvline(b_va[1], color="k", lw=1, alpha=0.6)
 
     ax.set_title(title, loc="left")
-    ax.set_xlabel("индекс по времени (склейка train→val→test)")
-    ax.set_ylabel("значение")
-    # убрать дубликаты в легенде
-    handles, labels = ax.get_legend_handles_labels()
-    uniq = dict(zip(labels, handles))
-    ax.legend(uniq.values(), uniq.keys(), ncol=2, frameon=False, fontsize=9)
+    ax.set_xlabel("symbol index")
+    ax.set_ylabel("MG series value")
     ax.margins(x=0.0)
 
-    if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
-    else:
-        plt.show()
+    # легенда без дублей; только если что-то добавили
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        uniq = dict(zip(labels, handles))
+        leg = ax.legend(uniq.values(), uniq.keys(),
+                        ncol=2,
+                        # loc="upper right",
+                        bbox_to_anchor=(0.98, 0.98),
+                        frameon=True)
+        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
+
+    cfg = res.get("cfg")
+    _maybe_savefig(fig, f"readout_concat_{cfg.variant}_C{cfg.core_count}",
+                   enabled=getattr(cfg.reservoir, "save_figs", False))
+    plt.show()
 
     return m
 
@@ -1360,6 +1644,7 @@ _VOLATILE_FIELDS = {
     ("reservoir", "num_threads"),
     ("reservoir", "display_debug_info"),
     ("reservoir", "display_debug_plots"),
+    ("reservoir", "save_figs"),
     ("reservoir", "save_gif"),
     ("reservoir", "max_hours_total"),
     ("training",),
@@ -1612,7 +1897,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
         use_torch=bool(rc["use_torch"]),
         num_threads=rc["num_threads"],
         display_debug_info=bool(rc["display_debug_info"]),
-        display_debug_plots=bool(rc["display_debug_plots"]),
+        display_debug_plots=False, # bool(rc["display_debug_plots"]),
         save_gif=bool(rc["save_gif"]),
         max_hours_total=rc.get("max_hours_total", None),
         precision=rc.get("precision", None),
@@ -1821,6 +2106,119 @@ def estimate_required_t_size_fast(cfg) -> int:
     S_total = int(S_needed + washout + max(target_shift, 0))
     return S_total
 
+def learning_curve_for_result_plotly(
+    result: dict,
+    *,
+    add_bias: bool = True,
+) -> dict:
+    """
+    Строит лёрнинг-кривую (validation NRMSE vs S_train) на УЖЕ посчитанных состояниях,
+    без пересчёта физики. Ожидает в result поля:
+      - "X_train", "y_train", "X_val", "y_val".
+    Внутри:
+      • берёт сетку S_train (6 точек от ~10% до 100% train),
+      • в каждой точке подбирает alpha риджа по лог-сетке через ОДНУ SVD,
+      • возвращает список метрик + сохраняет интерактивный HTML-график (Plotly).
+
+    Возвращает:
+      {
+        "curve": [{"S_train", "alpha_best", "nrmse_train", "nrmse_val"}, ...],
+        "plot_saved_to": "<путь к .html>" | None
+      }
+    """
+
+    # ---- входные массивы ----
+    Xtr_full = result["X_train"]
+    ytr_full = result["y_train"]
+    Xva = result["X_val"]
+    yva = result["y_val"]
+
+    n_train = Xtr_full.shape[0]
+    # Сетка S_train: 6 точек от ~10% до 100% train
+    lo = max(5, n_train // 10)
+    train_sizes_syms = sorted(set(np.linspace(lo, n_train, num=100, dtype=int).tolist()))
+
+    # Сетка alpha по умолчанию
+    alphas = np.logspace(-6, 2, 41)
+
+    curve = []
+    for S in train_sizes_syms:
+        if S < 2:
+            continue
+        S_use = min(S, n_train)
+        Xtr = Xtr_full[:S_use, :]
+        ytr = ytr_full[:S_use, :]
+
+        if add_bias:
+            Xb_tr = np.hstack([Xtr, np.ones((Xtr.shape[0], 1))])
+            Xb_va = np.hstack([Xva, np.ones((Xva.shape[0], 1))])
+        else:
+            Xb_tr, Xb_va = Xtr, Xva
+
+        # --- одна SVD на весь путь по alpha ---
+        U, Svd, Vt = np.linalg.svd(Xb_tr, full_matrices=False)
+        Ut_y = U.T @ ytr
+
+        best_alpha, best_W, best_val = None, None, np.inf
+        for a in alphas:
+            shrink = Svd / (Svd * Svd + a)
+            W = (Vt.T * shrink) @ Ut_y
+            val = nrmse(yva, Xb_va @ W)
+            if val < best_val:
+                best_val, best_alpha, best_W = val, float(a), W
+        print("best_alpha =", best_alpha)
+        nrmse_tr = nrmse(ytr, Xb_tr @ best_W)
+
+        curve.append({
+            "S_train": int(S_use),
+            "alpha_best": float(best_alpha),
+            "nrmse_train": float(nrmse_tr),
+            "nrmse_val": float(best_val),
+        })
+
+    # ---- график (Plotly) ----
+    plot_saved_to = None
+    try:
+        import plotly.graph_objects as go
+
+        Ss = [d["S_train"] for d in curve]
+        vals = [d["nrmse_val"] for d in curve]
+        trs  = [d["nrmse_train"] for d in curve]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=Ss, y=vals, mode="lines+markers", name="val NRMSE"))
+        fig.add_trace(go.Scatter(x=Ss, y=trs,  mode="lines+markers", name="train NRMSE", line=dict(dash="dash")))
+        fig.update_layout(
+            title="Learning curve (validation NRMSE vs S_train)",
+            xaxis_title="Число обучающих символов S_train",
+            yaxis_title="NRMSE",
+            template="plotly_white",
+            legend=dict(x=0.02, y=0.98),
+        )
+
+        # Автогенерация имени HTML рядом с экспериментом.
+        # Пытаемся использовать несколько полей из result["params"], если есть
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = "lc"
+        try:
+            p = result.get("params", {})
+            ms = p.get("mask_size", "M")
+            df = p.get("delay_factor_in_symbols", "D")
+            up = p.get("upsampling", "U")
+            tag = f"lc_m{ms}_d{df}_u{up}"
+        except Exception:
+            pass
+        plot_saved_to = f"{tag}_{stamp}.html"
+        # fig.write_html(plot_saved_to, include_plotlyjs="cdn")
+        # Покажем интерактивно
+        fig.show()
+    except Exception as _e:
+        # не роняем эксперимент из-за графика
+        result["_learning_curve_plot_error"] = str(_e)
+
+    return {"curve": curve, "plot_saved_to": plot_saved_to}
+
+
 
 # =========================
 # Сценарии запуска
@@ -1878,7 +2276,8 @@ def run_spatial_only(base_cfg: ExperimentConfig,
 def run_single_experiment(cfg: ExperimentConfig,
                           free_run_horizon: int = 0,
                           force_rerun: bool = False,
-                          save_cache: bool =False) -> Dict[str, Any]:
+                          save_cache: bool = False,
+                          do_learning_curve: bool = False) -> Dict[str, Any]:
     """
     1) генерируем вход/ряд MG,
     2) считаем/читаем из кэша MCF,
@@ -1904,6 +2303,7 @@ def run_single_experiment(cfg: ExperimentConfig,
     # 2) рисовалка уже с заполненным window_size
     if cfg.reservoir.display_debug_plots:
         debug_plot_input_overview(cfg_with_ws, mg_series_used=mg_series)
+        debug_plot_mg_attractor(cfg_with_ws, mg_series_used=mg_series)
 
     # ключ кэша
     params_dict = _params_for_cache(cfg_with_ws.core_count, cfg_with_ws.mg, cfg_with_ws.mask,
@@ -1913,7 +2313,7 @@ def run_single_experiment(cfg: ExperimentConfig,
                                                          params_dict,
                                                          force_rerun=force_rerun,
                                                          save_cache=save_cache,
-                                                         cache_bits=32)
+                                                         cache_bits=64)
 
     # ── признаки/таргеты: ПЕРЕХОД НА СИМВОЛЫ + taps
     X_full = make_states(data_out, feature_mode=cfg.training.feature_mode)  # (T,D)
@@ -1973,7 +2373,7 @@ def run_single_experiment(cfg: ExperimentConfig,
     Xte, yte = Xw[sl_test], yw[sl_test]
 
     # обучение рид-аута
-    W = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True)
+    W, ridge_alpha = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True)
 
     # метрики
     ytr_hat = apply_readout(Xtr, W)
@@ -1983,6 +2383,7 @@ def run_single_experiment(cfg: ExperimentConfig,
         nrmse_train=nrmse(ytr, ytr_hat),
         nrmse_val=nrmse(yva, yva_hat),
         nrmse_test=nrmse(yte, yte_hat),
+        ridge_alpha=ridge_alpha,
         T_total=int(X_full.shape[0]),
         features_dim=int(Xw.shape[1]),
         taps=int(cfg.training.taps),
@@ -2007,17 +2408,51 @@ def run_single_experiment(cfg: ExperimentConfig,
         data_out=data_out,
         mg_series=mg_series,
         cache_key=cache_key,
-        y_free_run=y_free
+        y_free_run=y_free,
+        # NEW: пробрасываем физические/служебные параметры для Optuna Dashboard
+        fiber_params=params_out
     )
 
     if cfg.reservoir.display_debug_plots:
-        debug_plot_post_training_comparison(
-            y_true=result["y_test"],
-            y_pred=result["y_test_hat"],
-            title="MCF-RC: тестовая последовательность"
-        )
+        # Выбираем первую доступную пару (предпочтительно с длиной ≥2)
+        pairs = [
+            ("test", yte, yte_hat),
+            ("val", yva, yva_hat),
+            ("train", ytr, ytr_hat),
+        ]
+        chosen = next(((name, y, yhat) for name, y, yhat in pairs
+                       if y is not None and yhat is not None and min(y.shape[0], yhat.shape[0]) >= 2), None)
+        if chosen is None:
+            chosen = next(((name, y, yhat) for name, y, yhat in pairs
+                           if y is not None and yhat is not None and min(y.shape[0], yhat.shape[0]) >= 1), None)
 
-        debug_plot_readout_train_val_test(result, title="MCF-RC: обученный рид-аут на train/val/test")
+        if chosen is not None:
+            name, y_sel, yhat_sel = chosen
+            title_map = {
+                "test": "MCF-RC: test symbols",
+                "val": "MCF-RC: validation symbols",
+                "train": "MCF-RC: training symbols",
+            }
+            n = min(y_sel.shape[0], yhat_sel.shape[0])
+            debug_plot_post_training_comparison(
+                cfg_with_ws,
+                y_true=y_sel[:n].ravel(),
+                y_pred=yhat_sel[:n].ravel(),
+                title=title_map.get(name, "MCF-RC: последовательность"),
+            )
+        else:
+            print("Нет данных ни для test, ни для val, ни для train — пропускаю сравнение.")
+
+        debug_plot_readout_train_val_test(result, title="Mackey-Glass series: training and prediction")
+
+    if do_learning_curve:
+        # проверим, что нужные поля присутствуют
+        missing = [k for k in ("X_train", "y_train", "X_val", "y_val") if k not in result]
+        if missing:
+            raise KeyError(f"Для лёрнинг-кривой не хватает полей в result: {missing}")
+        lc = learning_curve_for_result_plotly(result, add_bias=True)
+        result["learning_curve"] = lc["curve"]
+        result["learning_curve_plot_path"] = lc["plot_saved_to"]
 
     return result
 
@@ -2054,8 +2489,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
     from optuna.trial import TrialState
     from optuna.exceptions import TrialPruned
-    import os
-    from datetime import datetime
 
     # --- надёжное хранилище без конфликтов SQLite (журнал рядом со скриптом) ---
     base_dir = Path(__file__).parent.resolve()
@@ -2090,10 +2523,28 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     def _round(x: float, digit=3) -> float:
         return float(round(float(x), digit))
 
+    def _flatten(prefix, obj):
+        """Плоское представление словаря для user_attrs: ('a.b', value)."""
+        import numbers
+        if obj is None:
+            yield (prefix, None); return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                newp = f"{prefix}.{k}" if prefix else str(k)
+                yield from _flatten(newp, v)
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                newp = f"{prefix}[{i}]"
+                yield from _flatten(newp, v)
+        elif isinstance(obj, (numbers.Number, str, bool)):
+            yield (prefix, obj)
+        else:
+            yield (prefix, str(obj))
+
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
             # --- 1) основные гиперпараметры резерваура и усиления
-            kappa = trial.suggest_float("kappa", 0.1, 0.99, step=1e-3)
+            kappa = _round(trial.suggest_float("kappa", 0.1, 0.99)) #, step=1e-3)
             g0 = _round(trial.suggest_float("g0", 0.01, 20.0, log=True))
             psat = _round(trial.suggest_float("psat", 0.00001, 0.1, log=True), digit=5)
             fiber_length = _round(trial.suggest_float("fiber_length", 0.2, 3, log=True))
@@ -2118,12 +2569,13 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     layer_radii_array=base_cfg.reservoir.layer_radii_array,
                     g0_array=tuple([g0] * base_cfg.core_count),
                     psat_array=tuple([psat] * base_cfg.core_count),
-                    kappa=_round(kappa),
+                    kappa=kappa,
                     use_gpu=base_cfg.reservoir.use_gpu,
                     use_torch=base_cfg.reservoir.use_torch,
                     num_threads=1,
                     display_debug_info=False,
                     display_debug_plots=False,
+                    save_figs=False,
                     save_gif=False,
                     delay_factor_in_symbols=int(delay_factor),
                     delay_additional_in_mask_steps=base_cfg.reservoir.delay_additional_in_mask_steps,
@@ -2137,7 +2589,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
             # --- 4) запуск и метрика (плохие конфиги помечаем PRUNED, чтобы НЕ шли в COMPLETE)
             try:
-                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon, force_rerun=force_rerun, save_cache=save_cache)
+                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon,
+                                            force_rerun=force_rerun, save_cache=save_cache)
             except (AssertionError, ValueError, RuntimeError) as e:
                 msg = str(e).lower()
                 if ("feedback_length" in msg and "fiber" in msg) or "invalid_config" in msg:
@@ -2161,9 +2614,28 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
             score = min(float(res["metrics"]["nrmse_val"]), 1e+1)
             if not np.isfinite(score):
-                trial.set_user_attr("skip_reason", "score =", score)
+                trial.set_user_attr("skip_reason", f"non-finite score {score}")
                 print("skip_reason", "non-finite score")
-                raise TrialPruned("skip_reason", "non-finite score")
+                raise TrialPruned("skip_reason: non-finite score")
+
+            # === МИНИ-ЛОГИРОВАНИЕ ДЛЯ DASHBOARD ===
+            # метрики + лучшая альфа
+            trial.set_user_attr("nrmse_train", float(res["metrics"]["nrmse_train"]))
+            trial.set_user_attr("nrmse_val", float(res["metrics"]["nrmse_val"]))
+            trial.set_user_attr("ridge_alpha", float(res["metrics"]["ridge_alpha"]))
+
+            # физика/характерные длины/прочее из симулятора
+            fiber_params = res.get("fiber_params", {}) or {}
+            for k, v in _flatten("fiber", fiber_params):
+                trial.set_user_attr(k, v)
+
+            # полезные управляемые параметры (для быстрых фильтров в UI)
+            trial.set_user_attr("cfg.mask.mask_size", int(cfg.mask.mask_size))
+            trial.set_user_attr("cfg.mask.gain_in", float(cfg.mask.gain_in))
+            trial.set_user_attr("cfg.reservoir.kappa", float(cfg.reservoir.kappa))
+            trial.set_user_attr("cfg.reservoir.upsampling", int(cfg.reservoir.upsampling))
+            trial.set_user_attr("cfg.reservoir.delay_factor_in_symbols",
+                                int(cfg.reservoir.delay_factor_in_symbols))
 
             nonlocal best
             if score < best["score"]:
@@ -2278,14 +2750,14 @@ if __name__ == "__main__":
 
     temporal_mask_modulation_frequency_ghz = 40  # GHz
 
-    variant = "temporal_same_all_cores"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = "temporal_unique_per_core"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
         temporal_mask_size = 121
     else:
         temporal_mask_size = 1
 
-    mg_cfg = MGConfig(t_size=2**10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
+    mg_cfg = MGConfig(t_size=2 ** 10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
     mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=17.425874971099564)
 
@@ -2293,7 +2765,7 @@ if __name__ == "__main__":
         fiber_length_m=0.6571013875307805,  # 0.1
         time_step_ps=1.0 / temporal_mask_modulation_frequency_ghz * 1e+3,
         step_number_per_dimensionless_distance=20,
-        upsampling=1,
+        upsampling=2,
         delay_factor_in_symbols=6,
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
@@ -2306,12 +2778,13 @@ if __name__ == "__main__":
         num_threads=8,
         display_debug_plots=True,
         display_debug_info=True,
+        save_figs=True,
         max_hours_total=72,
         precision='float64',
         use_dispersion=True,
     )
 
-    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-6,  # washout=100,
+    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-4,  # washout=100,
                                   target_shift=1,
                                   train_frac=0.8, val_frac=0.2)  # для одиночного запуска
 
@@ -2321,7 +2794,7 @@ if __name__ == "__main__":
 
     t_size = estimate_required_t_size_fast(base_cfg)
     print("Estimated required symbol count =", t_size)
-    mg_cfg.t_size = 2500 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
+    mg_cfg.t_size = 5000 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     # Пример: одиночный прогон с сохранением артефактов и pseudo free-run
     if variant == "spatial_only":

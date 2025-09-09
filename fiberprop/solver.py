@@ -580,8 +580,8 @@ class Solver:
             self.linear_coeffs_array = torch.zeros((self.eq.size, self.eq.size))
             self.nonlinear_cubic_coeffs_array = torch.zeros((self.eq.size, self.eq.size))
         else:
-            self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size))
-            self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size))
+            self.linear_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
+            self.nonlinear_cubic_coeffs_array = np.zeros((self.eq.size, self.eq.size), dtype=self.dtype)
 
         cm = getattr(self.eq, "coupling_matrix", None)
         if cm is not None:
@@ -729,92 +729,121 @@ class Solver:
     # ─── solver.py ─────────────────────────────────────────────
     def calculate_D_matrix(self, h: float):
         """
-        Считает оператор D(h) и кладёт в self.D.
+        Считает оператор D(h) и сохраняет в self.D.
         • Если β1=β2=0 → self.D имеет форму (n, n).
         • Если β≠0     → self.D имеет форму (n, n, M).
-        Никаких других матриц (D_half, invD_half) здесь не считаем.
+
+        PyTorch-ветка — компактная, полагается на то, что все тензоры уже на нужных dtype/device.
+        NumPy-ветка — формирует A и считает expm в float64/complex128 (устойчивость), затем при необходимости
+        приводит результат к целевому комплексному типу хранения (self._np_ctype, если есть; иначе self.ctype).
         """
         n, M = self.eq.size, self.com.M
 
-        # ─────────────────────── Torch backend ───────────────────────
+        # ───────────────────────────── PyTorch backend ─────────────────────────────
         if self.use_torch and _TORCH_AVAILABLE:
-            device, rdtype, cdtype = self.device, self.dtype, self.ctype
+            # Предполагается, что нижеуказанные уже тензоры нужного dtype/device (см. инициализацию Solver)
+            C = self.linear_coeffs_array  # (n, n), real
+            alpha = self.eq.alpha  # (n,)
+            g0 = self.eq.g_0  # (n,)
+            b1 = self.eq.beta1  # (n,)
+            b2 = self.eq.beta2  # (n,)
+            omega = self.omega  # (M,)
+            cd = self.ctype
 
-            C = torch.as_tensor(self.linear_coeffs_array, dtype=rdtype, device=device)  # (n, n)
-            alpha = torch.as_tensor(self.eq.alpha, dtype=rdtype, device=device)  # (n,)
-            g0 = torch.as_tensor(self.eq.g_0, dtype=rdtype, device=device)  # (n,)
-            b1 = torch.as_tensor(self.eq.beta1, dtype=rdtype, device=device)  # (n,)
-            b2 = torch.as_tensor(self.eq.beta2, dtype=rdtype, device=device)  # (n,)
-
-            if torch.all(b1 == 0) and torch.all(b2 == 0):
+            if (b1 == 0).all() and (b2 == 0).all():
                 # β1=β2=0 → D(h) = exp( h*i*C + diag( -h*(α+g0)/2 ) )
-                A = (h * (1j * C)).to(cdtype) + torch.diag((-(h * 0.5) * (alpha + g0)).to(cdtype))
+                A = (h * (1j * C)).to(cd)
+                A = A + torch.diag((-0.5 * h) * (alpha + g0)).to(cd)
                 self.D = torch.linalg.matrix_exp(A)  # (n, n)
                 return self.D
 
-            # β ≠ 0 → частотнозависимая матрица (n,n,M)
-            omega = torch.as_tensor(self.omega, dtype=rdtype, device=device)  # (M,)
-            base = (1j * C).to(cdtype).unsqueeze(0).expand(M, n, n)  # (M, n, n)
-            # diag_term(ω) = ( -2i b1 ω + i b2 ω² - α - g0 ) / 2
-            diag_term = (-2j * b1[None, :] * omega[:, None] + 1j * b2[None, :] * (omega[:, None] ** 2)
-                         - (alpha + g0)[None, :]) * 0.5  # (M, n)
-            A = h * (base + torch.diag_embed(diag_term.to(cdtype)))  # (M, n, n)
-            D_m = torch.linalg.matrix_exp(A)  # (M, n, n)
-            self.D = D_m.permute(1, 2, 0).contiguous()  # (n, n, M)
+            # β ≠ 0 → частотно-зависимая матрица (M, n, n)
+            base = (1j * C).to(cd).unsqueeze(0).expand(M, n, n)  # (M, n, n)
+            diag_term = (
+                                -2j * b1[None, :] * omega[:, None]
+                                + 1j * b2[None, :] * (omega[:, None] ** 2)
+                                - (alpha + g0)[None, :]
+                        ) * 0.5  # (M, n)
+            A = h * (base + torch.diag_embed(diag_term.to(cd)))  # (M, n, n)
+            Dm = torch.linalg.matrix_exp(A)  # (M, n, n)
+            self.D = Dm.permute(1, 2, 0).contiguous()  # (n, n, M)
             return self.D
 
-        # ─────────────────────── NumPy/SciPy backend ───────────────────────
-        # β=0: оператор не зависит от ω
-        if np.all(self.eq.beta1 == 0.0) and np.all(self.eq.beta2 == 0.0):
-            # create_simple_dispersion_free_matrix(...) → (n,n); внутри expm для одной матрицы
-            self.D = create_simple_dispersion_free_matrix(
-                self.linear_coeffs_array, self.eq.alpha, self.eq.g_0, h
-            )  # (n, n)
+        # ───────────────────────────── NumPy/SciPy backend ─────────────────────────────
+        # Считаем A и expm в double/complex128, затем (опционально) приводим к целевому типу хранения.
+        rd64 = np.float64
+        cd64 = np.complex128
+        cd_out = getattr(self, "_np_ctype", self.ctype)  # итоговый комплексный тип хранения
+
+        C = np.asarray(self.linear_coeffs_array, dtype=rd64)  # (n, n)
+        alpha = np.asarray(self.eq.alpha, dtype=rd64)  # (n,)
+        g0 = np.asarray(self.eq.g_0, dtype=rd64)  # (n,)
+        b1 = np.asarray(self.eq.beta1, dtype=rd64)  # (n,)
+        b2 = np.asarray(self.eq.beta2, dtype=rd64)  # (n,)
+
+        if np.all(b1 == 0.0) and np.all(b2 == 0.0):
+            # β1=β2=0 → одна матрица A в complex128
+            A = (h * (1j * C)).astype(cd64, copy=False)  # (n, n)
+            idx = np.arange(n)
+            A[idx, idx] += (-0.5 * h * (alpha + g0)).astype(cd64, copy=False)
+            D64 = expm(A)  # (n, n)
+            self.D = D64.astype(cd_out, copy=False)
             return self.D
 
-        # β≠0: строим A(ω) и считаем expm батчево
-        # create_freq_matrix(...) возвращает плоский массив (n*n, M) элементов матриц A(ω)
-        A_flat = create_freq_matrix(
-            self.linear_coeffs_array, self.eq.beta1, self.eq.beta2,
-            self.eq.alpha, self.eq.g_0, self.omega, h
-        )  # (n*n, M), complex128
+        # β ≠ 0 → батч A(ω) формы (M, n, n) в complex128, expm батчево
+        omega = np.asarray(self.omega, dtype=rd64)  # (M,)
 
-        # представление (M, n, n) для батчевой expm в SciPy
-        A_n_n_M = A_flat.reshape(n, n, M)  # (n, n, M)
-        A_M_n_n = np.moveaxis(A_n_n_M, -1, 0)  # (M, n, n)
+        base = (1j * C).astype(cd64, copy=False)  # (n, n)
+        base_M = np.broadcast_to(base, (M, n, n))  # (M, n, n)
 
-        # SciPy expm поддерживает вход (..., n, n) и возвращает ту же форму (M, n, n)
-        D_M_n_n = expm(A_M_n_n)  # (M, n, n)
+        # diag_term[m,i] = ( -2i b1[i] ω[m] + i b2[i] ω[m]^2 - α[i] - g0[i] ) / 2
+        diag_term = (
+                            -2j * (b1[None, :] * omega[:, None])
+                            + 1j * (b2[None, :] * (omega[:, None] ** 2))
+                            - (alpha[None, :] + g0[None, :])
+                    ) * 0.5  # (M, n)
+        diag_term = diag_term.astype(cd64, copy=False)
 
-        # возвращаем форму (n, n, M), принятую в остальном коде
-        self.D = np.moveaxis(D_M_n_n, 0, -1)  # (n, n, M)
+        eye_n = np.eye(n, dtype=cd64)[None, :, :]  # (1, n, n)
+        diag_M = diag_term[:, :, None] * eye_n  # (M, n, n)
+
+        A_M_n_n = h * (base_M + diag_M)  # (M, n, n), complex128
+        D_M_n_n = expm(A_M_n_n)  # (M, n, n) — батчевый expm
+        D64 = np.moveaxis(D_M_n_n, 0, -1)  # (n, n, M)
+
+        self.D = D64.astype(cd_out, copy=False)  # (n, n, M)
         return self.D
 
     def calculate_invD_half(self):
         """
         Считает только invD_half из self.D_half.
-        • Если D_half имеет форму (n,n,M) → инверсия батчево по частотам.
-        • Если (n,n) → обычная матричная инверсия.
+        • Если D_half имеет форму (n, n, M) → инверсия батчево по частотам.
+        • Если (n, n) → обычная инверсия.
+        Никаких других матриц здесь не считаем.
         """
         if self.D_half is None:
             raise RuntimeError("calculate_invD_half(): self.D_half is None — сначала посчитайте self.D_half")
 
-        # ─────────────────────── Torch backend ───────────────────────
+        # ───────────── Torch backend ─────────────
         if self.use_torch and _TORCH_AVAILABLE and torch.is_tensor(self.D_half):
-            if self.D_half.ndim == 3:  # (n,n,M) → (M,n,n) → inv → (n,n,M)
+            if self.D_half.ndim == 3:
+                # (n, n, M) → (M, n, n) → inv (батч) → (n, n, M)
                 d_m = self.D_half.permute(2, 0, 1).contiguous()
-                inv_m = torch.linalg.inv(d_m)
+                inv_m = torch.linalg.inv(d_m)  # батч инверсия
                 self.invD_half = inv_m.permute(1, 2, 0).contiguous()
-            else:  # (n,n)
+            else:
+                # (n, n)
                 self.invD_half = torch.linalg.inv(self.D_half)
             return self.invD_half
 
-        # ─────────────────────── NumPy backend ───────────────────────
-        if self.D_half.ndim == 3:  # (n,n,M) → (M,n,n) → inv → (n,n,M)
+        # ───────────── NumPy backend ─────────────
+        if self.D_half.ndim == 3:
+            # (n, n, M) → (M, n, n) → inv (батч) → (n, n, M)
             d_m = np.moveaxis(self.D_half, -1, 0)  # (M, n, n)
-            inv_m = np.linalg.inv(d_m)  # (M, n, n) — батч поддерживается
+            inv_m = np.linalg.inv(d_m)  # батч инверсия (..., M, M)
             self.invD_half = np.moveaxis(inv_m, 0, -1)  # (n, n, M)
-        else:  # (n,n)
+        else:
+            # (n, n)
             self.invD_half = np.linalg.inv(self.D_half)
 
         return self.invD_half
@@ -858,6 +887,23 @@ class Solver:
             self.g0_h_half = 0.5 * self.g0_h
             self.exp_g0h_half = np.exp(self.g0_h_half)
             self.exp_2g0h_half = np.exp(2.0 * self.g0_h_half)
+
+        if not hasattr(self, "gain_mask"):
+            if self.use_torch:
+                xp = torch
+                any_ = lambda x: bool(torch.any(x))
+                ones_like = lambda x: torch.ones_like(x, dtype=self.dtype, device=self.device)
+                zeros_like = lambda x: torch.zeros_like(x, dtype=self.dtype, device=self.device)
+            else:
+                xp = np
+                any_ = lambda x: bool(np.any(x))
+                ones_like = lambda x: np.ones_like(x, dtype=self.dtype)
+                zeros_like = lambda x: np.zeros_like(x, dtype=self.dtype)
+
+            self.gain_mask = (self.eq.g_0 != 0)  # bool shape (n,)
+            self.has_gain = any_(self.gain_mask)  # обычный bool
+            self.exp1 = ones_like(self.exp_g0h)  # shape (n,)
+            self.g0zeros = zeros_like(self.eq.g_0)  # shape (n,)
 
     def _prepare_taper(self):
         """
@@ -1021,8 +1067,8 @@ class Solver:
             if self.invD_half is None:
                 self.calculate_invD_half()
 
-        # if self.display_debug_info:
-        #     print("Time of D computing =", time.time() - t1)
+        if self.display_debug_info:
+            print("Time of D computing =", time.time() - t1)
 
         if self.com.method == "ssfm_order2_ndn_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h)

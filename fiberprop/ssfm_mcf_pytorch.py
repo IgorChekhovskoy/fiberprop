@@ -42,15 +42,30 @@ else:
         return torch.sum(torch.abs(arr_func) ** 2) * time_step
 
     # @torch.jit.script
+    def power_abs2_t(psi: Tensor) -> Tensor:
+        """|psi|^2 поэлементно, без sqrt/abs. Возвращает Tensor той же формы."""
+        return psi.real * psi.real + psi.imag * psi.imag
+
+
+    def energy_from_power_t(P: Tensor, tau: Tensor | float) -> Tensor:
+        """Интеграл энергии по времени для каждого канала: sum_t P * tau  → (n,)"""
+        return P.sum(dim=1) * (tau if torch.is_tensor(tau) else torch.tensor(tau, dtype=P.dtype, device=P.device))
+
+
     def nonlinear_step_pytorch(
-        psi: Tensor,
-        gamma_h: Tensor, g0_h: Tensor,
-        exp_g0h: Tensor, exp_2g0h: Tensor,
-        E_sat: Tensor, g0: Tensor,
-        energy_in: Tensor
+            psi: Tensor,
+            gamma_h: Tensor, g0_h: Tensor,
+            exp_g0h: Tensor, exp_2g0h: Tensor,
+            E_sat: Tensor,
+            energy_in: Tensor,
+            *,
+            P: Tensor | None = None
     ) -> None:
-        P = psi.abs() ** 2
-        no_gain = (g0 == 0)
+
+        if P is None:
+            P = power_abs2_t(psi)
+
+        no_gain = (g0_h == 0)
         if no_gain.any():
             psi[no_gain] *= torch.exp(1j * gamma_h[no_gain, None] * P[no_gain])
 
@@ -64,11 +79,11 @@ else:
             eg2 = exp_2g0h[gain].unsqueeze(1)
             gamh = gamma_h[gain].unsqueeze(1)
 
-            E = torch.sqrt((Ek**2 + 2*Ek*esat) * eg2 + esat**2) - esat
-            C = -gamh*Pk*(Ek+esat-esat*torch.log(Ek+2*esat)) / (g0h_ * Ek) + torch.angle(psi[gain])
-            Pn = Pk*eg1*torch.sqrt((Ek+2*esat)/Ek)*torch.sqrt(E/(E+2*esat))
-            phi = gamh*Pk*(E+esat-esat*torch.log(E+2*esat)) / (g0h_ * Ek) + C
-            psi[gain] = torch.sqrt(Pn) * torch.exp(1j*phi)
+            E = torch.sqrt((Ek ** 2 + 2 * Ek * esat) * eg2 + esat ** 2) - esat
+            C = -gamh * Pk * (Ek + esat - esat * torch.log(Ek + 2 * esat)) / (g0h_ * Ek) + torch.angle(psi[gain])
+            Pn = Pk * eg1 * torch.sqrt((Ek + 2 * esat) / Ek) * torch.sqrt(E / (E + 2 * esat))
+            phi = gamh * Pk * (E + esat - esat * torch.log(E + 2 * esat)) / (g0h_ * Ek) + C
+            psi[gain] = torch.sqrt(Pn) * torch.exp(1j * phi)
 
     def linear_step_pytorch(psi: Tensor, has_beta: bool, D: Tensor) -> Tensor:
         """
@@ -108,39 +123,39 @@ else:
         if not torch.is_tensor(current_E):
             current_E = torch.as_tensor(current_E, dtype=solver.dtype, device=psi.device)
 
-        if solver.gamma_h_half is None:
-            solver.prepare_halfstep_constants()
+        P = power_abs2_t(psi)
 
-        # усиление/насыщение — тензоры на нужном device/dtype
+        # энергия/P ДО первой половины NL
         if (solver.eq.g_0 != 0).any():
-            current_E[solver.eq.g_0 != 0] = (psi.abs() ** 2).sum(-1)[solver.eq.g_0 != 0] * tau
+            current_E[solver.eq.g_0 != 0] = energy_from_power_t(P, solver.tau_t)[solver.eq.g_0 != 0]
 
-        # ½·N
         nonlinear_step_pytorch(
             psi,
             solver.gamma_h_half, solver.g0_h_half,
             solver.exp_g0h_half, solver.exp_2g0h_half,
-            solver.eq.E_sat, solver.eq.g_0, current_E
+            solver.eq.E_sat, solver.eq.g_0, current_E,
+            P=P
         )
 
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # D
         psi = linear_step_pytorch(psi, solver.has_beta, solver.D)
 
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        if (solver.eq.g_0 != 0).any():
-            current_E[solver.eq.g_0 != 0] = (psi.abs() ** 2).sum(-1)[solver.eq.g_0 != 0] * tau
+        P = power_abs2_t(psi)
 
-        # ½·N
+        if (solver.eq.g_0 != 0).any():
+            current_E[solver.eq.g_0 != 0] = energy_from_power_t(P, solver.tau_t)[solver.eq.g_0 != 0]
+
         nonlinear_step_pytorch(
             psi,
             solver.gamma_h_half, solver.g0_h_half,
             solver.exp_g0h_half, solver.exp_2g0h_half,
-            solver.eq.E_sat, solver.eq.g_0, current_E
+            solver.eq.E_sat, current_E,
+            P=P
         )
 
         if damp_length:
@@ -165,41 +180,35 @@ else:
             damp_length: float = 0.0,
             noise_amplitude: float = 0.0,
     ) -> Tensor:
-        # гарантируем тензор для энергии
         if not torch.is_tensor(current_E):
             current_E = torch.as_tensor(current_E, dtype=solver.dtype, device=psi.device)
 
-        if solver.gamma_h is None:
-            solver.prepare_halfstep_constants()  # создаст gamma_h, g0_h, exp_g0h, exp_2g0h (+ _half)
-
-        # ½·D
         psi = linear_step_pytorch(psi, solver.has_beta, solver.D_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # энергия после первого D(½) — как в NumPy
+        P = power_abs2_t(psi)
+
         g0 = solver.eq.g_0
         gain = (g0 != 0)
         if gain.any():
-            current_E[gain] = (psi.abs() ** 2).sum(-1)[gain] * tau
+            current_E[gain] = energy_from_power_t(P, solver.tau_t)[gain]
 
-        # N(h) — полный нелинейный шаг
         nonlinear_step_pytorch(
             psi,
             solver.gamma_h, solver.g0_h,
             solver.exp_g0h, solver.exp_2g0h,
-            solver.eq.E_sat, g0, current_E
+            solver.eq.E_sat, current_E,
+            P=P
         )
 
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # ½·D
         psi = linear_step_pytorch(psi, solver.has_beta, solver.D_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # шум опционально
         if noise_amplitude:
             noise = noise_amplitude * (
                     (torch.rand_like(psi.real) * 2 - 1)
@@ -215,17 +224,11 @@ else:
             damp_length: float = 0.0,
             disable_progress_bar: bool = False,
     ):
-        """
-        «Короткая» DND-схема целиком на torch: ½·D → [N → D]^N → (½·D)^{-1}.
-        Используются единые поля solver без локальных алиасов.
-        Возвращает финальный psi (Tensor) на solver.device.
-        """
         psi = torch.as_tensor(solver.numerical_solution[0], dtype=solver.ctype, device=solver.device)
 
         if solver.gamma_h is None:
             solver.prepare_halfstep_constants()
 
-        # префикс: ½·D
         psi = linear_step_pytorch(psi, solver.has_beta, solver.D_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
@@ -233,23 +236,22 @@ else:
         energy_full = torch.zeros(psi.shape[0], dtype=solver.dtype, device=solver.device)
 
         for _ in trange(solver.com.N, disable=disable_progress_bar):
-            # NL на полном шаге h: энергия берётся по всему окну
-
+            P = power_abs2_t(psi)
             if (solver.eq.g_0 != 0).any():
-                energy_full[solver.eq.g_0 != 0] = (psi.abs() ** 2).sum(-1)[solver.eq.g_0 != 0] * solver.tau_t
+                energy_full[solver.eq.g_0 != 0] = energy_from_power_t(P, solver.tau_t)[solver.eq.g_0 != 0]
 
             nonlinear_step_pytorch(
                 psi,
                 solver.gamma_h, solver.g0_h,
                 solver.exp_g0h, solver.exp_2g0h,
-                solver.eq.E_sat, solver.eq.g_0, energy_full
+                solver.eq.E_sat, energy_full,
+                P=P
             )
-            # D
+
             psi = linear_step_pytorch(psi, solver.has_beta, solver.D)
             if damp_length:
                 psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # суффикс: (½·D)^{-1}
         psi = linear_step_pytorch(psi, solver.has_beta, solver.invD_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
@@ -261,19 +263,13 @@ else:
             psi: Tensor,
             gamma_h: Tensor, g0_h: Tensor,
             exp_g0h: Tensor, exp_2g0h: Tensor,
-            E_sat: Tensor, g0: Tensor,
+            E_sat: Tensor,
             tau: float, window: int,
             *, offset_left: int = 0
     ) -> None:
-        """
-        Kerr + gain in-place по кускам, c "пустыми" зонами offset.
-        Усиление действует только внутри [offset_left, M - offset_left).
-        """
+        """Оконный Kerr+gain; константы берём из solver.exp1 / solver.g0zeros; энергия и P считаются один раз."""
         C, M = psi.shape
         offset_right = M - offset_left
-
-        ones = torch.ones_like(exp_g0h)
-        g0_0 = torch.zeros_like(g0)
 
         for s in range(0, M, window):
             e = min(M, s + window)
@@ -285,18 +281,21 @@ else:
 
             if l_off:
                 sub = view[:, :l_off]
-                E_slice = (sub.abs() ** 2).sum(dim=1) * tau
-                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, ones, ones, E_sat, g0_0, E_slice)
+                Psub = power_abs2_t(sub)
+                E_slice = energy_from_power_t(Psub, tau)
+                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
 
             if core > 0:
                 sub = view[:, l_off:l_off + core]
-                E_slice = (sub.abs() ** 2).sum(dim=1) * tau
-                nonlinear_step_pytorch(sub, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, g0, E_slice)
+                Psub = power_abs2_t(sub)
+                E_slice = energy_from_power_t(Psub, tau)
+                nonlinear_step_pytorch(sub, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
 
             if r_off:
                 sub = view[:, -r_off:]
-                E_slice = (sub.abs() ** 2).sum(dim=1) * tau
-                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, ones, ones, E_sat, g0_0, E_slice)
+                Psub = power_abs2_t(sub)
+                E_slice = energy_from_power_t(Psub, tau)
+                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
 
 
     def ssfm_order2_dnd_windowed_short_pytorch(
@@ -305,15 +304,11 @@ else:
             damp_length: float = 0.0,
             disable_progress_bar: bool = False,
     ):
-        """
-        DND-схема с оконным NL-шагом, без локальных алиасов.
-        """
         psi = torch.as_tensor(solver.numerical_solution[0], dtype=solver.ctype, device=solver.device)
 
         if solver.gamma_h is None:
             solver.prepare_halfstep_constants()
 
-        # префикс: ½·D
         psi = linear_step_pytorch(psi, solver.has_beta, solver.D_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
@@ -323,17 +318,15 @@ else:
                 psi,
                 solver.gamma_h, solver.g0_h,
                 solver.exp_g0h, solver.exp_2g0h,
-                solver.eq.E_sat, solver.eq.g_0,
-                solver.com.tau, window_size,
+                solver.eq.E_sat,
+                solver.tau_t, window_size,
                 offset_left=solver.com.offset_size
             )
             psi = linear_step_pytorch(psi, solver.has_beta, solver.D)
             if damp_length:
                 psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
 
-        # суффикс: (½·D)^{-1}
         psi = linear_step_pytorch(psi, solver.has_beta, solver.invD_half)
         if damp_length:
             psi = apply_absorbing_boundary_pytorch(psi, solver=solver)
-
         return psi

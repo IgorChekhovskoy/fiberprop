@@ -1,0 +1,91 @@
+# ====== БАЗОВОЕ ОФОРМЛЕНИЕ (ориентир на журналы) ======
+# Лучше рендерить фигуру сразу под целевой размер на полосе (напр., 3.4" одна колонка в Science). :contentReference[oaicite:1]{index=1}
+# Шрифты: sans-serif; математические — в наборе DejaVu Sans (поддержка символов). :contentReference[oaicite:2]{index=2}
+font.family: sans-serif
+font.sans-serif: DejaVu Sans, Arial, Helvetica
+
+# Базовый кегль: выбирай под ФИЗИЧЕСКИЙ размер фигуры.
+# Для рисования "в финал" под 1 колонку (≈3.4") обычно хватает 8–10 pt; под 2 колонки — 9–11 pt.
+font.size: 9
+mathtext.fontset: dejavusans
+
+# Заголовки/подписи/тики — согласованные, без ручных переопределений в коде
+axes.titlesize: 10
+axes.labelsize: 9
+xtick.labelsize: 8
+ytick.labelsize: 8
+legend.fontsize: 8
+
+# ====== ЛИНИИ / ТИКИ / ОБВОДКИ ======
+# Линии ~1 pt на финальном размере — безопасно по гайдам Nature (0.25–1 pt). :contentReference[oaicite:3]{index=3}
+lines.linewidth: 1.0
+lines.markersize: 4.0
+axes.linewidth: 0.8
+patch.linewidth: 0.8
+
+# Тики внутрь, на всех сторонах — так легче считывать оси в печати
+xtick.direction: in
+ytick.direction: in
+xtick.top: True
+ytick.right: True
+xtick.major.size: 6
+ytick.major.size: 6
+xtick.major.width: 0.8
+ytick.major.width: 0.8
+xtick.minor.visible: False
+ytick.minor.visible: False
+xtick.minor.size: 3
+ytick.minor.size: 3
+xtick.minor.width: 0.6
+
+# Отступы (points) — дистанция подписи оси/тиков до области построения
+axes.labelpad: 4
+axes.titlepad: 6
+xtick.major.pad: 3
+ytick.major.pad: 3
+
+# Сетка по умолчанию выключена (журналы часто не любят "шум") — включай только когда несёт информацию
+axes.grid: False
+grid.linewidth: 0.6
+grid.linestyle: -
+grid.alpha: 0.25
+
+# Ошибки — аккуратные "шапочки"
+errorbar.capsize: 2.0
+
+# Цвета: дружелюбные к дальтоникам (вариант на основе Tableau/CB-friendly палитр)
+axes.prop_cycle: cycler('color', ['#006BA4','#FF800E','#ABABAB','#595959','#5F9ED1','#C85200','#898989','#A2C8EC','#FFBC79','#CFCFCF'])
+
+# ====== ЛЕГЕНДА ======
+legend.frameon: True
+legend.framealpha: 0.6
+legend.fancybox: True
+legend.loc: upper right
+legend.handlelength: 2.0
+legend.handletextpad: 0.8
+legend.borderaxespad: 0.6
+legend.columnspacing: 1.0
+legend.facecolor: white
+legend.edgecolor: black   # прозрачность задаёт framealpha
+
+# ====== ФИГУРЫ / ЭКСПОРТ ======
+# Для растра (PNG/TIFF) лучше 600 dpi; для линий — ≥600 часто рекомендуют журналы. :contentReference[oaicite:4]{index=4}
+figure.dpi: 110
+savefig.dpi: 600
+savefig.bbox: tight
+savefig.pad_inches: 0.01
+savefig.transparent: True   # фон прозрачный (удобно для вёрстки)
+
+# В PDF/SVG держим текст как ТЕКСТ (не кривые) — проще редактировать и соответствовать шрифтовым требованиям
+pdf.fonttype: 42            # TrueType text; увеличивает удобство редактуры (размер файла может быть больше). :contentReference[oaicite:5]{index=5}
+ps.fonttype: 42
+
+# Единообразная научная запись (1.23×10^4) через мат-текст
+axes.formatter.use_mathtext: True
+
+# ====== ИЗОБРАЖЕНИЯ / ТЕПЛОВЫЕ КАРТЫ ======
+image.cmap: viridis         # нейтральная, доступная к дальтоникам
+
+# ====== ПРОЧЕЕ ======
+# Не включаем constrained_layout глобально (часто конфликтует в IDE); при необходимости вызывай plt.tight_layout() в коде
+# figure.constrained_layout.use: False

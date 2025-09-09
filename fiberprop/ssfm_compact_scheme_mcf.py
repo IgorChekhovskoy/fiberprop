@@ -204,7 +204,7 @@ def ssfm_order2_dnd_compact_windowed(psi, current_energy, solver,
 
     nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
                             solver.exp_g0h, solver.exp_2g0h,
-                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+                            solver.eq.E_sat, tau, window_size)
 
     psi = linear_step_compact(psi, solver, h * 0.5)
 
@@ -224,7 +224,7 @@ def ssfm_order2_dnd_compact_windowed_short(solver, window_size, damp_length=0.0)
 
         nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
                                 solver.exp_g0h, solver.exp_2g0h,
-                                solver.eq.E_sat, solver.eq.g_0, solver.com.tau, window_size,
+                                solver.eq.E_sat, solver.com.tau, window_size,
                                 offset_left=solver.com.offset_size)
 
         psi = linear_step_compact(psi, solver, solver.com.h)
