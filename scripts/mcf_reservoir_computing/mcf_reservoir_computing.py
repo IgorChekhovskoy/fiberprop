@@ -954,7 +954,7 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
     if cond_number > 1e15:
         print("Condition number too high, increasing alpha...")
         # Находим оптимальное alpha через итерации
-        for new_alpha in [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]:
+        for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
             A_reg_new = A + new_alpha * np.eye(n_features)
             new_cond = np.linalg.cond(A_reg_new)
             print(f"Trying alpha={new_alpha}, condition={new_cond}")
@@ -1064,7 +1064,7 @@ class ReservoirConfig:
     num_threads: int | str | None = "default"
     display_debug_info: bool = False
     display_debug_plots: bool = False
-    save_figs: bool = False
+    save_figs: bool = False  # Сохраняем все графики. Формат задается в файле конфигурации ./styles/mcf.mplstyle
     save_gif: bool = False
     delay_factor_in_symbols: int | None = None  # число символов в петле обратной связи
     delay_additional_in_mask_steps: int = 0  # дополнительный фазовый сдвиг в шагах маски в петле обратной связи (0..mask_size-1); для spatial_only эффекта не даст
@@ -1326,38 +1326,35 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     plt.show()
 
 
-def debug_plot_mg_attractor(cfg, mg_series_used: np.ndarray,
+def debug_plot_mg_attractor(cfg,
+                            mg_series_used: np.ndarray,
                             title: str = "Mackey-Glass attractor (delay embedding)"):
     """
     3D-визуализация аттрактора Mackey–Glass по delay-embedding: (x(t), x(t-τ), x(t-2τ)).
-    Сегменты shift/washout/train/val/test подсвечиваются цветами проекта и
-    автоматически скрываются, если не входят в выборку или их длина < 2.
+    Сегменты shift/washout/train/val/test рисуются только если их длина ≥ 2.
+    График оформлен под публикации: без сетки/панелей, ortho-проекция, equal-aspect.
     """
     import numpy as np
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (для регистрации 3D-проекции)
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (регистрация 3D)
+    from matplotlib.ticker import MaxNLocator
+    import matplotlib.patheffects as pe
 
-    x1d = np.asarray(mg_series_used, dtype=float).reshape(-1)
-    S = x1d.shape[0]
-    if S < 3:
-        print("debug_plot_mg_attractor: слишком короткая серия — нечего рисовать.")
-        return
-
-    # --- задержка в ОТСЧЁТАХ: τ_samples = round(τ / dt)
-    tau_samples = int(round(float(cfg.mg.tau) / float(cfg.mg.dt)))
-    tau_samples = max(1, tau_samples)
+    x1d = np.asarray(mg_series_used, dtype=float).ravel()
+    S = x1d.size
+    tau_samples = max(1, int(round(float(cfg.mg.tau) / float(cfg.mg.dt))))
     off = 2 * tau_samples
     if S <= off + 1:
         print(f"debug_plot_mg_attractor: серия короче 2τ (S={S}, 2τ={off}) — пропуск.")
         return
 
-    # --- координаты delay-вложений (выровненные по времени t=2τ..S-1)
-    X = x1d[off:]                # x(t)
-    Y = x1d[tau_samples:-tau_samples]  # x(t-τ)
-    Z = x1d[:-off]               # x(t-2τ)
-    L = X.shape[0]               # одинаковая длина
+    # delay-вложение
+    X = x1d[off:]                         # x(t)
+    Y = x1d[tau_samples:-tau_samples]     # x(t-τ)
+    Z = x1d[:-off]                        # x(t-2τ)
+    L = X.shape[0]
 
-    # --- восстановим границы сегментов в ИНДЕКСАХ mg_series_used (0..S)
+    # границы сегментов в ИНДЕКСАХ mg_series_used (0..S)
     shift_syms = int(getattr(cfg.training, "target_shift", 0))
     if cfg.training.washout is None:
         w_samples = auto_washout_samples(cfg.reservoir, eps=1e-3, min_loops=1, max_loops=3)
@@ -1365,7 +1362,6 @@ def debug_plot_mg_attractor(cfg, mg_series_used: np.ndarray,
         w_samples = int(cfg.training.washout)
     M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
     w_syms = int(np.ceil(w_samples / max(1, M_eff)))
-
     N_eff = S - shift_syms - w_syms
     n_train = int(N_eff * cfg.training.train_frac) if N_eff > 0 else 0
     n_val   = int(N_eff * cfg.training.val_frac) if N_eff > 0 else 0
@@ -1385,16 +1381,32 @@ def debug_plot_mg_attractor(cfg, mg_series_used: np.ndarray,
         ("test",         "#d62728", i_te),
     ]
 
-    # --- рисуем
-    fig = plt.figure(figsize=(COL2*0.62, COL2*0.62))
+    # фигура
+    fig_w = globals().get("COL2", 6)  # если у тебя есть константа COL2 — используем её
+    fig = plt.figure(figsize=(fig_w*0.62, fig_w*0.62))
     ax = fig.add_subplot(111, projection="3d")
-    ax.view_init(elev=20, azim=-15)
-    ax.set_title(title, loc="left")
-    ax.set_xlabel("x(t)", labelpad=2)
-    ax.set_ylabel("x(t - τ)", labelpad=2)
-    ax.set_zlabel("x(t - 2τ)", labelpad=2)
 
-    # helper: добавить линию сегмента, учитывая, что (X,Y,Z) начинаются с t=2τ
+    # — оформление под публикации —
+    ax.set_proj_type('ortho')  # без перспективных искажений (ortho).  :contentReference[oaicite:4]{index=4}
+    # equal-aspect в 3D: подгоняем коробку под диапазоны данных.  :contentReference[oaicite:5]{index=5}
+    ax.set_box_aspect((np.ptp(X), np.ptp(Y), np.ptp(Z)))
+    ax.view_init(elev=20, azim=-15)
+    ax.grid(False)  # сетка off (чистая схема).  :contentReference[oaicite:6]{index=6}
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.fill = False            # выключить заливку «панелей»  :contentReference[oaicite:7]{index=7}
+        axis.pane.set_edgecolor((0, 0, 0, 0))  # скрыть края панелей
+
+    # компактные тики (не больше 4 по каждой оси)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_major_locator(MaxNLocator(4))
+
+    ax.set_title(title, loc="left")
+    ax.set_xlabel("x(t)")
+    ax.set_ylabel("x(t − τ)")
+    ax.set_zlabel("x(t − 2τ)")
+
+    base_lw = float(plt.rcParams.get("lines.linewidth", 1.0))
+
     def plot_segment(name, color, bounds, min_len: int = 2):
         a, b = int(bounds[0]), int(bounds[1])
         aa, bb = max(a, off), min(b, S)
@@ -1402,27 +1414,33 @@ def debug_plot_mg_attractor(cfg, mg_series_used: np.ndarray,
             lo = max(0, min(aa - off, L))
             hi = max(0, min(bb - off, L))
             if hi - lo >= min_len:
-                ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
+                (line,) = ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
+                # белое «хало» вокруг линии для читаемости на типографском фоне  :contentReference[oaicite:8]{index=8}
+                line.set_path_effects([
+                    pe.Stroke(linewidth=base_lw*1.8, foreground='white'),
+                    pe.Normal()
+                ])
                 return True
         return False
 
     for name, color, bounds in segments:
         plot_segment(name, color, bounds)
 
-    # Легенда (только если есть что показывать) — полупрозрачный фон у границы
+    # Легенда (только если есть что показывать), полупрозрачный фон
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         uniq = dict(zip(labels, handles))
         leg = ax.legend(uniq.values(), uniq.keys(),
-                        bbox_to_anchor=(0.02, 0.98),
+                        bbox_to_anchor=(0.02, 0.98), loc="upper left",
                         frameon=True, title="Segments:")
         leg.get_frame().set_facecolor((1, 1, 1, 0.6))
         leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
-    plt.tight_layout()
-
-    _maybe_savefig(fig, f"mg_attractor_{cfg.variant}_C{cfg.core_count}",
+    # единое сохранение (формат/параметры — из rcParams, как и раньше)
+    _maybe_savefig(fig,
+                   f"mg_attractor_{cfg.variant}_C{cfg.core_count}",
                    enabled=getattr(cfg.reservoir, "save_figs", False))
+
     plt.show()
 
 
