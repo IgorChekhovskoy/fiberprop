@@ -54,7 +54,7 @@ grid.alpha: 0.25
 errorbar.capsize: 2.0
 
 # Цвета: дружелюбные к дальтоникам (вариант на основе Tableau/CB-friendly палитр)
-axes.prop_cycle: cycler('color', ['#006BA4','#FF800E','#ABABAB','#595959','#5F9ED1','#C85200','#898989','#A2C8EC','#FFBC79','#CFCFCF'])
+axes.prop_cycle: cycler(color=["#006BA4","#FF800E","#ABABAB","#595959","#5F9ED1","#C85200","#898989","#A2C8EC","#FFBC79","#CFCFCF"])
 
 # ====== ЛЕГЕНДА ======
 legend.frameon: True
@@ -75,6 +75,7 @@ savefig.dpi: 600
 savefig.bbox: tight
 savefig.pad_inches: 0.01
 savefig.transparent: True   # фон прозрачный (удобно для вёрстки)
+savefig.format: pdf
 
 # В PDF/SVG держим текст как ТЕКСТ (не кривые) — проще редактировать и соответствовать шрифтовым требованиям
 pdf.fonttype: 42            # TrueType text; увеличивает удобство редактуры (размер файла может быть больше). :contentReference[oaicite:5]{index=5}

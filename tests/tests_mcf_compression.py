@@ -16,9 +16,13 @@ def test_mcf_compression_dimensionless():
 
     solver = Solver(computational_params, equation_params,
                     pulses=gaussian_pulse, pulse_params_list={"p": 0.687, "tau": 1.775},
-                    use_gpu=True, use_torch=True, display_debug_info=True)
-    
+                    use_gpu=False, use_torch=False, display_debug_info=True)
+
+    #solver.collapse_if_possible()
+
     solver.run_numerical_simulation()
+
+    #solver.restore_full_system()
 
     energies = [solver.energy[i, :] for i in range(solver.eq.size)]
     names = [f'$E_{{{i}}}$' for i in range(solver.eq.size)]
@@ -61,17 +65,16 @@ def test_mcf_compression_dimensionless():
     fiber.set_refractive_indexes_by_lambda(light.lambda0)
 
     # Расчёт коэффициентов связи
-    coup_mat, err_mat = get_coupling_coefficients(fiber, light, eps=1e-2)
+    coup_mat = get_coupling_coefficients(fiber, light, eps=1e-2)
 
     coupling_coefficient = coup_mat[0][1]
-    coupling_coefficient_estimated_error = err_mat[0][1]
 
     print(f'Lambda = {fiber.distance_to_fiber_center[0] * 2.0} мкм')
-    print(f'k = {coupling_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
+    print(f'k = {coupling_coefficient} 1/m')
     print(f'L = {0.5 * np.pi / coupling_coefficient} m \n')
 
-    gamma, gamma_error = fiber.get_gamma(light, eps=1e-2)
-    print(f'Gamma = {gamma} +- {gamma_error} 1/(W*m)')
+    gamma = fiber.get_gamma(light, eps=1e-2)
+    print(f'Gamma = {gamma} 1/(W*m)')
 
     beta2 = fiber.get_beta2(light)
     print(f'Beta2 = {beta2} (ps^2)/km')
@@ -114,7 +117,7 @@ def test_mcf_compression_dimensionless_to_dimensional():
 
     solver = Solver(computational_params, equation_params,
                     pulses=gaussian_pulse, pulse_params_list={"p": 0.687, "tau": 1.775},
-                    use_gpu=True, use_torch=True)
+                    use_gpu=False, use_torch=False)
 
     gamma = 1.3 * 1e-3  # [1/(W*m)] Для телекома
     beta2 = -20 * 1e-3  # [ps^2/m] Для телекома
@@ -261,8 +264,8 @@ def test_mcf_compression_dimensional_to_dimensionless():
 
 
 if __name__ == '__main__':
-    # test_mcf_compression_dimensionless()
+    test_mcf_compression_dimensionless()
     # test_mcf_compression_dimensionless_to_dimensional()
 
-    test_mcf_compression_dimensional()
+    # test_mcf_compression_dimensional()
     # test_mcf_compression_dimensional_to_dimensionless()

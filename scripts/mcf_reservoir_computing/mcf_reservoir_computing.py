@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from copy import deepcopy
 from datetime import datetime
 from typing import Optional, Union
 
@@ -235,10 +236,12 @@ def mcf_nn_reservoir_computing(
         num_threads: int | str | None = "default",
         display_debug_info=False,
         display_debug_plots=False,
+        save_figs=False,
         save_gif=False,
         max_hours_total: Optional[float] = None,
         precision: Optional[str] = 'float64',
         use_dispersion: bool = True,
+        disable_core0: bool = False,
 ):
     """
         Численно моделирует единичный *пробег* комплексного сигнала по
@@ -291,6 +294,8 @@ def mcf_nn_reservoir_computing(
         display_debug_plots : bool, default False
             Визуализация хода интегрирования и итоговых спектров
             средствами plotly (2D/3D).
+        save_figs  bool, default False
+            Сохранять графики
         save_gif : bool, default False
             При включённой отрисовке modulus-кадров сохраняет анимацию
             эволюции поля в GIF-файл в рабочем каталоге.
@@ -339,6 +344,15 @@ def mcf_nn_reservoir_computing(
     if window_size <= 0 or window_size > M:
         raise ValueError("window_size должен быть >= 1")
 
+    # Нейтральное отключение ядра 0: зануляем вход для core=0.
+    # Для шести активных ядер 7-ядерного волокна достаточно, чтобы канал 0 был нулём,
+    # а связи к нему и от него — отключены (см. ниже).
+    if disable_core0 and eq_size >= 1:
+        data_in_mod = np.array(data_in, copy=True)
+        data_in_mod[0, :] = 0
+    else:
+        data_in_mod = data_in
+
     core_configuration = CoreConfig.hexagonal
     light = Light(lambda0=1.55)  # µm
 
@@ -356,11 +370,24 @@ def mcf_nn_reservoir_computing(
 
     central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
 
-    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4, display_debug_plots=display_debug_plots)
+    save_scheme_path = None
+    if save_figs:
+        save_scheme_path = str(Path(__file__).parent / "fig_mcf_scheme")
+
+    coupling_matrix = get_coupling_coefficients(fiber, light, eps=2e-4,
+                                                display_debug_plots=display_debug_plots,
+                                                save_debug_plot_path=save_scheme_path)
+
     coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 1e-10
     max_val = np.max(np.abs(coupling_matrix))
     threshold = max_val * 1e-2
     coupling_matrix = np.where(np.abs(coupling_matrix) > threshold, coupling_matrix, 0)
+
+    # Жёстко отключаем связи к и от ядра 0 при его деактивации.
+    if disable_core0 and eq_size >= 1:
+        coupling_matrix = np.array(coupling_matrix, copy=True)
+        coupling_matrix[0, :] = 0
+        coupling_matrix[:, 0] = 0
 
     gamma = fiber.get_gamma(light, eps=1e-3)
     beta1 = fiber.get_beta1(light)  # [ps/m]
@@ -388,7 +415,7 @@ def mcf_nn_reservoir_computing(
         beta2_ps2_m=beta2,
         gamma_1_w_m=gamma,
         coupling_coefficient=coupling_coefficient,
-        data_in=data_in,
+        data_in=data_in_mod,
         time_step_ps=time_step_ps,
         central_core_ind=central_core_ind,
         g0_array=g0_array,
@@ -403,9 +430,16 @@ def mcf_nn_reservoir_computing(
     n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
     esat_array = np.asarray(psat_array) * window_size * time_step_ps
 
+    # При выключенной 0-й сердцевине можно обнулить её g₀ для чистоты.
+    if disable_core0 and len(g0_array) >= 1:
+        g0_array_mod = np.array(g0_array, dtype=float, copy=True)
+        g0_array_mod[0] = 0.0
+    else:
+        g0_array_mod = np.asarray(g0_array, dtype=float) if len(g0_array) else np.asarray(g0_array)
+
     if display_debug_info:
-        print("data_in.shape=", data_in.shape)
-        print("data_in size =", data_in.shape[1] * time_step_ps, "ps")
+        print("data_in.shape=", data_in_mod.shape)
+        print("data_in size =", data_in_mod.shape[1] * time_step_ps, "ps")
         print("fiber_propagation_time =", fiber_propagation_time, "ps")
         print(f'feedback_loop_propagation_time={feedback_loop_propagation_time:.1f} ps')
         print("fiber_length_dimensionless =", fiber_length_dimensionless)
@@ -430,11 +464,14 @@ def mcf_nn_reservoir_computing(
                                 ring_count=layer_count,
                                 coupling_matrix=coupling_matrix,
                                 beta1=0, beta2=0.0, gamma=gamma,
-                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
+                                E_sat=esat_array, alpha=0.0, g_0=tuple(g0_array_mod),
                                 display_debug_info=display_debug_info)
 
+        # начальные данные окна: уже с занулённой 0-й сердцевиной при необходимости
+        ic0 = data_in_mod[:, 0:window_size]
+
         solver = Solver(comp, eq,
-                        initial_condition=data_in[:, 0:window_size],
+                        initial_condition=ic0,
                         stored_steps_count=2,
                         use_dimensional=True,
                         use_gpu=use_gpu,
@@ -464,7 +501,7 @@ def mcf_nn_reservoir_computing(
             if batch_index > 0:
                 s = batch_index * window_size
                 e = min(s + window_size, M)
-                seg = data_in[:, s:e]
+                seg = data_in_mod[:, s:e]
                 if seg.shape[1] < window_size:
                     tmp = np.zeros((eq_size, window_size), dtype=dtype)
                     tmp[:, :seg.shape[1]] = seg
@@ -568,10 +605,9 @@ def mcf_nn_reservoir_computing(
         # Выбираем размер «обрезки»/добивки: теперь подгоняем длину под быстрый FFT
         # и при этом offset_part гарантированно >= 0.1.
         offset_size0, offset_part, _target_len = _fft_padding_params(M, min_fraction=0.1)
-        initial_data = np.zeros((data_in.shape[0], (M + offset_size0) * 2), dtype=dtype)
-        initial_data[:, offset_size0:M + offset_size0] = data_in
+        initial_data = np.zeros((data_in_mod.shape[0], (M + offset_size0) * 2), dtype=dtype)
+        initial_data[:, offset_size0:M + offset_size0] = data_in_mod
 
-        # upsampling
         if upsampling != 1:
             initial_data = np.repeat(initial_data, upsampling, axis=1)
 
@@ -593,7 +629,7 @@ def mcf_nn_reservoir_computing(
                                 coupling_matrix=coupling_matrix,
                                 beta1=0,
                                 beta2=beta2, gamma=gamma,
-                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
+                                E_sat=esat_array, alpha=0.0, g_0=tuple(g0_array_mod),
                                 display_debug_info=display_debug_info)
 
         solver = Solver(comp, eq,
@@ -625,6 +661,10 @@ def mcf_nn_reservoir_computing(
 
         t_stream_ps = np.arange(M_final) * time_step_ps / upsampling  # [ps]
         omega_stream = 2 * np.pi * np.fft.fftfreq(M_final, d=time_step_ps / upsampling)  # [rad/ps]
+
+        solver.collapse_if_possible()
+        if solver.is_collapsed:
+            initial_data = deepcopy(solver.numerical_solution[0])
 
         t1 = time()
 
@@ -684,7 +724,7 @@ def mcf_nn_reservoir_computing(
             #         [np.abs(solver.numerical_solution[0][central_core_ind][::step]) ** 2,
             #          np.abs(solver.numerical_solution[-1][central_core_ind][::step]) ** 2],
             #         names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
-            #         x_axis_label='t [ns]', y_axis_label='power [W]'
+            #         x_axis_label='t [ns]', y_axis_label='power [W]', yscale='log',
             #     )
 
             solver.numerical_solution[0] = initial_data + np.roll(solver.numerical_solution[-1],
@@ -702,6 +742,8 @@ def mcf_nn_reservoir_computing(
                 f"ITERATION_NOT_CONVERGED: max_nrmse_last={_last_max_nrmse:.6g} > 5e-2"
             )
 
+        solver.restore_full_system()
+
         if display_debug_plots:
             plot2D_plotly(
                 np.fft.fftshift(omega_stream),
@@ -715,14 +757,14 @@ def mcf_nn_reservoir_computing(
             plot2D_plotly(
                 t_stream_ps * 1e-3,
                 np.abs(solver.numerical_solution[-1][central_core_ind][
-                       offset_size:offset_size + data_in.shape[1] * upsampling]) ** 2,
+                       offset_size:offset_size + data_in_mod.shape[1] * upsampling]) ** 2,
                 names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
                 x_axis_label='t [ns]', y_axis_label='power [W]'
             )
 
         return {
             "data_out": (solver.numerical_solution[-1][:,
-                         offset_size:offset_size + data_in.shape[1] * upsampling:upsampling]),
+                         offset_size:offset_size + data_in_mod.shape[1] * upsampling:upsampling]),
             "params": {
                 "gamma": float(gamma),
                 "beta1": float(beta1),
@@ -750,114 +792,11 @@ def mcf_nn_reservoir_computing(
         }
 
 
-# if __name__ == '__main__':
-#
-#     layer_count = 1.1
-#     core_configuration = CoreConfig.hexagonal
-#     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
-#
-#     # layer 0 - центральная сердцевина
-#     # layer 1 - первый круг из 6 сердцевин
-#     # layer 2 - второй "круг" из 12 сердцевин, расстояние от которых до центра разное
-#     # ...
-#     layer_radii_array = np.zeros(int(layer_count) + 1)
-#     for i in range(int(layer_count) + 1):
-#         if i == 0:
-#             layer_radii_array[i] = 0 # [mkm]
-#         if i == 1:
-#             layer_radii_array[i] = 17.3 # [mkm]
-#         if i == 2:
-#             layer_radii_array[i] = 50 # [mkm]
-#
-#         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
-#
-#     g0_array = np.zeros(core_count)
-#     for i in range(core_count):
-#         g0_array[i] = 10.0 # [1/m]
-#
-#     psat_array = np.zeros(core_count)
-#     for i in range(core_count):
-#         psat_array[i] = 40 * 5e-4 # мощность насыщения [W]
-#
-#
-#     modulation_frequency_ghz = 40 # GHz
-#     mackey_glass_symbol_count = 2**9
-#     mask_size = modulation_frequency_ghz
-#
-#     time_step_ps = 1 / modulation_frequency_ghz * 1e+3 # длина по времени одного отсчета
-#     window_size = modulation_frequency_ghz * 30 # в количестве отсчетов
-#
-#     mg_params = {
-#         'tau': 17,
-#         'n': 10,
-#         'beta': 2,
-#         'gamma': 1,
-#         'initial_condition': 1.2
-#     }
-#     seed = 42
-#     data_in = mackey_glass_masked(core_count, mackey_glass_symbol_count, mask_size, seed, **mg_params) # √W
-#
-#     required_avg_power_w = 1.0  # ← задайте требуемую среднюю мощность, W
-#     current_avg_power = np.mean(np.abs(data_in) ** 2)  # ⟨|U|²⟩
-#     scale_factor = np.sqrt(required_avg_power_w / current_avg_power)
-#     data_in *= scale_factor
-#
-#     kappa = 0.9 # коэффициент обратной связи
-#
-#     t_start = time()
-#
-#     # data_out, feedback_length_m = mcf_nn_reservoir_computing_temporal_evolution(
-#     #     data_in=data_in,  # ndarray (C, M_in)
-#     #     fiber_length_m=0.1,  # физическая длина MCF, m
-#     #     time_step_ps=1/modulation_frequency_ghz*1e+3,  # шаг сетки t, ps
-#     #     kappa=kappa, # необходимо передать, так как поле добавляется непрерывно,
-#     #                         # а внутри считается производная по z
-#     #     step_number_per_dimensionless_distance=20,
-#     #     layer_count=layer_count,
-#     #     layer_radii_array=layer_radii_array,  # радиусы колец, µm
-#     #     g0_array=g0_array,
-#     #     psat_array=psat_array,
-#     #     use_gpu=False,
-#     #     display_debug_info=True,
-#     #     display_debug_plots=True,
-#     #     save_gif=False,
-#     #     upsampling = 2000
-#     # )
-#
-#     data_out, feedback_length_m = mcf_nn_reservoir_computing(
-#         data_in=data_in,  # ndarray (C, M_in)
-#         fiber_length_m=0.1,  # физическая длина MCF, m
-#         window_size=window_size,
-#         time_step_ps=time_step_ps,  # шаг сетки t, ps
-#         step_number_per_dimensionless_distance=20, # ставишь меньше 20 - проверь, что поле не улетело в космос от переусиления
-#         upsampling=2,
-#         layer_count=layer_count,
-#         layer_radii_array=layer_radii_array,  # радиусы колец, µm
-#         g0_array=g0_array,
-#         psat_array=psat_array,
-#         kappa=kappa,
-#         use_gpu=False,
-#         display_debug_info=True,
-#         display_debug_plots=True,
-#         save_gif=False
-#     )
-#
-#     print("Total elapsed time =", (time() - t_start) / 60, "min.")
-#
-#     central_core_ind = 3
-#     t = np.arange(data_in.shape[1])
-#     plot2D_plotly(t, [np.abs(data_in[central_core_ind]) ** 2,
-#                                             np.abs(data_out[central_core_ind]) ** 2],
-#                   names=[f"$|U_{central_core_ind}(z=0,t)|^2$", f"$|U_{central_core_ind}(z=L,t)|^2$"],
-#                   x_axis_label='t [ns]', y_axis_label='power [W]')
-
-
 ######################################################################
 
 import json, hashlib
 import dataclasses as _dc
 from dataclasses import dataclass, asdict
-from pathlib import Path
 from typing import Dict, Any, Tuple, Literal, Optional
 
 # =========================
@@ -939,48 +878,84 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
     Xb = Xb.astype(np.float64)
     y = y.astype(np.float64)
 
-    # Вычисляем матрицу системы
-    A = Xb.T @ Xb
-    n_features = A.shape[0]
+    # Выбираем форму решения: dual при F >> N, иначе primal
+    N, F = Xb.shape
+    use_dual = F > N
 
-    # Добавляем регуляризацию
-    A_reg = A + alpha * np.eye(n_features)
+    if not use_dual:
+        # Вычисляем матрицу системы
+        A = Xb.T @ Xb
+        n_features = A.shape[0]
 
-    # Вычисляем число обусловленности
-    cond_number = np.linalg.cond(A_reg)
-    print(f"Alpha: {alpha}, Condition number: {cond_number}")
+        # Добавляем регуляризацию
+        A_reg = A + alpha * np.eye(n_features)
 
-    # Если число обусловленности слишком высокое, увеличиваем alpha
-    if cond_number > 1e15:
-        print("Condition number too high, increasing alpha...")
-        # Находим оптимальное alpha через итерации
-        for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
-            A_reg_new = A + new_alpha * np.eye(n_features)
-            new_cond = np.linalg.cond(A_reg_new)
-            print(f"Trying alpha={new_alpha}, condition={new_cond}")
-            if new_cond < 1e15:
-                alpha = new_alpha
-                A_reg = A_reg_new
-                print(f"Using alpha={alpha}")
-                break
+        # Вычисляем число обусловленности
+        cond_number = np.linalg.cond(A_reg)
+        print(f"Alpha: {alpha}, Condition number: {cond_number}")
 
-    # Используем псевдообратную матрицу для устойчивого решения
-    try:
-        # Пробуем решить систему
-        W = np.linalg.solve(A_reg, Xb.T @ y)
-    except np.linalg.LinAlgError:
-        # Если не получается, используем SVD-решение
-        print("Using SVD solution due to numerical issues")
-        U, s, Vt = np.linalg.svd(A_reg, full_matrices=False)
-        # Отсекаем очень малые сингулярные значения
-        s_inv = np.zeros_like(s)
-        threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
-        for i in range(len(s)):
-            if s[i] > threshold:
-                s_inv[i] = 1.0 / s[i]
-        W = Vt.T @ np.diag(s_inv) @ U.T @ Xb.T @ y
+        # Если число обусловленности слишком высокое, увеличиваем alpha
+        if cond_number > 1e15:
+            print("Condition number too high, increasing alpha...")
+            for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
+                A_reg_new = A + new_alpha * np.eye(n_features)
+                new_cond = np.linalg.cond(A_reg_new)
+                print(f"Trying alpha={new_alpha}, condition={new_cond}")
+                if new_cond < 1e15:
+                    alpha = new_alpha
+                    A_reg = A_reg_new
+                    print(f"Using alpha={alpha}")
+                    break
 
-    return W, alpha
+        # Используем псевдообратную матрицу для устойчивого решения
+        try:
+            W = np.linalg.solve(A_reg, Xb.T @ y)
+        except np.linalg.LinAlgError:
+            print("Using SVD solution due to numerical issues")
+            U, s, Vt = np.linalg.svd(A_reg, full_matrices=False)
+            s_inv = np.zeros_like(s)
+            threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
+            for i in range(len(s)):
+                if s[i] > threshold:
+                    s_inv[i] = 1.0 / s[i]
+            W = Vt.T @ np.diag(s_inv) @ U.T @ (Xb.T @ y)
+
+        return W, alpha
+
+    else:
+        # Dual-форма (без X^T X) для уменьшения потребления ОЗУ
+        K = Xb @ Xb.T                       # (N, N)
+        K_reg = K + alpha * np.eye(N)
+
+        cond_number = np.linalg.cond(K_reg)
+        print(f"Alpha: {alpha}, Condition number: {cond_number}")
+
+        if cond_number > 1e15:
+            print("Condition number too high, increasing alpha...")
+            for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
+                K_reg_new = K + new_alpha * np.eye(N)
+                new_cond = np.linalg.cond(K_reg_new)
+                print(f"Trying alpha={new_alpha}, condition={new_cond}")
+                if new_cond < 1e15:
+                    alpha = new_alpha
+                    K_reg = K_reg_new
+                    print(f"Using alpha={alpha}")
+                    break
+
+        try:
+            A = np.linalg.solve(K_reg, y)   # (N, T)
+        except np.linalg.LinAlgError:
+            print("Using SVD solution due to numerical issues")
+            U, s, Vt = np.linalg.svd(K_reg, full_matrices=False)
+            s_inv = np.zeros_like(s)
+            threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
+            for i in range(len(s)):
+                if s[i] > threshold:
+                    s_inv[i] = 1.0 / s[i]
+            A = Vt.T @ np.diag(s_inv) @ U.T @ y
+
+        W = Xb.T @ A                         # (F(+1), T)
+        return W, alpha
 
 
 def apply_readout(X: np.ndarray, W: np.ndarray, add_bias: bool = True) -> np.ndarray:
@@ -1073,6 +1048,7 @@ class ReservoirConfig:
     max_hours_total: Optional[float] = None  # ОГРАНИЧЕНИЕ: оценка общего времени прогона (часы)
     precision: Optional[str] = 'float64' # Размер данных в вычислениях ('float64', 'float32')
     use_dispersion: Optional[bool] = True  # Включать ли слагаемое с дисперсией в модель
+    disable_core0: bool = False  # Выключить нулевую периферийную сердцевину (обнулить вход и связи)
 
 @dataclass
 class TrainingConfig:
@@ -1208,7 +1184,7 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
          в зависимости от варианта.
     """
     # --- восстановим полный MG, чтобы показать warmup слева
-    warmup = cfg.mg.warmup
+    warmup = getattr(cfg.mg, "warmup", 0)
     x_full = mackey_glass(cfg.mg.t_size + warmup,
                           tau=cfg.mg.tau, n=cfg.mg.n, beta=cfg.mg.beta, gamma=cfg.mg.gamma,
                           initial_condition=cfg.mg.initial_condition, dt=cfg.mg.dt)
@@ -1219,52 +1195,52 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     x_full_norm = (x_full - mu) / sigma
 
     # Проверим согласованность длины
-    S = cfg.mg.t_size
+    S = int(cfg.mg.t_size)
     assert mg_series_used.shape[0] == S, "mg_series_used длиной не равно t_size"
 
-    # --- индексы сегментов на оси полного ряда
-    shift_syms = int(cfg.training.target_shift)  # shift у нас в символах — ок
+    # --- индексы сегментов на оси полного ряда (в символах)
+    shift_syms = int(getattr(cfg.training, "target_shift", 0) or 0)
 
-    # 1) берём washout в отсчётах (если авто — тем же способом, что и в пайплайне)
-    if cfg.training.washout is None:
-        w_samples = auto_washout_samples(cfg.reservoir, eps=1e-3, min_loops=1, max_loops=3)
+    # washout учитываем ТОЛЬКО если задан > 0; иначе не рисуем его вовсе
+    w_raw = getattr(cfg.training, "washout", None)
+    if w_raw is None or float(w_raw) <= 0:
+        w_syms = 0
     else:
-        w_samples = int(cfg.training.washout)
+        # cfg.training.washout задан в отсчётах → переведём в символы
+        M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
+        w_syms = int(np.ceil(int(w_raw) / max(1, int(M_eff))))
 
-    # 2) переводим washout в символы: делим на «эффективный размер маски»
-    #    (для temporal_* это mask_size; для spatial_only — 1)
-    M_eff = cfg.mask.mask_size if cfg.variant.startswith("temporal_") else 1
-    w_syms = int(np.ceil(w_samples / max(1, M_eff)))  # теперь w_syms в символах
-
-    # 3) дальше считаем разметку ТОЛЬКО в символах
+    # Эффективный хвост под train/val/test
     N_eff = S - shift_syms - w_syms
-    if N_eff <= 10:
-        print("N_eff =", N_eff, " S =", S, " shift_syms =", shift_syms, " w_syms =", w_syms)
-        raise ValueError("Слишком мало символов после shift+washout")
+    train_frac = float(getattr(cfg.training, "train_frac", 0.6))
+    val_frac = float(getattr(cfg.training, "val_frac", 0.2))
+    n_train = max(0, int(N_eff * train_frac))
+    n_val = max(0, int(N_eff * val_frac))
+    n_test = max(0, N_eff - n_train - n_val)
 
+    # Границы по полной оси (0..S) в символах
     i_warmup_L = 0
-    i_warmup_R = cfg.mg.warmup
+    i_warmup_R = warmup
     i_shift_L = i_warmup_R
     i_shift_R = i_warmup_R + shift_syms
     i_wash_L = i_shift_R
     i_wash_R = i_shift_R + w_syms
-    i_tr_L = i_wash_R
-    n_train = int(N_eff * cfg.training.train_frac)
-    n_val = int(N_eff * cfg.training.val_frac)
-    i_tr_R = i_tr_L + n_train
+    tr_start = i_wash_R
+    i_tr_L = tr_start
+    i_tr_R = tr_start + n_train
     i_va_L = i_tr_R
     i_va_R = i_va_L + n_val
     i_te_L = i_va_R
-    i_te_R = i_te_L + (N_eff - n_train - n_val)
+    i_te_R = i_te_L + n_test
 
     # --- рисуем
-    fig = plt.figure(figsize=(COL2, COL2*0.62))  # соотношение ~3:2
+    fig = plt.figure(figsize=(COL2, COL2 * 0.62))  # соотношение ~3:2
     gs = fig.add_gridspec(2, 1, height_ratios=[2.2, 1.6], hspace=0.35)
 
     # (1) полный MG с разметкой
     ax1 = fig.add_subplot(gs[0, 0])
     t_full = np.arange(x_full_norm.shape[0])
-    ax1.plot(t_full, x_full_norm, label="Mackey-Glass")
+    ax1.plot(t_full, x_full_norm, label="Mackey-Glass series")  # ← вернул подпись линии
     ax1.set_xlim(t_full[0], t_full[-1])  # жёстко фиксируем границы
     ax1.margins(x=0.0)  # убираем автополя по X
 
@@ -1281,25 +1257,30 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
         return True
 
     shown = []
-    if span_if(i_warmup_L, i_warmup_R, "#888888", "warmup"):          shown.append("warmup")
-    if span_if(i_shift_L,  i_shift_R,  "#1f77b4", "target shift"):    shown.append("target shift")
-    if span_if(i_wash_L,   i_wash_R,   "#ff7f0e", "washout"):         shown.append("washout")
-    if span_if(i_tr_L,     i_tr_R,     "#2ca02c", "train"):           shown.append("train")
-    if span_if(i_va_L,     i_va_R,     "#9467bd", "val"):             shown.append("val")
-    if span_if(i_te_L,     i_te_R,     "#d62728", "test"):            shown.append("test")
+    if span_if(i_warmup_L, i_warmup_R, "#888888", "warmup"):
+        shown.append("warmup")
+    if span_if(i_shift_L, i_shift_R, "#1f77b4", "target shift"):
+        shown.append("target shift")
+    if w_syms > 0 and span_if(i_wash_L, i_wash_R, "#ff7f0e", "washout"):
+        shown.append("washout")
+    if span_if(i_tr_L, i_tr_R, "#2ca02c", "train"):
+        shown.append("train")
+    if span_if(i_va_L, i_va_R, "#9467bd", "val"):
+        shown.append("val")
+    if span_if(i_te_L, i_te_R, "#d62728", "test"):
+        shown.append("test")
 
-    ax1.set_title("Mackey-Glass series: warmup/shift/washout/train/val/test", loc="left")
+    # Заголовок только по реально показанным сегментам
+    title_suffix = ("/".join(shown)) if shown else ""
+    ax1.set_title(f"Mackey-Glass series{': ' + title_suffix if title_suffix else ''}", loc="left")
     ax1.set_xlabel("symbol index")
     ax1.set_ylabel("normalized amplitude")
 
-    # Легенда: только из реально добавленных элементов
+    # Легенда: линия + реально добавленные зоны
     handles, labels = ax1.get_legend_handles_labels()
     if handles:
         uniq = dict(zip(labels, handles))
-        leg = ax1.legend(uniq.values(), uniq.keys(),
-                         ncols=3,
-                         bbox_to_anchor=(0.98, 0.98),
-                         frameon=True)
+        leg = ax1.legend(uniq.values(), uniq.keys(), ncols=3, bbox_to_anchor=(0.98, 0.98), frameon=True)
         leg.get_frame().set_facecolor((1, 1, 1, 0.6))
         leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
@@ -1334,9 +1315,6 @@ def debug_plot_mg_attractor(cfg,
     Сегменты shift/washout/train/val/test рисуются только если их длина ≥ 2.
     График оформлен под публикации: без сетки/панелей, ortho-проекция, equal-aspect.
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (регистрация 3D)
     from matplotlib.ticker import MaxNLocator
     import matplotlib.patheffects as pe
 
@@ -1381,19 +1359,17 @@ def debug_plot_mg_attractor(cfg,
         ("test",         "#d62728", i_te),
     ]
 
-    # фигура
-    fig_w = globals().get("COL2", 6)  # если у тебя есть константа COL2 — используем её
-    fig = plt.figure(figsize=(fig_w*0.62, fig_w*0.62))
+    fig = plt.figure(figsize=(COL2*0.62, COL2*0.62), constrained_layout=True)
     ax = fig.add_subplot(111, projection="3d")
 
     # — оформление под публикации —
-    ax.set_proj_type('ortho')  # без перспективных искажений (ortho).  :contentReference[oaicite:4]{index=4}
-    # equal-aspect в 3D: подгоняем коробку под диапазоны данных.  :contentReference[oaicite:5]{index=5}
+    ax.set_proj_type('ortho')  # без перспективных искажений (ortho).
+    # equal-aspect в 3D: подгоняем коробку под диапазоны данных.
     ax.set_box_aspect((np.ptp(X), np.ptp(Y), np.ptp(Z)))
     ax.view_init(elev=20, azim=-15)
-    ax.grid(False)  # сетка off (чистая схема).  :contentReference[oaicite:6]{index=6}
+    ax.grid(False)  # сетка off (чистая схема).
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-        axis.pane.fill = False            # выключить заливку «панелей»  :contentReference[oaicite:7]{index=7}
+        axis.pane.fill = False            # выключить заливку «панелей»
         axis.pane.set_edgecolor((0, 0, 0, 0))  # скрыть края панелей
 
     # компактные тики (не больше 4 по каждой оси)
@@ -1415,7 +1391,7 @@ def debug_plot_mg_attractor(cfg,
             hi = max(0, min(bb - off, L))
             if hi - lo >= min_len:
                 (line,) = ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
-                # белое «хало» вокруг линии для читаемости на типографском фоне  :contentReference[oaicite:8]{index=8}
+                # белое «хало» вокруг линии для читаемости на типографском фоне
                 line.set_path_effects([
                     pe.Stroke(linewidth=base_lw*1.8, foreground='white'),
                     pe.Normal()
@@ -1436,10 +1412,13 @@ def debug_plot_mg_attractor(cfg,
         leg.get_frame().set_facecolor((1, 1, 1, 0.6))
         leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
-    # единое сохранение (формат/параметры — из rcParams, как и раньше)
-    _maybe_savefig(fig,
-                   f"mg_attractor_{cfg.variant}_C{cfg.core_count}",
-                   enabled=getattr(cfg.reservoir, "save_figs", False))
+    # Сохранение: используем tight, чтобы подписи снизу и справа не обрезались
+    if getattr(cfg.reservoir, "save_figs", False):
+        p = _default_fig_path(f"mg_attractor_{cfg.variant}_C{cfg.core_count}")
+        try:
+            fig.savefig(p, bbox_inches="tight", pad_inches=0.04)
+        except Exception as e:
+            print(f"[warn] savefig failed: {e}")
 
     plt.show()
 
@@ -1865,8 +1844,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
     key = p.stem
 
     # --- ЕДИНООБРАЗНЫЙ ПУТЬ К КЭШУ: (корень проекта)/scripts/mcf_rc_cache ---
-    from pathlib import Path as _Path
-    _base_dir = _Path(__file__).parent.resolve()  # ./scripts
+    _base_dir = Path(__file__).parent.resolve()  # ./scripts
     _p_scripts = (_base_dir / "mcf_rc_cache" / p.name)  # ./scripts/mcf_rc_cache/<hash>.npz
     _p_scripts.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1915,11 +1893,13 @@ def run_mcf_with_cache(data_in: np.ndarray,
         use_torch=bool(rc["use_torch"]),
         num_threads=rc["num_threads"],
         display_debug_info=bool(rc["display_debug_info"]),
-        display_debug_plots=False, # bool(rc["display_debug_plots"]),
+        display_debug_plots=bool(rc["display_debug_plots"]),
+        save_figs=bool(rc["save_figs"]),
         save_gif=bool(rc["save_gif"]),
         max_hours_total=rc.get("max_hours_total", None),
         precision=rc.get("precision", None),
         use_dispersion=bool(rc.get("use_dispersion", True)),
+        disable_core0=bool(rc.get("disable_core0", False)),
     )
 
     data_out = res["data_out"]
@@ -1972,15 +1952,75 @@ def run_mcf_with_cache(data_in: np.ndarray,
 # Признаки/таргет/сплиты + free-running
 # =========================
 
-def make_states(data_out: np.ndarray,
-                feature_mode: Literal["intensity", "realimag"] = "intensity") -> np.ndarray:
-    if feature_mode == "intensity":
-        X = (np.abs(data_out) ** 2).T  # (T,C)
-    elif feature_mode == "realimag":
-        X = np.hstack([data_out.real.T, data_out.imag.T])  # (T,2C)
+def make_states(
+    data_out: np.ndarray,
+    mask_cfg,
+    feature_mode: Literal["intensity", "realimag"] = "intensity",
+    *,
+    phase_shift: int = 0,
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Собирает матрицу признаков для time-multiplexed RC по символам.
+
+    Parameters
+    ----------
+    data_out : (C, T) complex
+        Выход резервара во времени (после нелинейности). T = N * M.
+    mask_cfg : MaskConfig
+        Должен содержать поле mask_size (M).
+    feature_mode : "intensity", "realimag"
+    phase_shift : int, default 0
+        Циклический сдвиг по времени в узлах маски (компенсация фазы задержки
+        относительно маски, если нужно): 0..M-1.
+
+    Returns
+    -------
+    X : (N, F)
+        Матрица признаков по символам. F = M*C при "intensity", либо F = 2*M*C при "realimag".
+    N : int
+        Число полных символов, попавших в X.
+    M : int
+        Размер маски (число виртуальных узлов на символ).
+    """
+    if data_out.ndim != 2:
+        raise ValueError("data_out должен быть формы (C, T)")
+    C, T = data_out.shape
+    M = int(mask_cfg.mask_size)
+    if M <= 0:
+        raise ValueError("mask_size должен быть положительным целым числом")
+
+    if M > 1:
+        r = int(phase_shift) % M
+        if r:
+            data_out = np.roll(data_out, -r, axis=1)
+
+    # Обрезаем хвост до кратности M
+    if M > 1:
+        N = T // M
+        if N == 0:
+            raise ValueError("недостаточно тактов для одного символа (T < M)")
+        T_eff = N * M
+        if T_eff != T:
+            data_out = data_out[:, :T_eff]
+            T = T_eff
     else:
-        raise ValueError("feature_mode ∈ {'intensity','realimag'}")
-    return np.asarray(X, dtype=np.float64)
+        # Без временной маски трактуем каждый такт как символ (M=1)
+        N = T
+
+    if feature_mode == "intensity":
+        feats = np.abs(data_out)**2              # (C, T)
+        C_feat = C
+    elif feature_mode == "realimag":
+        feats = np.vstack([data_out.real, data_out.imag])  # (2C, T)
+        C_feat = 2*C
+    else:
+        raise ValueError(f"unknown feature_mode={feature_mode!r}")
+
+    # Укладка по символам: (C_feat, N*M) -> (C_feat, N, M) -> (N, C_feat, M) -> (N, C_feat*M)
+    feats_blk = feats.reshape(C_feat, N, M)      # (C_feat, N, M)
+    X = np.transpose(feats_blk, (1, 0, 2)).reshape(N, C_feat * M)
+    return X, N, M
+
 
 def split_train_val_test(N: int, train_frac: float, val_frac: float):
     n_train = int(N * train_frac)
@@ -2333,20 +2373,20 @@ def run_single_experiment(cfg: ExperimentConfig,
                                                          save_cache=save_cache,
                                                          cache_bits=64)
 
+    # data_out_half, params_out_half, cache_key_half = run_mcf_with_cache(data_in[:,:int(data_in.shape[-1]/2)],
+    #                                                      params_dict,
+    #                                                      force_rerun=force_rerun,
+    #                                                      save_cache=False,
+    #                                                      cache_bits=64)
+    # size = data_out_half.shape[-1]
+    # central_core_ind = int(np.floor(eq_size / 2)) if eq_size > 1 else 0
+    # plot2D_plotly(np.arange(0, size), [np.abs(data_out[central_core_ind,:size]), np.abs(data_out_half[central_core_ind]),
+    #                                             np.abs(data_out[central_core_ind,:size] - data_out_half[central_core_ind])], yscale='log')
+
     # ── признаки/таргеты: ПЕРЕХОД НА СИМВОЛЫ + taps
-    X_full = make_states(data_out, feature_mode=cfg.training.feature_mode)  # (T,D)
-
-    # эффективные «узлы на символ»
-    M_eff = cfg.mask.mask_size if cfg.variant.startswith("temporal_") else 1
-
-    T, D = X_full.shape
-    S = T // M_eff
+    X_sym, S, M_eff = make_states(data_out, cfg.mask, feature_mode=cfg.training.feature_mode)  # (S,F)
     if S < 10:
         raise ValueError("Слишком мало символов: увеличьте длину MG или уменьшите mask_size")
-
-    # (S, M_eff, D) → (S, M_eff*D)   — flatten по узлам×ядрам
-    X_blocks = X_full[:S * M_eff].reshape(S, M_eff, D)
-    X_sym = X_blocks.reshape(S, M_eff * D)  # (S, F)
 
     # taps по символам: concat [x_s, x_{s-1}, ..., x_{s-(taps-1)}]
     def _make_tapped(Xs: np.ndarray, taps_: int) -> np.ndarray:
@@ -2371,16 +2411,9 @@ def run_single_experiment(cfg: ExperimentConfig,
     y_aligned = y_sym[(cfg.training.taps - 1 + shift_syms):, :]  # (S - (taps-1) - shift, 1)
     X_aligned = X_tapped[:y_aligned.shape[0], :]
 
-    # washout: авто в СЭМПЛАХ → переводим в СИМВОЛЫ
-    if cfg.training.washout is None:
-        w_samples = auto_washout_samples(cfg_with_ws.reservoir, eps=1e-3, min_loops=1, max_loops=3)
-    else:
-        w_samples = int(cfg.training.washout)
-    w_syms = int(np.ceil(w_samples / max(1, M_eff)))
-    if w_syms >= X_aligned.shape[0] - 10:
-        raise ValueError("washout (в символах) слишком большой относительно длины данных")
-
-    Xw, yw = X_aligned[w_syms:, :], y_aligned[w_syms:, :]
+    # washout отключён при разбиении (по просьбе пользователя): НЕ отбрасываем сверх target_shift/taps
+    w_syms = 0
+    Xw, yw = X_aligned, y_aligned
 
     # сплиты
     sl_trainval, sl_train, sl_val, sl_test = split_train_val_test(
@@ -2402,7 +2435,7 @@ def run_single_experiment(cfg: ExperimentConfig,
         nrmse_val=nrmse(yva, yva_hat),
         nrmse_test=nrmse(yte, yte_hat),
         ridge_alpha=ridge_alpha,
-        T_total=int(X_full.shape[0]),
+        T_total=int(X_sym.shape[0]),
         features_dim=int(Xw.shape[1]),
         taps=int(cfg.training.taps),
     )
@@ -2427,7 +2460,6 @@ def run_single_experiment(cfg: ExperimentConfig,
         mg_series=mg_series,
         cache_key=cache_key,
         y_free_run=y_free,
-        # NEW: пробрасываем физические/служебные параметры для Optuna Dashboard
         fiber_params=params_out
     )
 
@@ -2630,7 +2662,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     raise TrialPruned("no convergence")
                 raise
 
-            score = min(float(res["metrics"]["nrmse_val"]), 1e+1)
+            score = min(float(res["metrics"]["nrmse_val"]), 2)
             if not np.isfinite(score):
                 trial.set_user_attr("skip_reason", f"non-finite score {score}")
                 print("skip_reason", "non-finite score")
@@ -2768,7 +2800,7 @@ if __name__ == "__main__":
 
     temporal_mask_modulation_frequency_ghz = 40  # GHz
 
-    variant = "temporal_unique_per_core"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = "temporal_same_all_cores"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
         temporal_mask_size = 121
@@ -2793,13 +2825,14 @@ if __name__ == "__main__":
         kappa=0.455,  # 0.9
         use_gpu=False,
         use_torch=False,
-        num_threads=8,
+        num_threads=1,
         display_debug_plots=True,
         display_debug_info=True,
         save_figs=True,
         max_hours_total=72,
         precision='float64',
         use_dispersion=True,
+        disable_core0=False,
     )
 
     training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-4,  # washout=100,
@@ -2842,6 +2875,6 @@ if __name__ == "__main__":
     #     n_trials_opt=10000,  # сколько попробовать конфигураций
     #     free_run_horizon=0,  # без свободного прогона после обучения
     #     force_rerun=False,  # используй кэш, если ключ совпал
-    #     save_cache=False,
+    #     save_cache=True,
     # )
     # print("Лучший результат Optuna:\n", res)

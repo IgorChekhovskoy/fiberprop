@@ -1,7 +1,17 @@
+from numba import jit
+from numpy.fft import fftfreq
+
 from fiberprop.drawing import *
-from fiberprop.matrices import get_ring_coupling_matrix
 from fiberprop.pulses import fundamental_soliton, gain_loss_soliton
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig
+
+@jit(nopython=True)
+def get_ring_coupling_matrix(n):
+    elem = [1, -2, 1]
+    list_len = len(elem)
+    a = elem[list_len % 2:] + [0] * (n - list_len) + elem[:list_len % 2]
+    asw = [[a[k - i] for k in range(n)] for i in range(n)]
+    return np.array(asw)
 
 
 def test_case1_using_classes(plot=True):

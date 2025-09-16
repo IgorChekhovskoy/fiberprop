@@ -57,7 +57,7 @@ else:
             gamma_h: Tensor, g0_h: Tensor,
             exp_g0h: Tensor, exp_2g0h: Tensor,
             E_sat: Tensor,
-            energy_in: Tensor,
+            energy_in: Tensor | None = None,
             *,
             P: Tensor | None = None
     ) -> None:
@@ -133,7 +133,7 @@ else:
             psi,
             solver.gamma_h_half, solver.g0_h_half,
             solver.exp_g0h_half, solver.exp_2g0h_half,
-            solver.eq.E_sat, solver.eq.g_0, current_E,
+            solver.eq.E_sat, current_E,
             P=P
         )
 
@@ -277,16 +277,15 @@ else:
 
             l_off = max(0, offset_left - s)
             r_off = max(0, e - offset_right)
-            core = view.shape[1] - l_off - r_off
+            central_length = view.shape[1] - l_off - r_off
 
             if l_off:
                 sub = view[:, :l_off]
                 Psub = power_abs2_t(sub)
-                E_slice = energy_from_power_t(Psub, tau)
-                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
+                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, energy_in=None, P=Psub)
 
-            if core > 0:
-                sub = view[:, l_off:l_off + core]
+            if central_length > 0:
+                sub = view[:, l_off:l_off + central_length]
                 Psub = power_abs2_t(sub)
                 E_slice = energy_from_power_t(Psub, tau)
                 nonlinear_step_pytorch(sub, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
@@ -294,8 +293,7 @@ else:
             if r_off:
                 sub = view[:, -r_off:]
                 Psub = power_abs2_t(sub)
-                E_slice = energy_from_power_t(Psub, tau)
-                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, E_slice, P=Psub)
+                nonlinear_step_pytorch(sub, gamma_h, g0_h * 0, exp_g0h, exp_2g0h, E_sat, energy_in=None, P=Psub)
 
 
     def ssfm_order2_dnd_windowed_short_pytorch(

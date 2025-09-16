@@ -6,16 +6,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ==== Настройки (можно переопределить переменными окружения) ====
-SESSION="${SESSION:-mcf_rc}"
+SESSION="${SESSION:-mcf_rc}"                      # БАЗОВОЕ имя; при start будет выдано уникальное имя
 PROJECT_DIR="${PROJECT_DIR:-$REPO_ROOT}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 REQ_FILE="${REQ_FILE:-$PROJECT_DIR/requirements.txt}"
 MAIN_PY="${MAIN_PY:-$SCRIPT_DIR/mcf_reservoir_computing.py}"
-PY_ARGS="${PY_ARGS:-}"                         # сюда — аргументы твоему скрипту, если нужны
-DB_PATH="${DB_PATH:-$PROJECT_DIR/optuna_study.db}"   # оставлено на будущее (RDB)
+PY_ARGS="${PY_ARGS:-}"                            # сюда — аргументы твоему скрипту, если нужны
+DB_PATH="${DB_PATH:-$SCRIPT_DIR/optuna_study.db}"   # ← тут: файл БД в подпапке подпроекта
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-18080}"                           # (как у тебя на линуксе)
-JOURNAL_PATH="${JOURNAL_PATH:-$SCRIPT_DIR/mcf_optuna.journal}"
+PORT="${PORT:-18080}"
+JOURNAL_PATH="${JOURNAL_PATH:-$SCRIPT_DIR/mcf_optuna.journal}"  # уже в подпапке подпроекта
 
 # Глушим внутренний трединг у BLAS/OMP/NumPy/Numba
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -25,7 +25,7 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
 export NUMBA_NUM_THREADS="${NUMBA_NUM_THREADS:-1}"
 export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-PASSIVE}"
 
-LOG_DIR="$PROJECT_DIR/logs"; mkdir -p "$LOG_DIR"
+LOG_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOG_DIR"
 RUN_LOG="$LOG_DIR/run_$(date +%Y%m%d_%H%M%S).log"
 DASH_LOG="$LOG_DIR/dashboard_$(date +%Y%m%d_%H%M%S).log"
 
@@ -37,6 +37,9 @@ else
 fi
 
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+
+# — файл с последним ИМЕНЕМ tmux-сессии этой обвязки (для attach/status/stop по умолчанию)
+SESSION_FILE="$SCRIPT_DIR/.optuna_tmux_session"   # ← тут: в подпапке подпроекта
 
 ensure_tmux(){ command -v tmux >/dev/null || { echo "tmux не установлен. sudo apt-get update && sudo apt-get install -y tmux"; exit 1; }; }
 ensure_taskset(){ command -v taskset >/dev/null || { echo "taskset не найден (package util-linux). Установи: sudo apt-get install -y util-linux"; exit 1; }; }
@@ -55,14 +58,18 @@ bootstrap() {
   # shellcheck source=/dev/null
   source "$VENV_DIR/bin/activate"
   python -m pip install --upgrade pip >/dev/null
+
   # 3) requirements.txt (если есть)
   if [[ -f "$REQ_FILE" ]]; then
     echo "[bootstrap] Устанавливаю зависимости из $REQ_FILE"
     pip install -r "$REQ_FILE"
   else
     echo "[bootstrap] Внимание: $REQ_FILE не найден — пропускаю установку зависимостей."
-    echo "           Убедись, что optuna и optuna-dashboard стоят, либо добавь их в requirements.txt."
   fi
+
+  # 4) Обязательные пакеты для работы скрипта
+  echo "[bootstrap] Устанавливаю обязательные пакеты: optuna и optuna-dashboard"
+  pip install optuna optuna-dashboard
 }
 
 # --- физические ядра (сокеты × cores per socket); фоллбэки: /proc/cpuinfo → nproc ---
@@ -113,7 +120,7 @@ logical_cpu_list() {
   fi
   # cgroup v1: /sys/fs/cgroup/cpuset/cpuset.cpus
   if [[ -r /sys/fs/cgroup/cpuset/cpuset.cpus ]]; then
-    cpus="$(< /sys/fs/cgroup/cpuset/cpus)"
+    cpus="$(< /sys/fs/cgroup/cpuset.cpus)"
     [[ -n "$cpus" ]] && { expand_cpulist "$cpus"; return; }
   fi
   # sysfs список «онлайн» CPU, напр. "0-7,16-23"
@@ -131,6 +138,12 @@ logical_cpu_list() {
   seq 0 "${n#-1}"
 }
 
+# --- функция генерации УНИКАЛЬНОГО имени tmux-сессии (минимальная интеграция) ---
+_unique_session_name() {
+  local base="$1"
+  echo "${base}_$(date +%Y%m%d-%H%M%S)"
+}
+
 # --- общая функция запуска одной сессии (reuse в start/resume) ---
 _spawn_tmux_with_study() {
   local study_name="$1"
@@ -142,7 +155,7 @@ _spawn_tmux_with_study() {
   touch "$JOURNAL_PATH"   # создаём пустой журнал заранее (для дашборда)
 
   # Кол-во воркеров = физическим ядрам (можно переопределить WORKERS в env)
-  WORKERS="${WORKERS:-$(physical_cores)}"
+  WORKERS="${WORKERS:-$(($(physical_cores) - 0))}"
   if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then WORKERS=1; fi
   echo "[start] WORKERS = $WORKERS (физические ядра)"
 
@@ -194,13 +207,14 @@ start() {
   ensure_taskset
   bootstrap
 
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Сессия $SESSION уже запущена. Используй: $0 attach"
-    exit 0
-  fi
+  # Всегда получить УНИКАЛЬНОЕ имя tmux-сессии
+  local SESSION_ACTUAL
+  SESSION_ACTUAL="$(_unique_session_name "$SESSION")"
+  SESSION="$SESSION_ACTUAL"   # использовать далее в _spawn_*
+  echo "$SESSION_ACTUAL" > "$SESSION_FILE"
 
   # Сгенерировать НОВОЕ имя study и запомнить его
-  local STUDY_NAME_FILE="$PROJECT_DIR/.study_name"
+  local STUDY_NAME_FILE="$SCRIPT_DIR/.study_name"
   local STUDY_NAME="${STUDY_NAME:-mcf_rc_$(date +%Y%m%d-%H%M%S)}"
   echo "$STUDY_NAME" > "$STUDY_NAME_FILE"
 
@@ -213,57 +227,88 @@ resume() {
   ensure_taskset
   bootstrap
 
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Сессия $SESSION уже запущена. Используй: $0 attach"
+  # Если явно не задано SESSION — берем последнее созданное этим скриптом
+  local SES="${SESSION:-}"
+  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
+    SES="$(< "$SESSION_FILE")"
+  fi
+  if [[ -z "$SES" ]]; then
+    echo "Не задано имя tmux-сессии. Задай SESSION=... $0 resume, либо сначала запусти $0 start"
+    exit 1
+  fi
+  if tmux has-session -t "$SES" 2>/dev/null; then
+    tmux attach -t "$SES"
     exit 0
   fi
 
-  local STUDY_NAME_FILE="$PROJECT_DIR/.study_name"
+  # Если сессии нет — перезапуск по последнему study_name
+  local STUDY_NAME_FILE="$SCRIPT_DIR/.study_name"   # ← тут: в подпапке подпроекта
   local STUDY_NAME="${STUDY_NAME:-}"
-  if [[ -z "$STUDY_NAME" ]]; then
-    if [[ -f "$STUDY_NAME_FILE" ]]; then
-      STUDY_NAME="$(cat "$STUDY_NAME_FILE")"
-    fi
+  if [[ -z "$STUDY_NAME" && -f "$STUDY_NAME_FILE" ]]; then
+    STUDY_NAME="$(cat "$STUDY_NAME_FILE")"
   fi
   if [[ -z "$STUDY_NAME" ]]; then
     echo "Не найдено имя study. Либо задай STUDY_NAME=... $0 resume, либо сначала запусти $0 start"
     exit 1
   fi
 
-  # НЕ перезаписываем .study_name — продолжаем ровно ту, что указана
+  # Новое уникальное имя tmux-сессии на резюм
+  SESSION="$(_unique_session_name "$SES")"
+  echo "$SESSION" > "$SESSION_FILE"
   _spawn_tmux_with_study "$STUDY_NAME"
 }
 
-attach(){ ensure_tmux; tmux attach -t "$SESSION"; }
+attach(){
+  ensure_tmux
+  local SES="${SESSION:-}"
+  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
+    SES="$(< "$SESSION_FILE")"
+  fi
+  if [[ -z "$SES" ]]; then
+    echo "Не задано имя SESSION и нет $SESSION_FILE. Укажи SESSION=... $0 attach"
+    exit 1
+  fi
+  tmux attach -t "$SES"
+}
 
 status(){
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Сессия $SESSION активна. Окна:"
-    tmux list-windows -t "$SESSION"
-    echo "Дашборд: http://$HOST:$PORT/"
-    ls -1t "$LOG_DIR" | sed "s|^|log: $LOG_DIR/|"
-    if [[ -f "$PROJECT_DIR/.study_name" ]]; then
-      echo "Последнее сохранённое study_name: $(cat "$PROJECT_DIR/.study_name")"
+  local SES="${SESSION:-}"
+  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
+    SES="$(< "$SESSION_FILE")"
+  fi
+
+  if tmux list-sessions >/dev/null 2>&1; then
+    echo "Активные tmux-сессии:"
+    tmux list-sessions -F '#S: #{session_windows} windows, attached=#{session_attached}'
+    if [[ -f "$SESSION_FILE" ]]; then
+      echo "Последняя, созданная этим скриптом: $(< "$SESSION_FILE")"
     fi
+    echo "Последние логи:"
+    ls -1t "$LOG_DIR" | sed "s|^|$LOG_DIR/|"
   else
-    echo "Сессия $SESSION не найдена."
-    if [[ -f "$PROJECT_DIR/.study_name" ]]; then
-      echo "Последнее сохранённое study_name: $(cat "$PROJECT_DIR/.study_name")"
-    fi
+    echo "tmux-сервер не запущен (сессий нет)."
   fi
 }
 
 stop(){
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Останавливаю задачи (Ctrl-C) и закрываю сессию $SESSION…"
-    for w in $(tmux list-windows -t "$SESSION" -F '#W'); do
-      tmux send-keys -t "$SESSION:$w" C-c
+  local SES="${SESSION:-}"
+  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
+    SES="$(< "$SESSION_FILE")"
+  fi
+  if [[ -z "$SES" ]]; then
+    echo "Не задано имя SESSION и нет $SESSION_FILE. Укажи SESSION=... $0 stop"
+    exit 1
+  fi
+  if tmux has-session -t "$SES" 2>/dev/null; then
+    echo "Останавливаю задачи (Ctrl-C) и закрываю сессию $SES…"
+    for w in $(tmux list-windows -t "$SES" -F '#W'); do
+      tmux send-keys -t "$SES:$w" C-c
     done
     sleep 1 || true
-    tmux kill-session -t "$SESSION" || true
+    tmux kill-session -t "$SES" || true
     echo "✓ Остановлено."
-  else:
-    echo "Сессия $SESSION не найдена."
+  else
+    echo "Сессия $SES не найдена."
   fi
 }
 

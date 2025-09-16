@@ -83,42 +83,93 @@ def int_integral(fiber, light, core_center_coords, core_indexes, x, y):
     return temp
 
 
-def plot_core_centers(core_center_coords, core_radius, cladding_diameter, title='Fiber scheme', color='red'):
+def plot_core_centers(core_center_coords, core_radius, cladding_diameter,
+                      title='Fiber scheme', color='red',
+                      annotate_indices=False, scale_bar_um=None,
+                      save_path=None, show=True):
     """
     Функция для отрисовки центров ядер на плоскости (в мкм) с учетом их радиуса.
 
     Входные параметры:
-      - core_center_coords: список кортежей (x, y) с координатами центров ядер
-      - core_radius: радиус ядра
-      - cladding_diameter: диаметр волокна
-      - title: заголовок графика (по умолчанию 'Core centers positions')
-      - color: цвет кругов (по умолчанию 'red')
+      - core_center_coords: список кортежей (x, y) [мкм]
+      - core_radius: радиус сердцевины [мкм]
+      - cladding_diameter: диаметр оболочки [мкм]
+      - title: заголовок графика
+      - color: цвет заливки сердцевин
+      - annotate_indices: нумеровать ли ядра (по порядку в списке)
+      - scale_bar_um: длина масштабной линейки в мкм (None → не рисовать)
+      - save_path: путь для сохранения (None → не сохранять)
+      - show: показывать ли окно с графиком (False полезно на кластере)
+    Возвращает:
+      (fig, ax)
     """
-    fig, ax = plt.subplots()
-    ax.set_aspect('equal')
 
-    # Рисуем круги для каждого ядра
-    for (x, y) in core_center_coords:
-        circle = plt.Circle((x, y), core_radius, color=color, alpha=0.5)
-        ax.add_patch(circle)
+    if show or save_path:
+        fig, ax = plt.subplots()
+        ax.set_aspect('equal', adjustable='box')
 
-    # Рисуем окружность, обозначающую границу волокна
-    fiber_circle = plt.Circle((0, 0), cladding_diameter / 2, color='black', fill=False, linestyle='--')
-    ax.add_patch(fiber_circle)
+        # Рисуем окружность, обозначающую границу волокна (оболочка)
+        R_fiber = cladding_diameter * 0.5
+        lw = plt.rcParams.get("lines.linewidth", 1.0)
+        fiber_circle = plt.Circle((0.0, 0.0), R_fiber,
+                                  facecolor='none', edgecolor='black',
+                                  linestyle='-', linewidth=lw)
+        ax.add_patch(fiber_circle)
 
-    # Устанавливаем границы графика
-    limit = cladding_diameter / 2 + core_radius
-    ax.set_xlim(-limit, limit)
-    ax.set_ylim(-limit, limit)
+        # Рисуем круги сердцевин
+        edgecolor = 'black'
+        for idx, (x, y) in enumerate(core_center_coords):
+            circle = plt.Circle((x, y), core_radius,
+                                facecolor=color, edgecolor=edgecolor,
+                                linewidth=lw, alpha=0.65)
+            ax.add_patch(circle)
+            if annotate_indices:
+                ax.text(x, y, str(idx+1),
+                        ha='center', va='center',
+                        fontsize=plt.rcParams.get("font.size", 10) * 0.8)
 
-    plt.xlabel('X [μm]')
-    plt.ylabel('Y [μm]')
-    plt.title(title)
-    plt.grid(True)
-    plt.show()
+        # Границы с небольшим полем
+        pad = 0.08 * cladding_diameter
+        limit = R_fiber + core_radius + pad
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+
+        # Подписи и оформление (шрифты/размеры — из rcParams/.mplstyle)
+        ax.set_xlabel('X [µm]')
+        ax.set_ylabel('Y [µm]')
+        ax.set_title(title)
+        ax.grid(False)
+
+        # Простая масштабная линейка (если нужна)
+        if scale_bar_um and scale_bar_um > 0:
+            x0 = -limit + 0.12 * (2 * limit)
+            y0 = -limit + 0.10 * (2 * limit)
+            ax.plot([x0, x0 + scale_bar_um], [y0, y0],
+                    solid_capstyle='butt', linewidth=lw)
+            ax.text(x0 + scale_bar_um * 0.5, y0 - 0.03 * (2 * limit),
+                    f'{int(scale_bar_um)} µm', ha='center', va='top')
+
+    # Сохранение — строго по твоим rcParams (dpi/bbox/transparent и т.п.)
+    if save_path:
+        fig.savefig(
+            save_path,
+            dpi=plt.rcParams.get("savefig.dpi", "figure"),
+            bbox_inches=plt.rcParams.get("savefig.bbox", None),
+            transparent=plt.rcParams.get("savefig.transparent", False),
+            pad_inches=plt.rcParams.get("savefig.pad_inches", 0.1),
+        )
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, ax
 
 
-def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_plots=False):
+def get_coupling_coefficients(fiber, light, eps=1e-3,
+                              display_debug_plots=False,
+                              save_debug_plot_path=None):
     """
     Вычисляет матрицу коэффициентов связи между сердцевинами многожильного оптического волокна.
 
@@ -183,8 +234,10 @@ def get_coupling_coefficients(fiber, light, eps=1e-3, display_debug_plots=False)
     # После возможной подстройки оболочки обновляем R
     R = 0.5 * fiber.cladding_diameter
 
-    if display_debug_plots:
-        plot_core_centers(core_center_coords, fiber.core_radius, fiber.cladding_diameter)
+    plot_core_centers(core_center_coords, fiber.core_radius, fiber.cladding_diameter,
+                      title='Fiber scheme', color='red',
+                      annotate_indices=False, scale_bar_um=None,
+                      save_path=save_debug_plot_path, show=display_debug_plots)
 
     # Предполагаем, что все ядра идентичны, поэтому интеграл по диагонали (self-coupling) одинаков для всех.
     samples = int(1 / eps) + 1  # ≈ та же точность, но без dblquad

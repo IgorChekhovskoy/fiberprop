@@ -11,8 +11,7 @@ import os
 os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
 from numba import njit
 
-from .fiber_geometry import make_eq_mask, CoreConfig, get_core_count
-from .matrices import create_freq_matrix, get_pade_exponential2, create_simple_dispersion_free_matrix
+from .fiber_geometry import make_eq_mask, CoreConfig, get_core_count, Mask
 from .pulses import zero_pulse
 from .drawing import *
 from .rk4 import rk4_step
@@ -35,7 +34,7 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 from .ssfm_mcf_pytorch import ssfm_order2_dnd_pytorch, ssfm_order2_dnd_windowed_short_pytorch, \
-    ssfm_order2_dnd_short_pytorch
+    ssfm_order2_dnd_short_pytorch, ssfm_order2_ndn_pytorch
 from .rk4_pytorch import rk4_step_torch
 
 
@@ -358,6 +357,7 @@ class Solver:
         self.use_gpu = use_gpu and _TORCH_AVAILABLE  # Устанавливаем режим GPU только если PyTorch доступен
         self.use_torch = (use_torch and _TORCH_AVAILABLE) or (self.use_gpu and _TORCH_AVAILABLE)
         self.device = None
+
         if self.use_torch:
             self.device = torch.device('cuda' if self.use_gpu else 'cpu')
             torch.set_default_device('cuda' if self.use_gpu else 'cpu')
@@ -726,7 +726,345 @@ class Solver:
             else:
                 self.numerical_solution[0][k] = self.pulses[k](t=self.t, **pulse_params)
 
+    # ================== Код для сокращения числа уравнений, если найдена симметрия в задаче
+    # ===================== Публичный флаг и геттер =====================
+    @property
+    def is_collapsed(self) -> bool:
+        return getattr(self, "_collapsed", False)
+
+    def collapse_if_possible(self, *,
+                             rtol: float = 1e-13, atol: float = 1e-14,
+                             require_initial_symmetry: bool = True) -> bool:
+        """
+        Попытка схлопнуть систему по симметрии (кольца сердцевин).
+        Возвращает True при успешном схлопывании.
+        """
+        if getattr(self, "_collapsed", False):
+            return True
+
+        if getattr(self.eq, "noise_amplitude", 0.0) not in (0.0, 0):
+            return False
+
+        psi = None
+        if getattr(self, "numerical_solution", None) is not None:
+            psi = self.numerical_solution[0]
+
+        part = self._detect_collapse_partition(
+            psi=psi, rtol=rtol, atol=atol, require_initial_symmetry=require_initial_symmetry
+        )
+        if part is None:
+            return False
+
+        self._apply_collapse(part, psi=psi)
+        return True
+
+    def restore_full_system(self) -> None:
+        """
+        Восстановление исходной (несжатой) системы после collapse_if_possible().
+        Разворачивает рассчитанные массивы сжатой системы на полный размер по кольцам.
+        """
+        if not getattr(self, "_collapsed", False):
+            return
+
+        part = getattr(self, "_collapse_partition", None)
+        bk = getattr(self, "_collapse_backup", None)
+        if (part is None) or (bk is None):
+            self._collapsed = False
+            self._collapse_partition = None
+            self._collapse_backup = None
+            return
+
+        rings: list[list[int]] = part["rings"]
+        full_size: int = int(bk["eq_size"])
+
+        numsol_red = getattr(self, "numerical_solution", None)
+        numsol_time_red = getattr(self, "numerical_solution_time", None)
+        energy_red = getattr(self, "energy", None)
+        peak_red = getattr(self, "peak_power", None)
+        phase_red = getattr(self, "phase_by_z", None)
+
+        def _expand_2d(arr_red):
+            if arr_red is None:
+                return None
+            n_red, K = arr_red.shape
+            full = np.zeros((full_size, K), dtype=arr_red.dtype)
+            for l, members in enumerate(rings):
+                full[members, :] = arr_red[l, :][None, :]
+            return full
+
+        def _expand_3d(arr_red):
+            if arr_red is None:
+                return None
+            S, n_red, M = arr_red.shape
+            full = np.zeros((S, full_size, M), dtype=arr_red.dtype)
+            for l, members in enumerate(rings):
+                full[:, members, :] = arr_red[:, l, :][:, None, :]
+            return full
+
+        self.eq.size = bk["eq_size"]
+        self.eq.mask_array = bk["mask_array"]
+        for name, val in bk["eq_arrays"].items():
+            setattr(self.eq, name, val)
+
+        self.linear_coeffs_array = bk["linear_coeffs_array"]
+        self.nonlinear_cubic_coeffs_array = bk["nonlinear_cubic_coeffs_array"]
+
+        M = self.com.M
+        Nz = self.com.N + 1
+
+        self.energy = np.zeros((self.eq.size, Nz), dtype=self._np_dtype)
+        self.peak_power = np.zeros((self.eq.size, Nz), dtype=self._np_dtype)
+        self.phase_by_z = np.zeros((self.eq.size, Nz), dtype=self._np_dtype)
+        self.ind_by_z_for_phase = int(self.com.M / 2)
+
+        if numsol_red is not None:
+            ns_full = _expand_3d(numsol_red)
+            if ns_full is None:
+                ns_full = np.zeros((self.stored_steps_count, self.eq.size, M), dtype=self._np_ctype)
+                if bk.get("psi0_full") is not None:
+                    ns_full[0] = bk["psi0_full"]
+            self.numerical_solution = ns_full
+            self.numerical_solution_time = None
+        else:
+            self.numerical_solution = None
+            if numsol_time_red is not None:
+                self.numerical_solution_time = _expand_2d(numsol_time_red)
+            else:
+                self.numerical_solution_time = np.zeros((self.eq.size, Nz), dtype=self._np_ctype)
+
+        if energy_red is not None:
+            self.energy = _expand_2d(energy_red)
+        if peak_red is not None:
+            self.peak_power = _expand_2d(peak_red)
+        if phase_red is not None:
+            self.phase_by_z = _expand_2d(phase_red)
+
+        self._invalidate_linear_operator_cache()
+
+        self._collapsed = False
+        self._collapse_partition = None
+        self._collapse_backup = None
+
+    def _detect_collapse_partition(self, *, psi: np.ndarray | None,
+                                   rtol: float, atol: float,
+                                   require_initial_symmetry: bool):
+        """
+        Построение колец и представителей, проверка симметрии.
+        Возвращает dict: rings, reps, new_size, new_mask, ring_of.
+        """
+        cfg = self.eq.core_configuration
+        mask = self.eq.mask_array
+        size = self.eq.size
+
+        def ring_key(j: int) -> int:
+            x = mask[j].number_2d_x
+            y = mask[j].number_2d_y
+            if cfg is CoreConfig.hexagonal or cfg is CoreConfig.square:
+                return 3 * (y * y) + (x * x)
+            elif cfg is CoreConfig.ring_with_center:
+                return 0 if j == 0 else 1
+            elif cfg is CoreConfig.empty_ring:
+                return 0
+            else:
+                return j
+
+        def in_wedge(j: int) -> bool:
+            x = mask[j].number_2d_x
+            y = mask[j].number_2d_y
+            if cfg is CoreConfig.square:
+                return (x >= 0) and (y >= 0) and (y >= x)
+            if cfg is CoreConfig.hexagonal:
+                return (x >= 0) and (y >= 0) and (3 * y * y >= x * x)
+            if cfg is CoreConfig.ring_with_center:
+                return (j == 0) or (j == 1)
+            if cfg is CoreConfig.empty_ring:
+                return (j == 0)
+            return False
+
+        if cfg not in (CoreConfig.hexagonal, CoreConfig.square,
+                       CoreConfig.ring_with_center, CoreConfig.empty_ring):
+            return None
+
+        key_to_ring: dict[int, list[int]] = {}
+        for j in range(size):
+            key_to_ring.setdefault(ring_key(j), []).append(j)
+
+        reps: list[int] = []
+        rings: list[list[int]] = []
+        ring_of: dict[int, int] = {}
+        for members in key_to_ring.values():
+            rep = next((j for j in members if in_wedge(j)), None)
+            if rep is None:
+                return None
+            reps.append(rep)
+            members_sorted = sorted(members)
+            rings.append(members_sorted)
+            for j in members_sorted:
+                ring_of[j] = len(reps) - 1
+
+        def _allclose_vec(arr, inds) -> bool:
+            base = arr[inds[0]]
+            return all(np.isclose(arr[j], base, rtol=rtol, atol=atol) for j in inds)
+
+        for name in ("beta1", "beta2", "gamma", "E_sat", "alpha", "g_0", "coupling_coefficient"):
+            arr = np.asarray(getattr(self.eq, name))
+            for members in rings:
+                if not _allclose_vec(arr, members):
+                    return None
+
+        if require_initial_symmetry and (psi is not None):
+            for members in rings:
+                base = psi[members[0]]
+                for j in members[1:]:
+                    if not np.allclose(psi[j], base, rtol=rtol, atol=atol):
+                        return None
+
+        new_mask = []
+        for rep in reps:
+            m = Mask(number_1d=len(new_mask),
+                     number_2d_y=mask[rep].number_2d_y,
+                     number_2d_x=mask[rep].number_2d_x,
+                     neighbors=[])
+            new_mask.append(m)
+
+        return {
+            "rings": rings,
+            "reps": reps,
+            "new_size": len(reps),
+            "new_mask": new_mask,
+            "ring_of": ring_of,
+        }
+
+    def _apply_collapse(self, part: dict, *, psi: np.ndarray | None) -> None:
+        """
+        Применение схлопывания: редуцирование матриц/параметров, перенос psi0 и заполнение метрик на z=0.
+        """
+        rings: list[list[int]] = part["rings"]
+        reps: list[int] = part["reps"]
+        new_size: int = part["new_size"]
+        new_mask = part["new_mask"]
+        ring_of: dict[int, int] = part["ring_of"]
+
+        old_size = self.eq.size
+        M = self.com.M
+
+        L_old = np.asarray(self.linear_coeffs_array)
+        L_new = np.zeros((new_size, new_size), dtype=L_old.dtype)
+
+        neighbors = [m.neighbors for m in self.eq.mask_array]
+
+        for l, i_star in enumerate(reps):
+            L_new[l, l] = L_old[i_star, i_star]
+            for nb in neighbors[i_star]:
+                j = ring_of[nb]
+                L_new[l, j] += L_old[i_star, nb]
+
+        def collapse_vec(arr):
+            arr = np.asarray(arr)
+            return np.array([arr[i] for i in reps], dtype=arr.dtype)
+
+        eq_arrays = {
+            "beta1": self.eq.beta1, "beta2": self.eq.beta2, "gamma": self.eq.gamma,
+            "E_sat": self.eq.E_sat, "alpha": self.eq.alpha, "g_0": self.eq.g_0,
+            "coupling_coefficient": self.eq.coupling_coefficient,
+        }
+        new_eq_arrays = {name: collapse_vec(arr) for name, arr in eq_arrays.items()}
+
+        self._collapse_backup = {
+            "eq_size": old_size,
+            "mask_array": self.eq.mask_array,
+            "eq_arrays": {name: np.array(val, copy=True) for name, val in eq_arrays.items()},
+            "linear_coeffs_array": np.array(self.linear_coeffs_array, copy=True),
+            "nonlinear_cubic_coeffs_array": np.array(self.nonlinear_cubic_coeffs_array, copy=True)
+                if self.nonlinear_cubic_coeffs_array is not None else None,
+            "psi0_full": np.array(self.numerical_solution[0], copy=True)
+                if (getattr(self, "numerical_solution", None) is not None) else None,
+        }
+
+        self.eq.size = new_size
+        self.eq.mask_array = new_mask
+        for name, arr in new_eq_arrays.items():
+            setattr(self.eq, name, arr)
+
+        self.linear_coeffs_array = L_new
+        self.nonlinear_cubic_coeffs_array = np.zeros((new_size, new_size), dtype=self.dtype)
+        for l in range(new_size):
+            self.nonlinear_cubic_coeffs_array[l, l] = new_eq_arrays["gamma"][l]
+
+        for l in range(new_size):
+            nb = [j for j in range(new_size) if (j != l) and (abs(L_new[l, j]) != 0)]
+            self.eq.mask_array[l].neighbors = nb
+
+        Nz = self.com.N + 1
+        self.energy = np.zeros((new_size, Nz), dtype=self._np_dtype)
+        self.peak_power = np.zeros((new_size, Nz), dtype=self._np_dtype)
+        self.phase_by_z = np.zeros((new_size, Nz), dtype=self._np_dtype)
+        self.ind_by_z_for_phase = int(self.com.M / 2)
+
+        if getattr(self, "numerical_solution", None) is not None:
+            ns_new = np.zeros((self.stored_steps_count, new_size, M), dtype=self._np_ctype)
+            if psi is not None:
+                for l, i_star in enumerate(reps):
+                    ns_new[0, l] = psi[i_star]
+            self.numerical_solution = ns_new
+            self.numerical_solution_time = None
+
+            abs2_0 = np.abs(self.numerical_solution[0]) ** 2
+            self.energy[:, 0] = abs2_0.sum(axis=1) * self.com.tau
+            self.peak_power[:, 0] = abs2_0.max(axis=1)
+            if 0 <= self.ind_by_z_for_phase < self.com.M:
+                self.phase_by_z[:, 0] = np.angle(self.numerical_solution[0][:, self.ind_by_z_for_phase])
+        else:
+            self.numerical_solution_time = np.zeros((new_size, Nz), dtype=self._np_ctype)
+
+        self._invalidate_linear_operator_cache()
+
+        self._collapsed = True
+        self._collapse_partition = part
+
+        if self.display_debug_info:
+            print(f"[collapse] {old_size} → {new_size} equations")
+
+    def _invalidate_linear_operator_cache(self) -> None:
+        """
+        Размерность изменилась — сбрасываем кэши, чтобы пересчитались при следующем вызове.
+        """
+        # Линейные матрицы/их производные
+        self.D = None
+        self.D_half = None
+        self.invD_half = None
+
+
     # ─── solver.py ─────────────────────────────────────────────
+    def calculate_all_dispersion_matrices(self, h: float):
+        
+        if self.com.method == "ssfm_order2_ndn" or self.com.method == "ssfm_order2_ndn_windowed":
+            if self.D is None:
+                self.calculate_D_matrix(self.com.h)
+
+        if (self.com.method == "ssfm_order2_dnd"
+                or self.com.method == "ssfm_order2_dnd_short"
+                or self.com.method == "ssfm_order2_dnd_windowed_short"):
+            if self.D_half is None:
+                # Посчитать D для половинного шага и СРАЗУ положить в D_half
+                self.D_half = self.calculate_D_matrix(self.com.h * 0.5)
+
+                # Полный шаг: D = D_half @ D_half (с учётом формы)
+                if self.D_half.ndim == 3:
+                    # (n,n,M) → (M,n,n) @ (M,n,n) батчево
+                    if self.use_torch and torch.is_tensor(self.D_half):
+                        d_m = self.D_half.permute(2, 0, 1)  # (M,n,n)
+                        self.D = (d_m @ d_m).permute(1, 2, 0).contiguous()
+                    else:
+                        d_m = np.transpose(self.D_half, (2, 0, 1))  # (M,n,n)
+                        self.D = np.transpose(d_m @ d_m, (1, 2, 0))  # (n,n,M)
+                else:
+                    # (n,n)
+                    self.D = self.D_half @ self.D_half
+
+            if self.invD_half is None:
+                self.calculate_invD_half()
+
     def calculate_D_matrix(self, h: float):
         """
         Считает оператор D(h) и сохраняет в self.D.
@@ -972,15 +1310,11 @@ class Solver:
 
     def calculate_metrics(self, psi, n, save_every, save_idx):
         """
-        Два сценария:
-          • psi — torch.Tensor (GPU/CPU) → считаем на том же устройстве, на CPU копируем только (C,)
-          • psi — numpy.ndarray          → считаем в NumPy
-        Итоговое поле для логирования храним в self.numerical_solution на CPU (как и раньше).
+        Подсчёт метрик и, при необходимости, сохранение среза поля.
+        Возвращает обновлённый save_idx.
         """
-        # Torch-сценарий (во время шага): psi — тензор
         if self.use_torch and _TORCH_AVAILABLE and torch.is_tensor(psi):
             abs2 = psi.abs() ** 2
-            # маленькие векторы метрик на устройство → CPU
             energy = (abs2.sum(dim=1) * self.tau_t).detach().cpu().numpy()
             peak = (abs2.max(dim=1).values).detach().cpu().numpy()
             self.energy[:, n + 1] = energy
@@ -988,17 +1322,15 @@ class Solver:
 
             if 0 <= self.ind_by_z_for_phase < self.com.M:
                 phase = torch.angle(psi[:, self.ind_by_z_for_phase]).detach().cpu().numpy()
-                self.phase_by_z[:, n + 1] = phase  # [rad]
+                self.phase_by_z[:, n + 1] = phase
 
-            # сохраняем шаг по расписанию — в CPU-хранилище
             is_save_step = ((n + 1) % save_every == 0) or (n == self.com.N - 1)
             if is_save_step:
                 save_idx += 1
                 if save_idx < self.stored_steps_count:
                     self.numerical_solution[save_idx] = psi.detach().cpu().numpy()
-            return
+            return save_idx
 
-        # NumPy-сценарий (итоговое поле или CPU-ветка)
         abs2 = np.abs(psi) ** 2
         self.energy[:, n + 1] = abs2.sum(1) * self.com.tau
         self.peak_power[:, n + 1] = abs2.max(1)
@@ -1011,6 +1343,7 @@ class Solver:
             save_idx += 1
             if save_idx < self.stored_steps_count:
                 self.numerical_solution[save_idx] = psi
+        return save_idx
 
     # Основная функция моделирования
     def run_numerical_simulation(
@@ -1040,35 +1373,10 @@ class Solver:
 
         t1 = time.time()
 
-        if self.com.method == "ssfm_order2_ndn" or self.com.method == "ssfm_order2_ndn_windowed":
-            if self.D is None:
-                self.calculate_D_matrix(self.com.h)
+        self.calculate_all_dispersion_matrices(self.com.h)
 
-        if (self.com.method == "ssfm_order2_dnd"
-                or self.com.method == "ssfm_order2_dnd_short"
-                or self.com.method == "ssfm_order2_dnd_windowed_short"):
-            if self.D_half is None:
-                # Посчитать D для половинного шага и СРАЗУ положить в D_half
-                self.D_half = self.calculate_D_matrix(self.com.h * 0.5)
-
-                # Полный шаг: D = D_half @ D_half (с учётом формы)
-                if self.D_half.ndim == 3:
-                    # (n,n,M) → (M,n,n) @ (M,n,n) батчево
-                    if self.use_torch and torch.is_tensor(self.D_half):
-                        d_m = self.D_half.permute(2, 0, 1)  # (M,n,n)
-                        self.D = (d_m @ d_m).permute(1, 2, 0).contiguous()
-                    else:
-                        d_m = np.transpose(self.D_half, (2, 0, 1))  # (M,n,n)
-                        self.D = np.transpose(d_m @ d_m, (1, 2, 0))  # (n,n,M)
-                else:
-                    # (n,n)
-                    self.D = self.D_half @ self.D_half
-
-            if self.invD_half is None:
-                self.calculate_invD_half()
-
-        if self.display_debug_info:
-            print("Time of D computing =", time.time() - t1)
+        # if self.display_debug_info:
+        #     print("Time of D computing =", time.time() - t1)
 
         if self.com.method == "ssfm_order2_ndn_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h)
@@ -1099,15 +1407,15 @@ class Solver:
             if self.com.method == "ssfm_order2_dnd_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_short(self, damp_length=self.com.damp_length,
                                                                              disable_progress_bar=not self.display_debug_info)
-                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_windowed_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size,
                                                                              damp_length=self.com.damp_length,
                                                                              disable_progress_bar=not self.display_debug_info)
-                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_compact_windowed_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_compact_windowed_short(self, window_size=self.com.window_size, damp_length=self.com.damp_length)
-                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             else:
                 for n in trange(self.com.N, disable=not self.display_debug_info):
                     if self.com.method == "ssfm_order2_ndn":
@@ -1148,7 +1456,7 @@ class Solver:
                         )
 
                     # ---------- метрики --------------------------------------
-                    self.calculate_metrics(psi_next, n, save_every, save_idx)
+                    save_idx = self.calculate_metrics(psi_next, n, save_every, save_idx)
 
                     # ---------- обновить график ------------------------------
                     if draw_modulus and ((n + 1) % draw_interval == 0):
@@ -1156,39 +1464,44 @@ class Solver:
 
         # ─────────────────────────────────────── GPU-ветка ───────────────
         else:
-            psi_gpu = torch.as_tensor(
-                self.numerical_solution[0], dtype=self.ctype
-            )
+            psi_gpu = torch.as_tensor(self.numerical_solution[0], dtype=self.ctype)
 
             if self.com.method == "ssfm_order2_dnd_short":
-
                 self.numerical_solution[-1] = ssfm_order2_dnd_short_pytorch(
                     self,
                     self.com.damp_length,
                     disable_progress_bar=not self.display_debug_info
                 ).cpu().numpy()
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
 
-                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_windowed_short":
-
                 self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short_pytorch(
                     self,
                     self.com.window_size,
                     self.com.damp_length,
                     disable_progress_bar=not self.display_debug_info
                 ).cpu().numpy()
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
 
-                self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             else:
                 for n in trange(self.com.N, disable=not self.display_debug_info):
                     # ---------- очередной шаг (GPU) --------------------------
-                    psi_gpu = ssfm_order2_dnd_pytorch(
-                        psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
-                        self,
-                        self.com.h, tau,
-                        self.com.damp_length,
-                        self.eq.noise_amplitude,
-                    )
+                    if self.com.method == "ssfm_order2_dnd":
+                        psi_gpu = ssfm_order2_dnd_pytorch(
+                            psi_gpu, self.energy[:, n],
+                            self,
+                            self.com.h, tau,
+                            self.com.damp_length,
+                            self.eq.noise_amplitude,
+                        )
+                    elif self.com.method == "ssfm_order2_ndn":
+                        psi_gpu = ssfm_order2_ndn_pytorch(
+                            psi_gpu, self.energy[:, n],  # пред. энергия (CPU)
+                            self,
+                            self.com.h, tau,
+                            self.com.damp_length,
+                            self.eq.noise_amplitude,
+                        )
 
                     # ---------- метрики (GPU → CPU) --------------------------
                     abs2 = psi_gpu.abs() ** 2
@@ -1205,16 +1518,11 @@ class Solver:
                     if is_save_step:
                         save_idx += 1
                         if save_idx < self.stored_steps_count:
-                            self.numerical_solution[save_idx] = (
-                                psi_gpu.detach().cpu().numpy()
-                            )
+                            self.numerical_solution[save_idx] = psi_gpu.detach().cpu().numpy()
 
-                    # ---------- обновить график ------------------------------
                     if draw_modulus and ((n + 1) % draw_interval == 0):
                         psi_cpu_for_plot = psi_gpu.detach().cpu().numpy()
-                        update_modulus_plot(
-                            fig, ax, line, psi_cpu_for_plot, self.t, n
-                        )
+                        update_modulus_plot(fig, ax, line, psi_cpu_for_plot, self.t, n)
 
         # ───── финализация графика ───────────────────────────────────────
         if draw_modulus:
@@ -1614,7 +1922,7 @@ class Solver:
         в перспективе для более высокого порядка можно добавить флаг
         """
         if self.D is None:
-            self.calculate_D_matrix(self.com.h)
+            self.calculate_all_dispersion_matrices(self.com.h)
 
         fast_nocos_resonator_run(self.com.N, self.eq.size, self.numerical_solution, self.energy, backward_energy,
                                  self.D, self.eq.gamma, self.eq.E_sat, self.eq.g_0, self.com.h, self.com.tau,
@@ -1626,7 +1934,7 @@ class Solver:
         в перспективе для более высокого порядка можно добавить флаг
         """
         if self.D is None:
-            self.calculate_D_matrix(self.com.h)
+            self.calculate_all_dispersion_matrices(self.com.h)
 
         # Инициализация графика, если нужно
         if draw_modulus:
@@ -1758,7 +2066,7 @@ class Solver:
         self.eq.coupling_coefficient = 1.0  # [1]
         self.use_dimensional = False
         self.eq.__post_init__()
-        self.calculate_D_matrix(self.com.h)
+        self.calculate_all_dispersion_matrices(self.com.h)
 
         self.linear_coeffs_array /= dimensional_coupling_coefficient
         self.linear_coeffs_array += np.diag(np.full(self.eq.size, -self_coefficient))
@@ -1837,7 +2145,7 @@ class Solver:
         self.eq.coupling_coefficient = coupling_coefficient  # [1/m]
         self.use_dimensional = True
         self.eq.__post_init__()
-        self.calculate_D_matrix(self.com.h)
+        self.calculate_all_dispersion_matrices(self.com.h)
 
         self.linear_coeffs_array -= np.diag(np.full(self.eq.size, -self_coefficient))
         self.linear_coeffs_array *= coupling_coefficient  # Пока нет реализации для уравнений Манакова

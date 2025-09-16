@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from enum import Enum
 import numpy as np
-from math import sqrt
 
 
 @dataclass
@@ -200,7 +199,6 @@ def make_eq_mask(core_configuration: CoreConfig,
         Список объектов Mask, содержащих координаты и соседей каждого ядра
     """
 
-    from math import sqrt
     temp_array_size = int((1.0 + size * (size + 1.0)))
     temp_array = np.zeros((temp_array_size, temp_array_size), dtype=bool)
     center = temp_array_size // 2
@@ -222,7 +220,7 @@ def make_eq_mask(core_configuration: CoreConfig,
 
     elif core_configuration is CoreConfig.hexagonal:
         h_i = 1.0
-        h_j = 1.0 / sqrt(3.0)
+        h_j = 1.0 / np.sqrt(3.0)
         for i in range(temp_array_size):
             for j in range(temp_array_size):
                 if (h_i * (i - center)) ** 2 + (

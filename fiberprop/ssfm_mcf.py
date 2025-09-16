@@ -71,7 +71,7 @@ def energy_from_power_np(P: np.ndarray, tau: float) -> np.ndarray:
 def nonlinear_step(psi: np.ndarray,
                    gamma_h, g0_h, exp_g0h, exp_2g0h,
                    E_sat: np.ndarray,
-                   energy_in: np.ndarray,
+                   energy_in: np.ndarray | None = None,
                    *,
                    P: np.ndarray | None = None) -> None:
     """in-place обновление psi (n,M).
@@ -387,22 +387,21 @@ def nonlinear_step_windowed(psi: np.ndarray,
 
         l_off = max(0, offset_left  - s)
         r_off = max(0, e - offset_right)
-        core_len = view.shape[1] - l_off - r_off
+        central_len = view.shape[1] - l_off - r_off
 
         # левая оффсет-зона (без усиления)
         if l_off:
             sub = view[:, :l_off]
             Psub = power_abs2_np(sub)
-            E_slice = energy_from_power_np(Psub, tau)
             nonlinear_step(sub,
                            gamma_h, g0_h*0,
                            exp_g0h, exp_2g0h,
-                           E_sat, E_slice,
+                           E_sat, energy_in=None,
                            P=Psub)
 
         # центральная часть (с усилением)
-        if core_len > 0:
-            sub = view[:, l_off:l_off + core_len]
+        if central_len > 0:
+            sub = view[:, l_off:l_off + central_len]
             Psub = power_abs2_np(sub)
             E_slice = energy_from_power_np(Psub, tau)
             nonlinear_step(sub,
@@ -415,11 +414,10 @@ def nonlinear_step_windowed(psi: np.ndarray,
         if r_off:
             sub = view[:, -r_off:]
             Psub = power_abs2_np(sub)
-            E_slice = energy_from_power_np(Psub, tau)
             nonlinear_step(sub,
                            gamma_h, g0_h*0,
                            exp_g0h, exp_2g0h,
-                           E_sat, E_slice,
+                           E_sat, energy_in=None,
                            P=Psub)
 
 def ssfm_order2_ndn_windowed(psi, current_energy, solver,
