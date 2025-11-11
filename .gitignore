@@ -186,3 +186,5 @@ fabric.properties
 /mcf_rc_cache/
 /evolution.gif
 /mcf_optuna.db
+/out_spatial_only_radii/err_vs_radius.png
+/out_spatial_only_radii/radii_results.csv

@@ -1,7 +1,7 @@
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
 from fiberprop.fiber import Fiber, FiberMaterial, CoreConfig
 from fiberprop.light import Light
-from fiberprop.base_functions import get_coupling_coefficients
+from fiberprop.fiber_base_functions import get_coupling_coefficients
 
 from fiberprop.drawing import *
 from fiberprop.pulses import gaussian_pulse
@@ -77,7 +77,7 @@ def test_mcf_compression_dimensionless():
     print(f'Gamma = {gamma} 1/(W*m)')
 
     beta2 = fiber.get_beta2(light)
-    print(f'Beta2 = {beta2} (ps^2)/km')
+    print(f'Beta2 = {beta2 * 1e+3} (ps^2)/km')
 
     gamma = 1.3 * 1e-3  #  [1/(W*m)] Для телекома
     beta2 = -20 * 1e-3  # [ps^2/m] Для телекома

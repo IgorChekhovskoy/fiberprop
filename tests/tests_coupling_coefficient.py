@@ -4,7 +4,7 @@ import copy
 import time
 
 from fiberprop.solver import CoreConfig
-from fiberprop.base_functions import get_coupling_coefficients, get_lp_mode
+from fiberprop.fiber_base_functions import get_coupling_coefficients, get_lp_mode
 from fiberprop.fiber import Fiber, FiberMaterial
 from fiberprop.light import Light
 
@@ -57,7 +57,7 @@ def example_of_coefficients_calculation():
     gamma, gamma_error = fiber.get_gamma(light, eps)
     print(f'Gamma = {gamma} +- {gamma_error} 1/(W*m)')
     beta2 = fiber.get_beta2(light)
-    print(f'Beta2 = {beta2} (ps^2)/km')
+    print(f'Beta2 = {beta2 * 1e+3} (ps^2)/km')
 
     end = time.time()
     print(f'Full work time: {end - start} s')
@@ -216,8 +216,9 @@ def draw_beta_of_lambda(fiber, light, l1, l2, N):
 def test_smf28_parameters():
     # Заданные значения
     lambda0 = 1.55  # µm
+    beta1_expected = 4881  # ps/m
     beta2_expected = -21  # ps^2/km
-    gamma_expected = 0.00164  # 1/(W·m)
+    gamma_expected = 1.64  # 1/(W·km)
 
     # Создаём Light и Fiber с параметрами SMF‑28
     light = Light(lambda0=lambda0)
@@ -233,13 +234,15 @@ def test_smf28_parameters():
     fiber.material_concentration = 0.0
     fiber.set_refractive_indexes_by_lambda(lambda0)
 
-    beta2 = fiber.get_beta2(light)
-    gamma, _ = fiber.get_gamma(light)
+    beta1 = fiber.get_beta1(light)
+    beta2 = fiber.get_beta2(light) * 1e+3
+    gamma = fiber.get_gamma(light) * 1e+3
 
-    print(beta2, gamma)
+    print(beta1, "ps/m,", beta2, "ps^2/km,", gamma, "1/(W*km),")
 
+    assert abs(beta1 - beta1_expected) < 2, f"β1 ожидается {beta1_expected}, но вычислено {beta1}"
     assert abs(beta2 - beta2_expected) < 2, f"β₂ ожидается {beta2_expected}, но вычислено {beta2}"
-    assert abs(gamma - gamma_expected) < 0.0002, f"γ ожидается {gamma_expected}, но вычислено {gamma}"
+    assert abs(gamma - gamma_expected) < 0.2, f"γ ожидается {gamma_expected}, но вычислено {gamma}"
 
 
 if __name__ == '__main__':

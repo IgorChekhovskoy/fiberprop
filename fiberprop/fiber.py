@@ -8,7 +8,7 @@ from typing import List, Union
 
 from .light import Light
 from .fiber_geometry import CoreConfig, Mask, make_eq_mask, get_ring_count, get_core_count
-from .base_functions import int_f2, int_f4, scipy_double_integral_by_circle, get_lp_mode_radial_integral
+from .fiber_base_functions import int_f2, int_f4, scipy_double_integral_by_circle, get_lp_mode_radial_integral
 
 
 class FiberMaterial(Enum):
@@ -268,7 +268,7 @@ class Fiber:
 
        Выход:
 
-       - beta2 (float) — [ps²/км].
+       - beta2 (float) — [ps²/m].
 
        Определяется вторым численным дифференцированием beta1 по omega.
        """
@@ -278,14 +278,14 @@ class Fiber:
 
         fc.set_refractive_indexes_by_lambda(l0 - dl)
         lc.lambda0 = l0 - dl
-        b1_l = fc.get_beta1(lc) * 1e-9
+        b1_l = fc.get_beta1(lc) * 1e-12
 
         fc.set_refractive_indexes_by_lambda(l0 + dl)
         lc.lambda0 = l0 + dl
-        b1_r = fc.get_beta1(lc) * 1e-9
+        b1_r = fc.get_beta1(lc) * 1e-12
 
         D = (b1_r - b1_l) / (2.0 * dl)
-        beta2 = -l0 ** 2 * D / (2.0 * math.pi * lc.c_light) * 1e21
+        beta2 = -l0 ** 2 * D / (2.0 * math.pi * lc.c_light) * 1e18
         return beta2
 
     def get_gamma(self, light: Light, eps=1e-3):

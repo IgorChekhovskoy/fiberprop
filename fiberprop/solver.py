@@ -24,7 +24,7 @@ from .ssfm_mcf import ssfm_order2_ndn, get_energy_rectangles, ssfm_order1_resona
 from .stationary_solution_solver import find_stationary_solution
 from .utils import fft_derivative
 
-from .threading_control import configure_threads, threading_report
+from .parallel_runtime import configure_threads, threading_report
 
 
 try:

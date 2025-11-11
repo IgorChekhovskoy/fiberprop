@@ -1,4 +1,4 @@
-# fiberprop/threading_control.py
+# fiberprop/parallel_runtime.py
 from __future__ import annotations
 from typing import Optional, Union
 from contextlib import contextmanager
@@ -72,7 +72,14 @@ def configure_threads(num_threads: Union[int, str, None] = "default",
         os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
     if kmp_blocktime_infinite:
         os.environ["KMP_BLOCKTIME"] = "infinite"
-    os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+
+    if n == 1:
+        # полностью отключаем пиннинг в рантайме OpenMP/MKL
+        os.environ["KMP_AFFINITY"] = "disabled"  # или "none"
+        os.environ["OMP_PROC_BIND"] = "false"  # явный запрет биндинга OpenMP
+    else:
+        # для многопоточных CPU-кейсов оставляем прежнее поведение
+        os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
 
     # BLAS/OpenMP (MKL/OMP/…)
     _set_blas_openmp_threads(n)
@@ -302,3 +309,56 @@ def physical_cpu_count() -> int:
         return int(n)
     except Exception:
         return 1
+
+
+
+def mp_initializer(pin_map=None, pin_workers: bool = False):
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["KMP_AFFINITY"] = "disabled"      # не ставим все треды на cpu0
+    os.environ["OMP_PROC_BIND"] = "true"         # жёстко привязываем OMP-треды
+    os.environ.setdefault("OMP_PLACES", "cores") # пиннить к физ. ядрам, где возможно
+
+    if not pin_workers:
+        return
+
+    try:
+        import sys
+        import psutil
+        import multiprocessing as mp
+
+        # Если карта не задана — строим сами.
+        # HT: берём «через одно» логическое ядро (шаг = threads_per_core → обычно 0,2,4,...).
+        if not pin_map:
+            logical = psutil.cpu_count(logical=True) or 1
+            physical = psutil.cpu_count(logical=False) or logical
+            if logical > physical:
+                threads_per_core = max(1, logical // max(1, physical))
+                pin_map = list(range(0, logical, threads_per_core))   # 0,2,4,... для SMT=2
+            else:
+                pin_map = list(range(logical))                        # без HT — 0,1,2,...
+
+        # Номер воркера (у главного процесса _identity пуст)
+        wid_tuple = mp.current_process()._identity
+        if wid_tuple:
+            wid = wid_tuple[0] - 1  # 0-based
+        else:
+            wid = os.getpid()
+
+        cpu = int(pin_map[wid % len(pin_map)])
+
+        # Жёсткая привязка процесса к выбранному CPU
+        p = psutil.Process(os.getpid())
+        p.cpu_affinity([cpu])  # работает и на Linux, и на Windows
+
+        # На Linux подстрахуемся системным вызовом
+        if sys.platform.startswith("linux"):
+            try:
+                os.sched_setaffinity(0, {cpu})
+            except Exception:
+                pass
+    except Exception:
+        # Тихо: чтобы расчёт не падал при отсутствии psutil/прав
+        pass
