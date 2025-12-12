@@ -1,7 +1,7 @@
 from fiberprop.solver import ComputationalParameters, EquationParameters, Solver, CoreConfig, print_matrix
 
 from fiberprop.ssfm_mcf import *
-from scipy.fft import fftshift
+from scipy.fft import fftshift, fft, ifft
 
 from tqdm import trange
 from fiberprop.drawing import *

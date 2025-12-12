@@ -428,6 +428,9 @@ class Solver:
         self.omega = None
         self.omega2 = None
 
+        self.beta1_of_z = None
+        self.self_coupling_of_z = None
+
         self.D = None
         self.D_half = None
         self.invD_half = None
@@ -1065,6 +1068,62 @@ class Solver:
             if self.invD_half is None:
                 self.calculate_invD_half()
 
+    def calculate_D_matrix_of_n(self, h: float, z_index: int):
+        """
+        Считает оператор D(h) для заданной итерации по z с учётом
+        изменения показателя преломления и сохраняет в self.D.
+        Здесь β≠0 |=> self.D имеет форму (n, n, M).
+
+        Реализована только
+        NumPy-ветка — формирует A и считает expm в float64/complex128 (устойчивость), затем при необходимости
+        приводит результат к целевому комплексному типу хранения (self._np_ctype, если есть; иначе self.ctype).
+        """
+        n, M = self.eq.size, self.com.M
+
+        # ───────────────────────────── NumPy/SciPy backend ─────────────────────────────
+        # Считаем A и expm в double/complex128, затем (опционально) приводим к целевому типу хранения.
+        rd64 = np.float64
+        cd64 = np.complex128
+        cd_out = getattr(self, "_np_ctype", self.ctype)  # итоговый комплексный тип хранения
+
+        C = np.asarray(self.linear_coeffs_array, dtype=rd64)  # (n, n)
+        alpha = np.asarray(self.eq.alpha, dtype=rd64)  # (n,)
+        g0 = np.asarray(self.eq.g_0, dtype=rd64)  # (n,)
+        b1 = np.asarray(self.beta1_of_z[:, z_index], dtype=rd64)  # (n,)
+        sc = np.asarray(self.self_coupling_of_z[:, z_index], dtype=rd64)  # (n,)
+        b2 = np.asarray(self.eq.beta2, dtype=rd64)  # (n,)
+
+        # β ≠ 0 → батч A(ω) формы (M, n, n) в complex128, expm батчево
+        omega = np.asarray(self.omega, dtype=rd64)  # (M,)
+
+        # for id in range(self.eq.size):
+        #     C[id] += b1
+        base = (1j * C).astype(cd64, copy=False)  # (n, n)
+        base_M = np.broadcast_to(base, (M, n, n))  # (M, n, n)
+
+        # diag_term[m,i] = ( 2i sc[i] + i b2[i] ω[m]^2 - α[i] - g0[i] ) / 2
+        diag_term = (2j * sc[None, :]
+                     + 1j * (b2[None, :] * (omega[:, None]**2))
+                     - (alpha[None, :] + g0[None, :])
+                     ) * 0.5  # (M, n)
+        diag_term = diag_term.astype(cd64, copy=False)
+
+        eye_n = np.eye(n, dtype=cd64)[None, :, :]  # (1, n, n)
+        diag_M = diag_term[:, :, None] * eye_n  # (M, n, n)
+
+        for i in range(self.eq.size):
+            for j in range(self.eq.size):
+                if not C[i][j] == 0.0:
+                    diag_M[:, i, j] += 1j*b1[j]*omega
+
+        A_M_n_n = h * (base_M + diag_M)  # (M, n, n), complex128
+
+        D_M_n_n = expm(A_M_n_n)  # (M, n, n) — батчевый expm
+        D64 = np.moveaxis(D_M_n_n, 0, -1)  # (n, n, M)
+
+        self.D = D64.astype(cd_out, copy=False)  # (n, n, M)
+        return self.D
+
     def calculate_D_matrix(self, h: float):
         """
         Считает оператор D(h) и сохраняет в self.D.
@@ -1419,6 +1478,8 @@ class Solver:
             else:
                 for n in trange(self.com.N, disable=not self.display_debug_info):
                     if self.com.method == "ssfm_order2_ndn":
+                        if (not self.beta1_of_z is None) and (not self.self_coupling_of_z is None):
+                            self.calculate_D_matrix_of_n(self.com.h, n)
                         psi_next = ssfm_order2_ndn(
                             psi_next,
                             self.energy[:, n],

@@ -43,10 +43,11 @@ def zero_pulse(t):
     return 0.0 if type(t) is float else np.zeros(np.shape(t), dtype=complex)
 
 
-def laser_pulse(t, p, tau, phase=0, chirp=0):
-    """ Лазерный импульс, для дипломной работы """
-    simple = 1 / np.cosh(1.7627 * t/tau)
-    return np.sqrt(p) * np.exp(1j*phase) * simple**(1 + 1j*chirp)
+def laser_pulse(t, peak_power, fwhm, init_phase=0, chirp=0):
+    """ Импульс, который задаётся в терминах экспериментальных параметров """
+    tau = 2*np.log(1 + np.sqrt(2)) / fwhm
+    simple = 1 / np.cosh(tau * t)
+    return np.sqrt(peak_power) * np.exp(1j*init_phase) * simple**(1 + 1j*chirp)
 
 
 def get_analytical_field(params_dict, t_arr, z_arr, function):
