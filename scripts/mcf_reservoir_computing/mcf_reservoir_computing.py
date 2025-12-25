@@ -234,6 +234,7 @@ def mcf_nn_reservoir_computing(
         g0_array=(),
         psat_array=(),
         kappa=0.9,
+        delta_phase=0.0,
         use_gpu=False,
         use_torch=False,
         num_threads: int | str | None = "default",
@@ -281,13 +282,15 @@ def mcf_nn_reservoir_computing(
             Радиусы слоёв (микроны), начиная с центрального (0 µm).
             Длина = ``layer_count + 1``.
         g0_array : array-like, default ()
-            Коэффициенты малого-сигнала g₀ [1/м] для *C* сердцевин.
+            Коэффициенты малого-сигнала g₀ [1/m] для *C* сердцевин.
             Нулевой массив → усиление отключено.
         psat_array : array-like, default ()
-            Мощность насыщения P_sat, Вт, для *C* сердцевин
+            Мощность насыщения P_sat, [W], для *C* сердцевин
             (используется как E_sat = 2 T P_sat).
         kappa : float, default 0.9
-            Коэффициент обратной связи
+            Модуль коэффициента обратной связи
+        delta_phase : float, default 0
+            Фаза в коэффициенте обратной связи
         use_gpu : bool, default False
             True → основное ядро SSFM выполняется на GPU (PyTorch-CUDA),
             иначе – NumPy/CPU.
@@ -424,11 +427,11 @@ def mcf_nn_reservoir_computing(
     feedback_length_m = feedback_loop_propagation_time / beta1_air  # длина воздушного плеча, m
 
     tau_ps = beta1_air * feedback_length_m  # [ps]
-    omega0_rad_per_ps = 2 * np.pi * light.c_light / light.lambda0 * 1e-12
-    feedback_coeff = kappa * np.exp(1j * omega0_rad_per_ps * tau_ps)
+    omega0_rad_per_ps = 2 * np.pi * light.c_light * 1e-12 / (light.lambda0 * 1e-6)
+    feedback_coeff = kappa * np.exp(1j * (omega0_rad_per_ps * tau_ps + delta_phase))
 
     if feedback_length_m < fiber_length_m:
-        print("feedback_length_m < fiber_length_m", feedback_length_m, fiber_length_m)
+        # print("feedback_length_m < fiber_length_m", feedback_length_m, fiber_length_m)
         raise RuntimeError("feedback_length_m < fiber_length_m")
 
     # ─── характерные длины ───────────────────────────────────────
@@ -924,19 +927,19 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
 
         # Вычисляем число обусловленности
         cond_number = np.linalg.cond(A_reg)
-        print(f"Alpha: {alpha}, Condition number: {cond_number}")
+        # print(f"Alpha: {alpha}, Condition number: {cond_number}")
 
         # Если число обусловленности слишком высокое, увеличиваем alpha
         if cond_number > 1e15:
-            print("Condition number too high, increasing alpha...")
+            # print("Condition number too high, increasing alpha...")
             for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
                 A_reg_new = A + new_alpha * np.eye(n_features)
                 new_cond = np.linalg.cond(A_reg_new)
-                print(f"Trying alpha={new_alpha}, condition={new_cond}")
+                # print(f"Trying alpha={new_alpha}, condition={new_cond}")
                 if new_cond < 1e15:
                     alpha = new_alpha
                     A_reg = A_reg_new
-                    print(f"Using alpha={alpha}")
+                    # print(f"Using alpha={alpha}")
                     break
 
         # Используем псевдообратную матрицу для устойчивого решения
@@ -960,18 +963,18 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
         K_reg = K + alpha * np.eye(N)
 
         cond_number = np.linalg.cond(K_reg)
-        print(f"Alpha: {alpha}, Condition number: {cond_number}")
+        # print(f"Alpha: {alpha}, Condition number: {cond_number}")
 
         if cond_number > 1e15:
-            print("Condition number too high, increasing alpha...")
+            # print("Condition number too high, increasing alpha...")
             for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
                 K_reg_new = K + new_alpha * np.eye(N)
                 new_cond = np.linalg.cond(K_reg_new)
-                print(f"Trying alpha={new_alpha}, condition={new_cond}")
+                # print(f"Trying alpha={new_alpha}, condition={new_cond}")
                 if new_cond < 1e15:
                     alpha = new_alpha
                     K_reg = K_reg_new
-                    print(f"Using alpha={alpha}")
+                    # print(f"Using alpha={alpha}")
                     break
 
         try:
@@ -1063,9 +1066,10 @@ class ReservoirConfig:
     upsampling: int = 2
     layer_count: float = 1.0
     layer_radii_array: Tuple[float, ...] = (0.0, 17.3)
-    g0_array: Tuple[float, ...] = (10.0,)
-    psat_array: Tuple[float, ...] = (0.02,)
+    g0_array: Tuple[float, ...] = (10.0,)   # [1/m]
+    psat_array: Tuple[float, ...] = (0.02,) # [W]
     kappa: float = 0.9
+    delta_phase: float = 0
     use_gpu: bool = False
     use_torch: bool = False
     num_threads: int | str | None = "default"
@@ -1151,6 +1155,9 @@ def _reconstruct_masks_or_weights(core_count: int,
     Возвращает один из словарей:
       • {'type':'temporal', 'masks': (C,M)}        — для temporal_* (без каких-либо 'weights')
       • {'type':'spatial',  'weights': (C,)}       — для spatial_only
+
+    Для spatial_only в идеальном (lossless) случае нормируем weights так, чтобы sum(weights**2) = 1.
+    Тогда суммарная мощность входа не зависит от core_count, а gain_in задаёт общий масштаб поля.
     """
     rng = np.random.default_rng(seed)
 
@@ -1168,8 +1175,15 @@ def _reconstruct_masks_or_weights(core_count: int,
         return {"type": "temporal", "masks": masks}
 
     if variant == "spatial_only":
-        # В spatial_only подаём постоянные веса на ядра
+        # В spatial_only подаём постоянные веса на ядра (коэффициенты по полю).
+        # Идеальный SLM: сохраняем суммарную мощность -> нормировка по L2.
         weights = rng.uniform(-1.0, 1.0, size=core_count)
+        w_norm = float(np.linalg.norm(weights))
+        if w_norm > 0.0:
+            weights = weights / w_norm
+        else:
+            weights = np.zeros(core_count, dtype=float)
+            weights[0] = 1.0
         return {"type": "spatial", "weights": weights}
 
     raise ValueError(f"Unknown variant: {variant}")
@@ -1667,9 +1681,26 @@ def generate_input_temporal_same_all_cores(core_count: int, mg_cfg: MGConfig, ma
     return data_in, mg_series
 
 def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Spatial-only вход: один и тот же временной сигнал подаётся на все ядра, но с разными постоянными весами.
+
+    Идеальный (lossless) SLM моделируем как перераспределение мощности между ядрами при сохранении суммарной:
+        sum_c |u_c(t)|^2 = gain_in^2 * |s(t)|^2
+
+    Для этого weights нормируются так, что sum(weights**2) = 1 (weights — коэффициенты по полю/амплитуде).
+    """
     rng = np.random.default_rng(mask_cfg.seed)
     mg_series = _mg_series_from_cfg(mg_cfg)
-    weights = rng.uniform(-1.0, 1.0, size=core_count)
+
+    # Коэффициенты по полю (амплитуде). Оставляю ваш диапазон [0, 1], меняю только нормировку.
+    weights = rng.uniform(0.0, 1.0, size=core_count)
+    w_norm = float(np.linalg.norm(weights))
+    if w_norm > 0.0:
+        weights = weights / w_norm
+    else:
+        weights = np.zeros(core_count, dtype=float)
+        weights[0] = 1.0
+
     data_in = (weights[:, None] * mg_series[None, :]) * mask_cfg.gain_in
     return data_in, mg_series
 
@@ -1700,6 +1731,7 @@ _FIELD_DIGITS = {
     ("reservoir", "psat_array"): 5,
     ("reservoir", "g0_array"): 3,
     ("reservoir", "kappa"): 3,
+    ("reservoir", "delta_phase"): 3,
     ("mask", "gain_in"): 3,
 }
 
@@ -1932,6 +1964,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
         g0_array=tuple(rc["g0_array"]),
         psat_array=tuple(rc["psat_array"]),
         kappa=rc["kappa"],
+        delta_phase=rc["delta_phase"],
         use_gpu=bool(rc["use_gpu"]),
         use_torch=bool(rc["use_torch"]),
         num_threads=rc["num_threads"],
@@ -2549,7 +2582,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     Управление поисковым пространством из main:
       param_space: dict | None
-        Ключи: "kappa", "g0", "psat", "fiber_length_m", "gain_in",
+        Ключи: "kappa", "delta_phase", "g0", "psat", "fiber_length_m", "gain_in",
                "mask_size", "delay_factor_in_symbols".
         Значение для ключа:
           • число → фиксировать (не оптимизировать);
@@ -2560,6 +2593,9 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         Отсутствующий ключ → используется дефолтный диапазон из функции.
 
     Всегда в 1 поток внутри trial (temporary_thread_limits(1)).
+
+    Важно (кластер / много процессов):
+      Печать "GLOBAL BEST" синхронизируется через lock-файл на общей ФС, чтобы не спамили все процессы.
     """
     import optuna
     import warnings
@@ -2599,6 +2635,89 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     print("n_jobs   =", n_jobs)
 
     best = dict(score=float("inf"), res=None, params=None)
+
+    # --- "GLOBAL BEST" печатаем только один раз на улучшение (межпроцессная синхронизация) ---
+    best_state_path = base_dir / ".optuna_global_best.json"
+    best_lock_path = base_dir / ".optuna_global_best.lock"
+    last_best_printed_local = {"trial_number": -1}
+
+    def _print_best_trial(bt: "optuna.trial.FrozenTrial") -> None:
+        print(f"[optuna][GLOBAL BEST] trial={bt.number} value={bt.value}", flush=True)
+        print("[params]", flush=True)
+        for k in sorted(bt.params.keys()):
+            print(f"  {k} = {bt.params[k]}", flush=True)
+
+        print("[user_attrs]", flush=True)
+        if bt.user_attrs:
+            for k in sorted(bt.user_attrs.keys()):
+                print(f"  {k} = {bt.user_attrs[k]}", flush=True)
+        else:
+            print("  <empty>", flush=True)
+
+        print("-" * 80, flush=True)
+
+    def _print_global_best_if_updated(study: "optuna.study.Study") -> None:
+        """
+        Печатает best_trial только тогда, когда глобальный best действительно обновился.
+
+        В multi-process режиме (кластер) синхронизируемся через lock-файл на общей ФС.
+        """
+        try:
+            bt = study.best_trial
+        except Exception:
+            return
+
+        best_no = int(getattr(bt, "number", -1))
+        if best_no < 0:
+            return
+
+        # На POSIX делаем межпроцессный lock; на остальных платформах fallback на локальный guard.
+        if os.name == "posix":
+            try:
+                import fcntl  # noqa: WPS433
+            except Exception:
+                fcntl = None
+
+            if fcntl is not None:
+                best_lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(best_lock_path, "a+", encoding="utf-8") as lf:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+
+                    prev_no = -1
+                    if best_state_path.exists():
+                        try:
+                            import json  # noqa: WPS433
+                            with open(best_state_path, "r", encoding="utf-8") as sf:
+                                prev_no = int(json.load(sf).get("best_trial_number", -1))
+                        except Exception:
+                            prev_no = -1
+
+                    if best_no <= prev_no:
+                        return
+
+                    try:
+                        import json  # noqa: WPS433
+                        with open(best_state_path, "w", encoding="utf-8") as sf:
+                            json.dump(
+                                {
+                                    "best_trial_number": best_no,
+                                    "best_value": float(bt.value) if bt.value is not None else None,
+                                    "ts": datetime.now().isoformat(timespec="seconds"),
+                                },
+                                sf,
+                                ensure_ascii=False,
+                            )
+                    except Exception:
+                        pass
+
+                    _print_best_trial(bt)
+                    return
+
+        # Fallback: хотя бы не спамить в одном процессе.
+        if best_no <= int(last_best_printed_local["trial_number"]):
+            return
+        last_best_printed_local["trial_number"] = best_no
+        _print_best_trial(bt)
 
     def _round(x, digit=13) -> float:
         return float(round(float(x), digit))
@@ -2699,7 +2818,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     def _flatten(prefix, obj):
         import numbers
         if obj is None:
-            yield (prefix, None); return
+            yield (prefix, None)
+            return
         if isinstance(obj, dict):
             for k, v in obj.items():
                 newp = f"{prefix}.{k}" if prefix else str(k)
@@ -2716,17 +2836,22 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
             # --- 1) гиперпараметры из внешнего пространства (или дефолтные диапазоны) ---
-            kappa = (_suggest("kappa", trial, default_kind="float", default_low=0.1, default_high=0.99, search_space=param_space))
+            kappa = (_suggest("kappa", trial, default_kind="float", default_low=0.1, default_high=0.99,
+                              search_space=param_space))
+            delta_phase = (_suggest("delta_phase", trial, default_kind="float", default_low=0.0,
+                                    default_high=2 * np.pi, search_space=param_space))
             g0 = (_suggest("g0", trial, default_kind="float", default_low=0.01, default_high=20.0,
-                                 default_log=True, search_space=param_space))
+                           default_log=True, search_space=param_space))
             psat = (_suggest("psat", trial, default_kind="float", default_low=1e-5, default_high=0.1,
-                                   default_log=True, search_space=param_space))
+                             default_log=True, search_space=param_space))
             fiber_length = (_suggest("fiber_length_m", trial, default_kind="float",
-                                           default_low=0.2, default_high=3.0, default_log=True, search_space=param_space))
+                                     default_low=0.2, default_high=3.0, default_log=True, search_space=param_space))
             gain_in = (_suggest("gain_in", trial, default_kind="float",
-                                      default_low=1.0, default_high=1e2, default_log=True, search_space=param_space))
-            mask_size = _suggest("mask_size", trial, default_kind="int", default_low=30, default_high=400, search_space=param_space)
-            delay_factor = _suggest("delay_factor_in_symbols", trial, default_kind="int", default_low=1, default_high=20, search_space=param_space)
+                                default_low=1.0, default_high=1e2, default_log=True, search_space=param_space))
+            mask_size = _suggest("mask_size", trial, default_kind="int", default_low=30, default_high=400,
+                                 search_space=param_space)
+            delay_factor = _suggest("delay_factor_in_symbols", trial, default_kind="int", default_low=1,
+                                    default_high=20, search_space=param_space)
             time_step_ps = _suggest("time_step_ps", trial, default_kind="float",
                                     default_low=base_cfg.reservoir.time_step_ps,
                                     default_high=base_cfg.reservoir.time_step_ps,
@@ -2750,6 +2875,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     g0_array=tuple([g0] * base_cfg.core_count),
                     psat_array=tuple([psat] * base_cfg.core_count),
                     kappa=kappa,
+                    delta_phase=delta_phase,
                     use_gpu=base_cfg.reservoir.use_gpu,
                     use_torch=base_cfg.reservoir.use_torch,
                     num_threads=1,
@@ -2804,6 +2930,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             trial.set_user_attr("cfg.mask.mask_size", int(cfg.mask.mask_size))
             trial.set_user_attr("cfg.mask.gain_in", float(cfg.mask.gain_in))
             trial.set_user_attr("cfg.reservoir.kappa", float(cfg.reservoir.kappa))
+            trial.set_user_attr("cfg.reservoir.delta_phase", float(cfg.reservoir.delta_phase))
             trial.set_user_attr("cfg.reservoir.upsampling", int(cfg.reservoir.upsampling))
             trial.set_user_attr("cfg.reservoir.delay_factor_in_symbols", int(cfg.reservoir.delay_factor_in_symbols))
             trial.set_user_attr("cfg.reservoir.time_step_ps", int(cfg.reservoir.time_step_ps))
@@ -2837,6 +2964,11 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     print(f"[optimize] Target COMPLETE trials = {n_trials}")
 
+    def _optuna_global_best_callback(study_: "optuna.study.Study", frozen_trial: "optuna.trial.FrozenTrial") -> None:
+        if getattr(frozen_trial, "state", None) != TrialState.COMPLETE:
+            return
+        _print_global_best_if_updated(study_)
+
     if os.getenv("MCF_BASH", ""):
         while True:
             complete_cnt = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
@@ -2846,6 +2978,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             try:
                 value = objective(trial)
                 study.tell(trial, value)
+                _print_global_best_if_updated(study)
             except TrialPruned:
                 study.tell(trial, state=TrialState.PRUNED)
             except (AssertionError, ValueError, RuntimeError) as _e:
@@ -2861,7 +2994,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             n_trials=n_trials,
             n_jobs=n_jobs,
             show_progress_bar=True,
-            catch=(AssertionError, ValueError, RuntimeError, Exception)
+            catch=(AssertionError, ValueError, RuntimeError, Exception),
+            callbacks=[_optuna_global_best_callback],
         )
 
     best_trial = study.best_trial
@@ -2876,6 +3010,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         optuna_best_value=float(best_trial.value),
         study_name=study_name,
     )
+
 
 
 def _update_plots_and_save(results_stream: list[dict],
@@ -3519,7 +3654,7 @@ if __name__ == "__main__":
     # Базовые параметры
     force_rerun = False  # игнорировать кэш и считать заново
     save_cache = False
-    layer_count = 1
+    layer_count = 0
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
 
@@ -3540,35 +3675,36 @@ if __name__ == "__main__":
 
         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
 
-    temporal_mask_modulation_frequency_ghz = 40 / 72  # GHz
+    temporal_mask_modulation_frequency_ghz = 40  # GHz
 
     variant = "spatial_only"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
-        temporal_mask_size = 72
+        temporal_mask_size = 294
     else:
         temporal_mask_size = 1
 
     mg_cfg = MGConfig(t_size=2 ** 10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=52.5)
+    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=30.96)
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=0.051,  # 0.1
+        fiber_length_m=0.1,  # 0.1
         time_step_ps=1.0 / temporal_mask_modulation_frequency_ghz * 1e+3,
         step_number_per_dimensionless_distance=20,
         upsampling=1,
-        delay_factor_in_symbols=6,
+        delay_factor_in_symbols=3,
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([0.9] * core_count),  # 10
-        psat_array=tuple([7.0e-05] * core_count),  # 0.02
-        kappa=0.813,  # 0.9
+        g0_array=tuple([0.0158] * core_count),  # 10
+        psat_array=tuple([1.1054e-05] * core_count),  # 0.02
+        kappa=0.793,  # 0.9
+        delta_phase=0,
         use_gpu=False,
         use_torch=False,
         num_threads=1,
-        display_debug_plots=False,
+        display_debug_plots=True,
         display_debug_info=False,
         save_figs=False,
         max_hours_total=24,
@@ -3590,9 +3726,9 @@ if __name__ == "__main__":
     t = time()
 
     # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
-    # res = run_experiments(base_cfg,force_rerun=force_rerun, save_cache=save_cache)
-    #
-    # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+    #res = run_experiments(base_cfg,force_rerun=force_rerun, save_cache=save_cache)
+
+    #print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # =============== Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===================
 
@@ -3608,17 +3744,19 @@ if __name__ == "__main__":
 
     param_space = {
         "kappa": {"low": 0.2, "high": 0.99},
-        "g0": {"low": 0.001, "high": 5.0, "log": True},
-        "psat": {"low": 1e-5, "high": 1, "log": True},       # 1e-4  # фиксированное, не тюним
-        "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
-        "gain_in": {"low": 1.0, "high": 100.0, "log": True},
+        "delta_phase": 0, # {"low": 0.0, "high": 2 * np.pi},
+        "g0": {"low": 0.0001, "high": 100.0, "log": True},
+        "psat": {"low": 1e-5, "high": 10, "log": True},       # 1e-4  # фиксированное, не тюним
+        "fiber_length_m": 0.000001, # {"low": 0.0001, "high": 3, "log": True},
+        "gain_in": {"low": 0.001, "high": 200.0, "log": True},
         "mask_size": 1, # {"int": True, "low": 5, "high": 300, "step": 1},
-        "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
-        "time_step_ps": {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+        "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
+        "time_step_ps": reservoir_cfg.time_step_ps, # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
     }
 
     # param_space = {
     #     "kappa": {"low": 0.2, "high": 0.99},
+    #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
     #     "g0": {"low": 0.001, "high": 5.0, "log": True},
     #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
     #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
@@ -3632,7 +3770,7 @@ if __name__ == "__main__":
     base_cfg.training.val_frac = 0.3
     res = run_experiments(
         base_cfg,
-        n_trials_opt=100000,  # сколько попробовать конфигураций
+        n_trials_opt=200000,  # сколько попробовать конфигураций
         param_space=param_space,
         force_rerun=False,  # используй кэш, если ключ совпал
         save_cache=False,
@@ -3661,6 +3799,7 @@ if __name__ == "__main__":
     #
     # param_space = {
     #     "kappa": {"low": 0.2, "high": 0.99},
+    #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
     #     "g0": {"low": 0.001, "high": 5.0, "log": True},
     #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
     #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
