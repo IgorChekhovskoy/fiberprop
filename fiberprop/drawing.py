@@ -57,7 +57,7 @@ def plot3D_plotly(t, z, field, name, filename=None, file_format='html', yscale='
         print('plot3D_plotly: \tDone')
 
 
-def plot2D(t_arrr, func_arr, name='', filename=None, file_format='png', yscale='linear'):
+def plot2D(t_arr, func_arr, name='', xlabel='t, fs', ylabel='', yscale='linear'):
     """ Функция строит и выводит одномерный график """
     fig = plt.figure(figsize=(9, 6), frameon=True)
     plt.style.use('ggplot')
@@ -78,12 +78,13 @@ def plot2D(t_arrr, func_arr, name='', filename=None, file_format='png', yscale='
     ax.set(facecolor='w')
     ax.grid('axis = "both"', color='gray')
 
-    ax.set_xlabel('t, fs', labelpad=-10)
+    ax.set_xlabel(xlabel, labelpad=-10)
+    ax.set_ylabel(ylabel, labelpad=-10)
+    ax.set_title(name)
 
     ax.set_yscale(yscale)  # Устанавливаем масштабирование по оси y
 
-    ax.plot(t_arrr, func_arr, color='blue', linestyle='-', linewidth=2, label=name)
-    ax.legend(loc=2)
+    ax.plot(t_arr, func_arr, color='blue', linestyle='-', linewidth=2)
 
     plt.show()
     plt.close(fig)
@@ -150,17 +151,19 @@ def plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale=False, marker_flag
             color, marker = colors[i], markers[i]
             marker = marker if marker_flag else ''
             ax.semilogy(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
-                        linewidth=2, label=line_label)
+                        linewidth=1, label=line_label)
     else:
         for i, line_label in enumerate(func_dict):
             color, marker = colors[i], markers[i]
             marker = marker if marker_flag else ''
             ax.plot(x_arr, func_dict[line_label], color=color, linestyle='-', marker=marker,
-                    linewidth=2, label=line_label)
+                    linewidth=1, label=line_label)
     ax.legend(loc=2)
 
 
-def plot2D_dict(x_arr, func_dict, y_min=0, y_max=10, xlabel='x', ylabel='y', title='', log_scale=False, marker_flag=True):
+def plot2D_dict(x_arr, func_dict, y_min=0, y_max=900,
+                xlabel='x', ylabel='y', title='',
+                log_scale=False, marker_flag=True):
     """ Функция строит и выводит набор двумерных графиков на одном рисунке по словарю """
     fig, ax = create_single_ax(xlabel, ylabel, y_min, y_max, title)
     plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale, marker_flag)
@@ -172,10 +175,11 @@ def plot2D_dict(x_arr, func_dict, y_min=0, y_max=10, xlabel='x', ylabel='y', tit
 def plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict):
     for i, label in enumerate(func_dict):
         axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
+        axs[i].axvline(x=0.0, color='black', linestyle='--', linewidth=1)
         axs[i].legend()
 
 
-def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=4.2):
+def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=900):
     fig, axs = create_multicore_axs(len(func_dict), xlabel, ylabel, y_min, y_max)
     plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict)
     plt.show()
@@ -186,7 +190,7 @@ def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=4.2)
 def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max):
     ncols = 2
     nrows = axs_num // ncols if (axs_num % ncols == 0) else (axs_num // ncols + 1)
-    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, nrows * 6), frameon=True)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, nrows * 6.25), frameon=True)
     plt.style.use('ggplot')
     plt.rcParams['mathtext.fontset'] = 'cm'
     plt.rcParams['font.family'] = 'Times New Roman'
@@ -204,8 +208,8 @@ def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max):
         ax.spines['left'].set_color('black')
         ax.set(facecolor='w')
         ax.grid('axis = "both"', color='gray')
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel(xlabel, labelpad=-5)
+        ax.set_ylabel(ylabel, labelpad=-7)
         ax.set_ylim(y_min, y_max)
 
     if not (axs_num % ncols == 0):

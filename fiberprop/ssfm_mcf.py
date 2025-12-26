@@ -121,7 +121,7 @@ def linear_step(psi, has_beta, D):
 def ssfm_order2_ndn(psi, current_energy, solver,
                     h, tau, damp_length=0.0, noise_amplitude=0.0):
     """ D–N–D со снятием двойных расчётов мощности. """
-    g0   = solver.eq.g_0
+    g0 = solver.eq.g_0
     gain = g0 != 0.0
 
     P = power_abs2_np(psi)
