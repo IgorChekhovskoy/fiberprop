@@ -2482,6 +2482,13 @@ def run_single_experiment(cfg: ExperimentConfig,
     Xva, yva = Xw[sl_val], yw[sl_val]
     Xte, yte = Xw[sl_test], yw[sl_test]
 
+    mu = Xtr.mean(axis=0)
+    sigma = Xtr.std(axis=0)
+    sigma[sigma < 1e-12] = 1.0
+    Xtr = (Xtr - mu) / sigma
+    Xva = (Xva - mu) / sigma
+    Xte = (Xte - mu) / sigma
+
     # обучение рид-аута
     W, ridge_alpha = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True)
 
@@ -3747,7 +3754,7 @@ if __name__ == "__main__":
         "delta_phase": 0, # {"low": 0.0, "high": 2 * np.pi},
         "g0": {"low": 0.0001, "high": 100.0, "log": True},
         "psat": {"low": 1e-5, "high": 10, "log": True},       # 1e-4  # фиксированное, не тюним
-        "fiber_length_m": 0.000001, # {"low": 0.0001, "high": 3, "log": True},
+        "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
         "gain_in": {"low": 0.001, "high": 200.0, "log": True},
         "mask_size": 1, # {"int": True, "low": 5, "high": 300, "step": 1},
         "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
