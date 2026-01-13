@@ -555,7 +555,7 @@ def mcf_nn_reservoir_computing(
 
             if display_debug_plots:
 
-                number_of_points_for_display = 1000 # solver.com.M  # np.min([5000, solver.com.M])
+                number_of_points_for_display = solver.com.M  # np.min([5000, solver.com.M])
                 step = int(solver.com.M / number_of_points_for_display)
 
                 # plot2D_plotly(
@@ -1177,7 +1177,7 @@ def _reconstruct_masks_or_weights(core_count: int,
     if variant == "spatial_only":
         # В spatial_only подаём постоянные веса на ядра (коэффициенты по полю).
         # Идеальный SLM: сохраняем суммарную мощность -> нормировка по L2.
-        weights = rng.uniform(-1.0, 1.0, size=core_count)
+        weights = rng.uniform(0.0, 1.0, size=core_count)
         w_norm = float(np.linalg.norm(weights))
         if w_norm > 0.0:
             weights = weights / w_norm
@@ -2847,10 +2847,35 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                               search_space=param_space))
             delta_phase = (_suggest("delta_phase", trial, default_kind="float", default_low=0.0,
                                     default_high=2 * np.pi, search_space=param_space))
-            g0 = (_suggest("g0", trial, default_kind="float", default_low=0.01, default_high=20.0,
-                           default_log=True, search_space=param_space))
-            psat = (_suggest("psat", trial, default_kind="float", default_low=1e-5, default_high=0.1,
-                             default_log=True, search_space=param_space))
+
+            g0_array = []
+            psat_array = []
+
+            # Проверяем, нужно ли оптимизировать отдельно для каждого ядра
+            if param_space and isinstance(param_space.get("g0"), list):
+                # Если g0 задан как список в param_space
+                for i in range(base_cfg.core_count):
+                    g0 = _suggest(f"g0_{i}", trial, default_kind="float", default_low=0.01, default_high=20.0,
+                                  default_log=True, search_space=param_space)
+                    g0_array.append(g0)
+            else:
+                # Стандартная оптимизация одного значения для всех ядер
+                g0 = (_suggest("g0", trial, default_kind="float", default_low=0.01, default_high=20.0,
+                               default_log=True, search_space=param_space))
+                g0_array = [g0] * base_cfg.core_count
+
+            if param_space and isinstance(param_space.get("psat"), list):
+                # Если psat задан как список в param_space
+                for i in range(base_cfg.core_count):
+                    psat = _suggest(f"psat_{i}", trial, default_kind="float", default_low=1e-5, default_high=0.1,
+                                    default_log=True, search_space=param_space)
+                    psat_array.append(psat)
+            else:
+                # Стандартная оптимизация одного значения для всех ядер
+                psat = (_suggest("psat", trial, default_kind="float", default_low=1e-5, default_high=0.1,
+                                 default_log=True, search_space=param_space))
+                psat_array = [psat] * base_cfg.core_count
+
             fiber_length = (_suggest("fiber_length_m", trial, default_kind="float",
                                      default_low=0.2, default_high=3.0, default_log=True, search_space=param_space))
             gain_in = (_suggest("gain_in", trial, default_kind="float",
@@ -2879,8 +2904,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     upsampling=base_cfg.reservoir.upsampling,
                     layer_count=base_cfg.reservoir.layer_count,
                     layer_radii_array=base_cfg.reservoir.layer_radii_array,
-                    g0_array=tuple([g0] * base_cfg.core_count),
-                    psat_array=tuple([psat] * base_cfg.core_count),
+                    g0_array=tuple(g0_array),
+                    psat_array=tuple(psat_array),
                     kappa=kappa,
                     delta_phase=delta_phase,
                     use_gpu=base_cfg.reservoir.use_gpu,
@@ -3661,7 +3686,101 @@ if __name__ == "__main__":
     # Базовые параметры
     force_rerun = False  # игнорировать кэш и считать заново
     save_cache = False
-    layer_count = 0
+
+    ########### Parameters for the best regimes #############
+
+    params = {}
+
+    # # best 1-core with temporal mask (0.534051376182763)
+    # params = {
+    #     "layer_count": 0,
+    #     "variant": "temporal_same_all_cores",
+    #     "delay_factor_in_symbols": 9,
+    #     "fiber_length_m": 0.025452927924700015,
+    #     "g0": 25.263000926144148,
+    #     "gain_in": 70.73874859737282,
+    #     "kappa": 0.3468221607798453,
+    #     "psat": 0.000989736646092226
+    # }
+    #
+    # # # best 1-core with temporal mask (0.6046692821976254)
+    # params = {
+    #     "layer_count": 0,
+    #     "variant": "temporal_same_all_cores",
+    #     "delay_factor_in_symbols": 4,
+    #     "fiber_length_m": 0.20824462603995597,
+    #     "g0": 0.00012112194746004569,
+    #     "gain_in": 109.16390472938491,
+    #     "kappa": 0.7605799908679632,
+    #     "mask_size": 158,
+    #     "psat": 1.5188531613954726,
+    # }
+    #
+    # # best 7-core with equal temporal masks ("nrmse_val": 0.3765429442430391)
+    # params = {
+    #     "layer_count": 1,
+    #     "variant": "temporal_same_all_cores",
+    #     "delay_factor_in_symbols": 3,
+    #     "fiber_length_m": 0.029532836852220454,
+    #     "g0": 0.003994483003827699,
+    #     "gain_in": 63.1325986315943,
+    #     "kappa": 0.767900837893305,
+    #     "mask_size": 269,
+    #     "psat": 0.043516668288062166
+    # }
+    #
+    # # best 7-core with different temporal masks (value=0.00048644843214891366)
+    # params = {
+    #     "layer_count": 1,
+    #     "variant": "temporal_unique_per_core",
+    #     "delay_factor_in_symbols": 4,
+    #     "fiber_length_m": 0.195738262714597,
+    #     "g0": 2.4250900923903105,
+    #     "gain_in": 18.937924821977948,
+    #     "kappa": 0.8096486533100956,
+    #     "mask_size": 321,
+    #     "psat": 0.0002199642471655403,
+    # }
+    #
+    # # best 7-core with spatial mask ("nrmse_val": 0.534051376182763)
+    # params = {
+    #     "layer_count": 1,
+    #     "variant": "spatial_only",
+    #     "delay_factor_in_symbols": 9,
+    #     "fiber_length_m": 0.025452927924700015,
+    #     "g0": 25.263000926144148,
+    #     "gain_in": 70.73874859737282,
+    #     "kappa": 0.3468221607798453,
+    #     "psat": 0.000989736646092226,
+    # }
+    #
+    # # best 19-core with spatial mask ('optuna_best_value': 0.27960669434400703)
+    params = {
+        "layer_count": 2,
+        "variant": "spatial_only",
+        'kappa': 0.7514549959835767,
+        'g0': 0.03333587932400271,
+        'psat': 5.5359281838356184e-05,
+        'fiber_length_m': 0.004480407948553015,
+        'gain_in': 119.59275595623892,
+        'delay_factor_in_symbols': 3,
+    }
+    #
+    # # best 37-core with spatial mask ('optuna_best_value': 0.16953488306286332)
+    # params = {
+    #     "layer_count": 3,
+    #     "variant": "spatial_only",
+    #     'kappa': 0.5089340404443606,
+    #     'g0': 0.0004533592157416011,
+    #     'psat': 6.265629327274745e-05,
+    #     'fiber_length_m': 0.017535040039437726,
+    #     'gain_in': 155.58427927073484,
+    #     'delay_factor_in_symbols': 6,
+    # }
+
+    #####################################################
+
+    layer_count = params.get("layer_count", 1)
     core_configuration = CoreConfig.hexagonal
     core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
 
@@ -3684,30 +3803,30 @@ if __name__ == "__main__":
 
     temporal_mask_modulation_frequency_ghz = 40  # GHz
 
-    variant = "spatial_only"  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = params.get("variant", "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
-        temporal_mask_size = 294
+        temporal_mask_size = params.get("mask_size", 294)
     else:
         temporal_mask_size = 1
 
     mg_cfg = MGConfig(t_size=2 ** 10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=30.96)
+    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=params.get("gain_in", 30.96))
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=0.1,  # 0.1
-        time_step_ps=1.0 / temporal_mask_modulation_frequency_ghz * 1e+3,
+        fiber_length_m=params.get("fiber_length_m", 0.1),  # 0.1
+        time_step_ps=params.get("time_step_ps", 1.0 / temporal_mask_modulation_frequency_ghz * 1e+3),
         step_number_per_dimensionless_distance=20,
         upsampling=1,
-        delay_factor_in_symbols=3,
+        delay_factor_in_symbols=params.get("delay_factor_in_symbols", 3),
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([0.0158] * core_count),  # 10
-        psat_array=tuple([1.1054e-05] * core_count),  # 0.02
-        kappa=0.793,  # 0.9
-        delta_phase=0,
+        g0_array=tuple([params.get("g0", 0.0158)] * core_count),  # 10
+        psat_array=tuple([params.get("psat", 1.1054e-05)] * core_count),  # 0.02
+        kappa=params.get("kappa", 0.793),  # 0.9
+        delta_phase=params.get("delta_phase", 0),
         use_gpu=False,
         use_torch=False,
         num_threads=1,
@@ -3733,9 +3852,9 @@ if __name__ == "__main__":
     t = time()
 
     # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
-    #res = run_experiments(base_cfg,force_rerun=force_rerun, save_cache=save_cache)
+    res = run_experiments(base_cfg,force_rerun=force_rerun, save_cache=save_cache)
 
-    #print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # =============== Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===================
 
@@ -3749,40 +3868,58 @@ if __name__ == "__main__":
     # На линуксе порт 18080, поэтому
     # открой в браузере http://127.0.0.1:18080/dashboard
 
-    param_space = {
-        "kappa": {"low": 0.2, "high": 0.99},
-        "delta_phase": 0, # {"low": 0.0, "high": 2 * np.pi},
-        "g0": {"low": 0.0001, "high": 100.0, "log": True},
-        "psat": {"low": 1e-5, "high": 10, "log": True},       # 1e-4  # фиксированное, не тюним
-        "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
-        "gain_in": {"low": 0.001, "high": 200.0, "log": True},
-        "mask_size": 1, # {"int": True, "low": 5, "high": 300, "step": 1},
-        "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
-        "time_step_ps": reservoir_cfg.time_step_ps, # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
-    }
+    # param_space = {
+    #     "kappa": {"low": 0.2, "high": 0.99},
+    #     "delta_phase": 0, # {"low": 0.0, "high": 2 * np.pi},
+    #     "g0": {"low": 0.0001, "high": 100.0, "log": True},
+    #     "psat": {"low": 1e-5, "high": 10, "log": True},       # 1e-4  # фиксированное, не тюним
+    #     "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
+    #     "gain_in": {"low": 0.001, "high": 200.0, "log": True},
+    #     "mask_size": 1, # {"int": True, "low": 5, "high": 300, "step": 1},
+    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
+    #     "time_step_ps": reservoir_cfg.time_step_ps, # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+    # }
 
     # param_space = {
     #     "kappa": {"low": 0.2, "high": 0.99},
-    #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
-    #     "g0": {"low": 0.001, "high": 5.0, "log": True},
-    #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
-    #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
-    #     "gain_in": {"low": 1.0, "high": 100.0, "log": True},
-    #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
-    #     # "time_step_ps": {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+    #     "delta_phase": 0,  # {"low": 0.0, "high": 2 * np.pi},
+    #     "g0": [
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 0
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 1
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 2
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 3
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 4
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 5
+    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 6
+    #     ],
+    #     # psat как список - оптимизируется для каждого ядра отдельно
+    #     "psat": [
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 0
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 1
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 2
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 3
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 4
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 5
+    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 6
+    #     ],
+    #     "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
+    #     "gain_in": {"low": 0.001, "high": 200.0, "log": True},
+    #     "mask_size": 1,  # {"int": True, "low": 5, "high": 300, "step": 1},
+    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
+    #     "time_step_ps": reservoir_cfg.time_step_ps,
+    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
     # }
-
-    base_cfg.training.train_frac = 0.7
-    base_cfg.training.val_frac = 0.3
-    res = run_experiments(
-        base_cfg,
-        n_trials_opt=200000,  # сколько попробовать конфигураций
-        param_space=param_space,
-        force_rerun=False,  # используй кэш, если ключ совпал
-        save_cache=False,
-    )
-    print("Лучший результат Optuna:\n", res)
+    #
+    # base_cfg.training.train_frac = 0.7
+    # base_cfg.training.val_frac = 0.3
+    # res = run_experiments(
+    #     base_cfg,
+    #     n_trials_opt=200000,  # сколько попробовать конфигураций
+    #     param_space=param_space,
+    #     force_rerun=False,  # используй кэш, если ключ совпал
+    #     save_cache=False,
+    # )
+    # print("Лучший результат Optuna:\n", res)
 
     # ==================== Зависимость NMRSE от коэффициента связи при наличии временной маски =========================
 
