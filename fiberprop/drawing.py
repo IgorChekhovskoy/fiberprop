@@ -161,13 +161,16 @@ def plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale=False, marker_flag
     ax.legend(loc=2)
 
 
-def plot2D_dict(x_arr, func_dict, y_min=0, y_max=900,
-                xlabel='x', ylabel='y', title='',
+def plot2D_dict(x_arr, func_dict, y_min=0, y_max=100,
+                xlabel='x', ylabel='y', title='', path='', name='',
                 log_scale=False, marker_flag=True):
     """ Функция строит и выводит набор двумерных графиков на одном рисунке по словарю """
     fig, ax = create_single_ax(xlabel, ylabel, y_min, y_max, title)
     plot2D_dict_ForVideo(fig, ax, x_arr, func_dict, log_scale, marker_flag)
-    plt.show()
+    if path:
+        fig.savefig(path + '\\' + name + '.png')
+    else:
+        plt.show()
     plt.close(fig)
     print('plot2D_dict: \tDone')
 
@@ -175,19 +178,22 @@ def plot2D_dict(x_arr, func_dict, y_min=0, y_max=900,
 def plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict):
     for i, label in enumerate(func_dict):
         axs[i].plot(x_arr, func_dict[label], color='red', linestyle='-', label=label)
-        axs[i].axvline(x=0.0, color='black', linestyle='--', linewidth=1)
+        # axs[i].axvline(x=0.0, color='black', linestyle='--', linewidth=1)
         axs[i].legend()
 
 
-def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=900):
-    fig, axs = create_multicore_axs(len(func_dict), xlabel, ylabel, y_min, y_max)
+def plot2D_multicore(x_arr, func_dict, xlabel='', ylabel='', y_min=0, y_max=900, y_logscale=False, path='', name=''):
+    fig, axs = create_multicore_axs(len(func_dict), xlabel, ylabel, y_min, y_max, y_logscale)
     plot2D_multicore_ForVideo(fig, axs, x_arr, func_dict)
-    plt.show()
+    if path:
+        fig.savefig(path + '\\' + name + '.png')
+    else:
+        plt.show()
     plt.close(fig)
     print('plot2D_multicore: \tDone')
 
 
-def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max):
+def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max, y_logscale=False):
     ncols = 2
     nrows = axs_num // ncols if (axs_num % ncols == 0) else (axs_num // ncols + 1)
     fig, axs = plt.subplots(nrows, ncols, figsize=(5 * ncols, nrows * 6.25), frameon=True)
@@ -210,7 +216,10 @@ def create_multicore_axs(axs_num, xlabel, ylabel, y_min, y_max):
         ax.grid('axis = "both"', color='gray')
         ax.set_xlabel(xlabel, labelpad=-5)
         ax.set_ylabel(ylabel, labelpad=-7)
-        ax.set_ylim(y_min, y_max)
+        if y_logscale:
+            ax.set_yscale('log')
+        else:
+            ax.set_ylim(y_min, y_max)
 
     if not (axs_num % ncols == 0):
         empty_num = nrows * ncols - axs_num
