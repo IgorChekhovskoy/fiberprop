@@ -1,6 +1,8 @@
 import copy
 import time
 
+from julia_compute.functions import make_iteration_julia, make_iteration_dcalc_julia
+
 from tqdm import trange
 from scipy.fft import fftfreq
 from scipy.linalg import expm
@@ -1487,6 +1489,25 @@ class Solver:
                             self.com.h, tau,
                             self.com.damp_length,
                             self.eq.noise_amplitude,
+                        )
+                    elif (self.com.method == "ssfm_order2_ndn_by_julia") and (not self.beta1_of_z is None) and (not self.self_coupling_of_z is None):
+                        psi_next = make_iteration_dcalc_julia(
+                            psi_next,
+                            self.com.N, self.com.M, self.com.L2, (self.com.T2 - self.com.T1),
+                            self.eq.size, self.beta1_of_z[:, n], self.eq.beta2, self.eq.gamma, 
+                            self.eq.E_sat, self.eq.alpha, self.eq.g_0, 
+                            self.eq.noise_amplitude,
+                            self.linear_coeffs_array,
+                            self.self_coupling_of_z[:, n]
+                        )
+                    elif (self.com.method == "ssfm_order2_ndn_by_julia") and (self.beta1_of_z is None) and (self.self_coupling_of_z is None):
+                        psi_next = make_iteration_julia(
+                            psi_next,
+                            self.com.N, self.com.M, self.com.L2, (self.com.T2 - self.com.T1),
+                            self.eq.size, self.beta1_of_z[:, n], self.eq.beta2, self.eq.gamma, 
+                            self.eq.E_sat, self.eq.alpha, self.eq.g_0, 
+                            self.eq.noise_amplitude,
+                            self.D
                         )
                     elif self.com.method == "ssfm_order2_dnd":
                         psi_next = ssfm_order2_dnd(

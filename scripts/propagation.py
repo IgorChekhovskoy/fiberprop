@@ -1,14 +1,99 @@
 from fiberprop.solver import (ComputationalParameters, EquationParameters,
                               Solver, CoreConfig)
 from fiberprop.drawing import plot2D_multicore, plot2D_dict
-from scripts.mcf_reservoir_computing.mcf_reservoir_computing import compute_characteristic_lengths
+# from scripts.mcf_reservoir_computing.mcf_reservoir_computing import compute_characteristic_lengths
 from fiberprop.pulses import laser_pulse, zero_pulse
 from fiberprop.ssfm_mcf import get_energy_rectangles
 from scipy.interpolate import make_interp_spline
 from scipy.fft import fftshift, fft
 import matplotlib.pyplot as plt
+from numpy.typing import NDArray
 import numpy as np
 import os
+
+
+def compute_characteristic_lengths(beta2_ps2_m: float,
+                                   gamma_1_w_m: float,
+                                   coupling_coefficient: float,
+                                   data_in: NDArray[np.complex128],
+                                   time_step_ps: float,
+                                   *,
+                                   use_fwhm: bool = False,
+                                   central_core_ind: int = 0,
+                                   g0_array=(),
+                                   psat_array=(),
+                                   display_debug_info: bool = False):
+    """
+    Return (L_D, L_NL, L_coupling, L_gain)  using either
+    • integral definitions  (default)  or
+    • peak-power/FWHM shortcut   (set use_fwhm=True).
+
+    Parameters are the same as the old version, plus
+    `use_fwhm` – choose old behaviour.
+    """
+
+    # ------------------------------------------------------------------
+    # common quantities
+    # ------------------------------------------------------------------
+    q = data_in[central_core_ind]
+    power = np.abs(q) ** 2  # W
+    tau = time_step_ps  # ps
+    L_coupling = np.pi / (2 * coupling_coefficient) if coupling_coefficient else np.inf
+
+    if use_fwhm:
+        # ==============================================================
+        # 1. old FWHM / peak-power approach
+        # ==============================================================
+        P_peak = power.max() if power.size else 0.0
+        idx_peak = power.argmax()
+
+        half = 0.5 * P_peak
+        above = power >= half
+        # boundaries
+        l = idx_peak
+        while l > 0 and above[l]:
+            l -= 1
+        r = idx_peak
+        while r < power.size - 1 and above[r]:
+            r += 1
+
+        tau_fwhm_ps = (r - l) * tau
+        T0_ps = tau_fwhm_ps / 1.763 if tau_fwhm_ps > 0 else np.inf
+
+        L_D = T0_ps ** 2 / abs(beta2_ps2_m) if beta2_ps2_m else np.inf
+        L_NL = 1.0 / (gamma_1_w_m * P_peak) if P_peak else np.inf
+
+    else:
+        # ==============================================================
+        # 2. integral definitions  (preferred / default)
+        # ==============================================================
+        # ∫|q|² dt
+        energy = power.sum() * tau  # W·ps
+        if energy == 0:
+            return np.inf, np.inf, L_coupling, np.inf
+
+        # ∫|∂_t q|² dt
+        dqdt = np.gradient(q, tau)  # √W / ps
+        disp_int = (np.abs(dqdt) ** 2).sum() * tau  # W / ps
+
+        # ∫|q|⁴ dt
+        quartic = (power ** 2).sum() * tau  # W²·ps
+
+        L_D = 2 * energy / (abs(beta2_ps2_m) * disp_int) if disp_int and beta2_ps2_m else np.inf
+        L_NL = energy / (gamma_1_w_m * quartic) if quartic else np.inf
+
+    g = np.asarray(g0_array, float).ravel()
+    m = np.isfinite(g) & (g > 1e-12)
+    L_gain = 1.0 / np.max(g[m]) if np.any(m) else np.inf
+
+    if display_debug_info:
+        print(f"\nIntegral method = {not use_fwhm}")
+        print(f"L_D        : {L_D:.4g} m")
+        print(f"L_NL       : {L_NL:.4g} m")
+        print(f"L_coupling : {L_coupling:.4g} m")
+        print(f"L_gain : {L_gain:.4g} m\n")
+
+    return L_D, L_NL, L_coupling, L_gain
 
 
 def get_dn_of_z(eq, com, z_array,
@@ -40,13 +125,14 @@ def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4
 
     # параметры вычислительной сетки
     ComputationalParameters.get_info()
-    fiber_length = 200  # длина волокна [m]
+    fiber_length = 200.0  # длина волокна [m]
     my_N = round(fiber_length / spatial_step)  # разбиение таково,
     # чтобы пространственный шаг составлял spatial_step м
     my_M = 512
     td_width = 5e3  # ширина временного интервала [ps]
     computational_params = ComputationalParameters(N=my_N, M=my_M, L1=0.0, L2=fiber_length,
-                                                   T1=-td_width/2, T2=td_width/2)
+                                                   T1=-td_width/2, T2=td_width/2, 
+                                                   method="ssfm_order2_ndn_by_julia")  # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn"
 
     # параметры уравнения
     EquationParameters.get_info()
@@ -294,7 +380,7 @@ if __name__ == "__main__":
                 file.write(key + ":\t\t\t" + str(val) + "\n")
     dir_path = os.path.dirname(os.path.abspath(__file__))
 
-    spatial_step = 5e-5  # [m]
+    spatial_step = 3e-4  # [m]
     curr_path = dir_path + "\\propagation_results"
     params_dict = {'spatial_step': spatial_step, 'dn': 1e-3,
                    'dn_step': 0.005, 'J_coef': 1e-4,
