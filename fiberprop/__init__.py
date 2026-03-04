@@ -11,3 +11,8 @@ from .spectrum_characteristics import *
 from .ssfm_mcf import *
 from .ssfm_mcf_pytorch import *
 # from .stationary_solution_solver import *
+
+try:
+    from .ssfm_julia import ssfm_order2_ndn_julia, nonlinear_step_julia, linear_step_julia
+except ImportError:
+    pass

@@ -1,0 +1,13 @@
+{
+    "julia": "1.9",
+    "packages": {
+        "FFTW": {
+            "uuid": "7a1cc6ca-52ef-59f5-83cd-3a7055c09341",
+            "version": "1"
+        },
+        "PythonCall": {
+            "uuid": "6099a3de-0909-46bc-b1f4-468b9a2dfc0d",
+            "version": "0.9"
+        }
+    }
+}

@@ -73,6 +73,11 @@ def configure_threads(num_threads: Union[int, str, None] = "default",
     if kmp_blocktime_infinite:
         os.environ["KMP_BLOCKTIME"] = "infinite"
 
+    # JULIA_NUM_THREADS must be set before the first import of juliacall.
+    # Use setdefault so a user-set value is never overridden.
+    if n is not None:
+        os.environ.setdefault("JULIA_NUM_THREADS", str(int(n)))
+
     if n == 1:
         # полностью отключаем пиннинг в рантайме OpenMP/MKL
         os.environ["KMP_AFFINITY"] = "disabled"  # или "none"
@@ -110,7 +115,7 @@ def threading_report() -> dict:
         "env": {k: os.environ.get(k) for k in (
             "OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS",
             "VECLIB_MAXIMUM_THREADS","OMP_WAIT_POLICY","KMP_BLOCKTIME","KMP_AFFINITY",
-            "NUMBA_THREADING_LAYER","NUMBA_NUM_THREADS"
+            "NUMBA_THREADING_LAYER","NUMBA_NUM_THREADS","JULIA_NUM_THREADS"
         )},
         "numpy_blas_openmp": [],
         "torch": {},

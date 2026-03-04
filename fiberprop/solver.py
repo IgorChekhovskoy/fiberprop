@@ -1,31 +1,41 @@
 import copy
+import os
 import time
+from dataclasses import dataclass, field
+from math import pi, sqrt
+from typing import Union
 
-from tqdm import trange
 from scipy.fft import fftfreq
 from scipy.linalg import expm
-from dataclasses import dataclass, field
-from typing import Union
-from math import sqrt, pi
-import os
+from tqdm import trange
+
 os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
 from numba import njit
 
-from .fiber_geometry import make_eq_mask, CoreConfig, get_core_count, Mask
-from .pulses import zero_pulse
 from .drawing import *
+from .fiber_geometry import CoreConfig, Mask, get_core_count, make_eq_mask
+from .parallel_runtime import configure_threads, threading_report
+from .pulses import zero_pulse
 from .rk4 import rk4_step
-from .ssfm_compact_scheme_mcf import ssfm_order2_ndn_compact_windowed, prepare_compact_solver_for_linear_step, \
-    ssfm_order2_dnd_compact_windowed, ssfm_order2_dnd_compact_windowed_short
-from .ssfm_mcf import ssfm_order2_ndn, get_energy_rectangles, ssfm_order1_resonator_nocos, \
-    ssfm_order1_resonator_fullcos, \
-    ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed_short, \
-    ssfm_order2_dnd_short
+from .ssfm_compact_scheme_mcf import (
+    prepare_compact_solver_for_linear_step,
+    ssfm_order2_dnd_compact_windowed,
+    ssfm_order2_dnd_compact_windowed_short,
+    ssfm_order2_ndn_compact_windowed,
+)
+from .ssfm_julia import ssfm_order2_ndn_julia
+from .ssfm_mcf import (
+    get_energy_rectangles,
+    ssfm_order1_resonator_fullcos,
+    ssfm_order1_resonator_nocos,
+    ssfm_order2_2_in_fourier_space,
+    ssfm_order2_dnd,
+    ssfm_order2_dnd_short,
+    ssfm_order2_dnd_windowed_short,
+    ssfm_order2_ndn,
+)
 from .stationary_solution_solver import find_stationary_solution
 from .utils import fft_derivative
-
-from .parallel_runtime import configure_threads, threading_report
-
 
 try:
     import torch
@@ -33,9 +43,13 @@ try:
 except ImportError:
     _TORCH_AVAILABLE = False
 
-from .ssfm_mcf_pytorch import ssfm_order2_dnd_pytorch, ssfm_order2_dnd_windowed_short_pytorch, \
-    ssfm_order2_dnd_short_pytorch, ssfm_order2_ndn_pytorch
 from .rk4_pytorch import rk4_step_torch
+from .ssfm_mcf_pytorch import (
+    ssfm_order2_dnd_pytorch,
+    ssfm_order2_dnd_short_pytorch,
+    ssfm_order2_dnd_windowed_short_pytorch,
+    ssfm_order2_ndn_pytorch,
+)
 
 
 @dataclass
@@ -1041,7 +1055,7 @@ class Solver:
     # ─── solver.py ─────────────────────────────────────────────
     def calculate_all_dispersion_matrices(self, h: float):
         
-        if self.com.method == "ssfm_order2_ndn" or self.com.method == "ssfm_order2_ndn_windowed":
+        if self.com.method in ("ssfm_order2_ndn", "ssfm_order2_ndn_windowed", "ssfm_order2_ndn_julia"):
             if self.D is None:
                 self.calculate_D_matrix(self.com.h)
 
@@ -1478,7 +1492,7 @@ class Solver:
             else:
                 for n in trange(self.com.N, disable=not self.display_debug_info):
                     if self.com.method == "ssfm_order2_ndn":
-                        if (not self.beta1_of_z is None) and (not self.self_coupling_of_z is None):
+                        if (self.beta1_of_z is not None) and (self.self_coupling_of_z is not None):
                             self.calculate_D_matrix_of_n(self.com.h, n)
                         psi_next = ssfm_order2_ndn(
                             psi_next,
@@ -1512,6 +1526,15 @@ class Solver:
                             self.energy[:, n],
                             self,
                             self.com.h, tau, self.com.M,
+                            self.com.damp_length,
+                            self.eq.noise_amplitude,
+                        )
+                    elif self.com.method == "ssfm_order2_ndn_julia":
+                        psi_next = ssfm_order2_ndn_julia(
+                            psi_next,
+                            self.energy[:, n],
+                            self,
+                            self.com.h, tau,
                             self.com.damp_length,
                             self.eq.noise_amplitude,
                         )
