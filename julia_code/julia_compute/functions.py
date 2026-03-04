@@ -13,9 +13,9 @@ def make_iteration_julia(initial_psi: NDArray[np.complex128],
                          E_sat: NDArray[np.float64], alpha: NDArray[np.float64], g_0: NDArray[np.float64], 
                          noise_amplitude: np.float64,
                          D: NDArray[np.complex128]) -> NDArray[np.complex128]:
-    new_psi = Main.ComputingJuliaModule.make_iteration_for_python(initial_psi, N, M, L2, T, size, 
-                                                                  beta1, beta2, gamma,  E_sat, alpha, g_0, 
-                                                                  noise_amplitude, D)
+    new_psi = Main.ComputingJuliaModule.make_ndn_iteration_for_python(initial_psi, N, M, L2, T, size, 
+                                                                      beta1, beta2, gamma,  E_sat, alpha, g_0, 
+                                                                      noise_amplitude, D)
     return np.array(new_psi, dtype=np.complex128)
 
 def make_iteration_dcalc_julia(initial_psi: NDArray[np.complex128],
@@ -25,7 +25,7 @@ def make_iteration_dcalc_julia(initial_psi: NDArray[np.complex128],
                                noise_amplitude: np.float64,
                                linear_coeffs_array: NDArray[np.float64],
                                self_coupling: NDArray[np.float64]) -> NDArray[np.complex128]:
-    new_psi = Main.ComputingJuliaModule.make_iteration_dcalc_for_python(initial_psi, N, M, L2, T, size, 
-                                                                        beta1, beta2, gamma,  E_sat, alpha, g_0, 
-                                                                        noise_amplitude, linear_coeffs_array, self_coupling)
+    new_psi = Main.ComputingJuliaModule.make_ndn_iteration_dcalc_for_python(initial_psi, N, M, L2, T, size, 
+                                                                            beta1, beta2, gamma,  E_sat, alpha, g_0, 
+                                                                            noise_amplitude, linear_coeffs_array, self_coupling)
     return np.array(new_psi, dtype=np.complex128)

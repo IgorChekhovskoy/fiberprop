@@ -5,7 +5,7 @@ include("structures.jl")
    Вычисляет матрицу D размера (n, n, M) или (n, n) если производные от константы распространения нулевые.
 - linear_coeffs_array: матрица связи (n, n) (Float64)
 - self_coupling: набор (n, N) поправок на диагонали матрицы связи (self coupling) при фиксированном z
-- h: шаг по z
+- h: шаг по z (в зависимости от схемы может отличаться от com.h)
 - omega: частотная сетка
 Возвращает массив комплексных чисел размером (n, n, M).
 """
@@ -13,6 +13,7 @@ function calculate_D_matrix(eq::EquationParameters,
                             com::ComputationalParameters,
                             linear_coeffs_array::Matrix{Float64},
                             self_coupling::AbstractVector{Float64},
+                            h_coef::Float64,
                             omega::AbstractVector{Float64})::Array{ComplexF64}
     n = eq.size
     M = com.M
@@ -26,11 +27,11 @@ function calculate_D_matrix(eq::EquationParameters,
     sc = self_coupling                    # (n)
 
     if all(iszero, β1) && all(iszero, β2)
-        return calculate_coupling_matrix_exponent(eq, linear_coeffs_array, self_coupling, com.h)
+        return calculate_coupling_matrix_exponent(eq, linear_coeffs_array, self_coupling, h_coef)
     end
 
     # Частотная сетка (циклические частоты)
-    ω = omega                             # (M)
+    ω = omega  # (M)
 
     # Итоговая матрица D (n, n, M)
     D = Array{ComplexF64, 3}(undef, n, n, M)
@@ -59,8 +60,8 @@ function calculate_D_matrix(eq::EquationParameters,
             end
         end
 
-        # Умножаем на шаг h
-        A .*= com.h
+        # Умножаем на шаг
+        A .*= h_coef
 
         # Экспонента от матрицы
         D[:, :, m] = exp(A)

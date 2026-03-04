@@ -137,17 +137,17 @@ def test_mcf_beta1_dimensional():
     print("n_cladding =", fiber.n_cladding)
 
     # Расчёт коэффициентов связи
-    coup_mat, err_mat = get_coupling_coefficients(fiber, light, eps=1e-2)
+    coup_mat = get_coupling_coefficients(fiber, light, eps=1e-2)
 
     coupling_coefficient = coup_mat[0][1]
-    coupling_coefficient_estimated_error = err_mat[0][1]
+    # coupling_coefficient_estimated_error = err_mat[0][1]
 
     print(f'Lambda = {fiber.distance_to_fiber_center[0] * 2.0} мкм')
-    print(f'k = {coupling_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
+    # print(f'k = {coupling_coefficient} +- {coupling_coefficient_estimated_error} 1/m')
     print(f'L = {0.5 * np.pi / coupling_coefficient} m \n')
 
-    gamma, gamma_error = fiber.get_gamma(light, eps=1e-2)
-    print(f'Gamma = {gamma} +- {gamma_error} 1/(W*m)')
+    gamma = fiber.get_gamma(light, eps=1e-2)
+    # print(f'Gamma = {gamma} +- {gamma_error} 1/(W*m)')
 
     b = fiber.get_b(light)
     print(f'B = {b}')

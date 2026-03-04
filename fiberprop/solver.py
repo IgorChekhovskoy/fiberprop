@@ -1043,7 +1043,9 @@ class Solver:
     # ─── solver.py ─────────────────────────────────────────────
     def calculate_all_dispersion_matrices(self, h: float):
         
-        if self.com.method == "ssfm_order2_ndn" or self.com.method == "ssfm_order2_ndn_windowed":
+        if (self.com.method == "ssfm_order2_ndn" or 
+            self.com.method == "ssfm_order2_ndn_windowed" or 
+            ((self.com.method == "ssfm_order2_ndn_by_julia") and (self.beta1_of_z is None) and (self.self_coupling_of_z is None))):
             if self.D is None:
                 self.calculate_D_matrix(self.com.h)
 
@@ -1504,7 +1506,7 @@ class Solver:
                         psi_next = make_iteration_julia(
                             psi_next,
                             self.com.N, self.com.M, self.com.L2, (self.com.T2 - self.com.T1),
-                            self.eq.size, self.beta1_of_z[:, n], self.eq.beta2, self.eq.gamma, 
+                            self.eq.size, self.eq.beta1, self.eq.beta2, self.eq.gamma, 
                             self.eq.E_sat, self.eq.alpha, self.eq.g_0, 
                             self.eq.noise_amplitude,
                             self.D
