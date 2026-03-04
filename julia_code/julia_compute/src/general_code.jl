@@ -42,3 +42,25 @@ function make_ndn_iteration_dcalc_for_python(initial_psi::PyArray{ComplexF64, 2}
     com = ComputationalParameters(N=N, M=M, L2=L2, T1=-0.5*T, T2=0.5*T)
     return make_ndn_iteration_dcalc(initial_psi, eq, com, linear_coeffs_array, self_coupling)
 end
+
+function calculate_dnd_short_noisefree_for_python(initial_psi::PyArray{ComplexF64, 2},
+                                                  N::Int64, M::Int64, L2::Float64, T::Float64,
+                                                  size::Int64, beta1::PyArray{Float64, 1}, beta2::PyArray{Float64, 1}, gamma::PyArray{Float64, 1}, 
+                                                  E_sat::PyArray{Float64, 1}, alpha::PyArray{Float64, 1}, g_0::PyArray{Float64, 1}, 
+                                                  D::PyArray{ComplexF64},
+                                                  D_half::PyArray{ComplexF64};
+                                                  enable_pb::Bool=true)::Matrix{ComplexF64}
+    initial_psi = pyconvert(Matrix{ComplexF64}, initial_psi)
+    beta1 = pyconvert(Vector{Float64}, beta1)
+    beta2 = pyconvert(Vector{Float64}, beta2)
+    gamma = pyconvert(Vector{Float64}, gamma)
+    E_sat = pyconvert(Vector{Float64}, E_sat)
+    alpha = pyconvert(Vector{Float64}, alpha)
+    g_0 = pyconvert(Vector{Float64}, g_0)
+    D = pyconvert(Array{ComplexF64}, D)
+    D_half = pyconvert(Array{ComplexF64}, D_half)
+
+    eq = EquationParameters(size=size, beta1=beta1, beta2=beta2, gamma=gamma, E_sat=E_sat, alpha=alpha, g_0=g_0)
+    com = ComputationalParameters(N=N, M=M, L2=L2, T1=-0.5*T, T2=0.5*T)
+    return ssfm_order2_dnd_short_noisefree(initial_psi, eq, com, D, D_half, enable_pb)
+end

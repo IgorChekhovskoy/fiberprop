@@ -1,5 +1,6 @@
 import Random
 using Printf
+using ProgressMeter
 include("calculation_nonlinear_step.jl")
 
 """
@@ -24,7 +25,7 @@ function make_ndn_iteration_dcalc(initial_psi::Array{ComplexF64, 2},
     gamma_h = 0.5*com.h * eq.gamma
     g0_h = 0.5*com.h * eq.g_0
     exp_g0h = exp.(g0_h)
-    exp_2g0h = exp.(com.h * eq.gamma)
+    exp_2g0h = exp.(2.0 * g0_h)
 
     # расчёт матрицы для линейного шага
     D = calculate_D_matrix(eq, com, 
@@ -56,7 +57,6 @@ end
 Один шаг численного моделирования без расчёта матрицы D (симметричное расщепление N-D-N с учётом усиления и шума).
 *глубокое копирование массивов происходит при передаче julia управления памятью
 - initial_psi: начальное поле, комплексный массив размера (n, M)
-- linear_coeffs_array: матрица связи (n, n)
 - D: массив (n, n, M) или (n, n) экспонента матрицы для линейного шага
 
 Возвращает следующий шаг решения.
@@ -72,7 +72,7 @@ function make_ndn_iteration(initial_psi::Array{ComplexF64, 2},
     gamma_h = 0.5*com.h * eq.gamma
     g0_h = 0.5*com.h * eq.g_0
     exp_g0h = exp.(g0_h)
-    exp_2g0h = exp.(com.h * eq.g_0)
+    exp_2g0h = exp.(2.0 .* g0_h)
     
     # Половина нелинейного шага
     nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
@@ -91,6 +91,53 @@ function make_ndn_iteration(initial_psi::Array{ComplexF64, 2},
         noise = eq.noise_amplitude * (noise_real .+ 1im .* noise_imag)
         psi .+= noise
     end
+
+    return psi
+end
+
+"""
+Численное моделирование без расчёта матриц D и D_half (симметричное расщепление D-N-D с учётом усиления и шума).
+*глубокое копирование массивов происходит при передаче julia управления памятью
+- initial_psi: начальное поле, комплексный массив размера (n, M)
+- D: массив (n, n, M) или (n, n) экспонента матрицы для линейного шага
+- D_half: массив (n, n, M) или (n, n) экспонента матрицы для линейного полушага
+
+Возвращает решение в конечной точке.
+"""
+function ssfm_order2_dnd_short_noisefree(initial_psi::Array{ComplexF64, 2},
+                                         eq::EquationParameters,
+                                         com::ComputationalParameters,
+                                         D::Array{ComplexF64},
+                                         D_half::Array{ComplexF64}, 
+                                         enable_pb::Bool)::Array{ComplexF64, 2}
+    psi = initial_psi
+
+    E_sat = eq.E_sat
+    gamma_h = com.h * eq.gamma
+    g0_h = com.h * eq.g_0
+    exp_g0h = exp.(g0_h)
+    exp_2g0h = exp.(2.0 .* g0_h)
+
+    # Линейный полушаг
+    psi = linear_step(psi, D_half)
+
+    # Запуск цикла шагов с объединениями
+    p = Progress(com.N-1, enabled=enable_pb, showspeed=true, desc="Computing short d-n-d scheme...")
+    for _ in 1:com.N-1
+        # Нелинейный шаг
+        nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+
+        # Линейный шаг
+        psi = linear_step(psi, D)
+
+        # Обновление progress bar
+        next!(p)
+    end
+    # Нелинейный шаг
+    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+
+    # Линейный полушаг
+    psi = linear_step(psi, D_half)
 
     return psi
 end

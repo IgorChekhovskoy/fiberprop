@@ -179,7 +179,8 @@ def test_mcf_beta1_dimensional():
     L2 = 1.78 * length_scale  # [m]
     T = 30 * time_scale  # [ps]
 
-    computational_params = ComputationalParameters(N=1000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T)
+    computational_params = ComputationalParameters(N=10000, M=2 ** 13, L1=L1, L2=L2, T1=-T, T2=+T)
+    # ssfm_order2_dnd_short, ssfm_order2_dnd_short_julia, ssfm_order2_ndn_by_julia: method=
 
     equation_params = EquationParameters(core_configuration=core_configuration, size=core_count, ring_count=1,
                                          coupling_coefficient=coupling_coefficient,

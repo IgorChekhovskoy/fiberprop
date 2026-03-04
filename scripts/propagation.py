@@ -132,7 +132,8 @@ def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4
     td_width = 5e3  # ширина временного интервала [ps]
     computational_params = ComputationalParameters(N=my_N, M=my_M, L1=0.0, L2=fiber_length,
                                                    T1=-td_width/2, T2=td_width/2, 
-                                                   method="ssfm_order2_ndn_by_julia")  # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn"
+                                                   method="ssfm_order2_ndn_by_julia")
+    # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn"
 
     # параметры уравнения
     EquationParameters.get_info()
@@ -158,7 +159,7 @@ def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4
                            {}, {}]
     solver = Solver(computational_params, eq_params, use_dimensional=True,
                     pulses=input_pulses, pulse_params_list=input_pulses_params,
-                    display_debug_info=True, use_gpu=False)
+                    stored_steps_count=2, display_debug_info=True, use_gpu=False)
     solver.beta1_of_z, solver.self_coupling_of_z = get_dn_of_z(solver.eq, solver.com, solver.z,
                                                                dn, dn_step, n_ref, k_coef, J_coef)
 
@@ -222,42 +223,43 @@ def read_1d_arrays(full_file_name):
 def visualize_res(solver, path):
     current_solution = solver.numerical_solution
     # интенсивность на входе
-    # all_magnitudes_by_t = {f'{idx}-core': abs(current_solution[0, idx, :])**2
-    #                        for idx in range(solver.eq.size)}
-    # plot2D_multicore(solver.t*1e-3, all_magnitudes_by_t, xlabel='time, ns',
-    #                  ylabel='$|A_n \\text{(t, z=0)}|^2$, W', y_max=np.max(abs(current_solution[0, 3, :])**2)*1.1,
-    #                  path=path, name="интенсивность_вход")
+    all_magnitudes_by_t = {f'{idx}-core': abs(current_solution[0, idx, :])**2
+                           for idx in range(solver.eq.size)}
+    plot2D_multicore(solver.t*1e-3, all_magnitudes_by_t, xlabel='time, ns',
+                     ylabel='$|A_n \\text{(t, z=0)}|^2$, W', y_max=np.max(abs(current_solution[0, 3, :])**2)*1.1,
+                     path=path, name="интенсивность_вход")
 
-    # # интенсивность на выходе
-    # all_magnitudes_by_t = {f'{idx}-core': abs(current_solution[-1, idx, :])**2
-    #                        for idx in range(solver.eq.size)}
-    # plot2D_multicore(solver.t*1e-3, all_magnitudes_by_t, xlabel='time, ns',
-    #                  ylabel='$|A_n \\text{(t, z=end)}|^2$, W', y_max=np.max(abs(current_solution[-1, 3, :])**2)*1.1,
-    #                  path=path, name="интенсивность_выход")
-    # print(solver.com.tau)
+    # интенсивность на выходе
+    all_magnitudes_by_t = {f'{idx}-core': abs(current_solution[-1, idx, :])**2
+                           for idx in range(solver.eq.size)}
+    plot2D_multicore(solver.t*1e-3, all_magnitudes_by_t, xlabel='time, ns',
+                     ylabel='$|A_n \\text{(t, z=end)}|^2$, W', y_max=np.max(abs(current_solution[-1, 3, :])**2)*1.1,
+                     path=path, name="интенсивность_выход")
+    print(solver.com.tau)
 
-    # # спектр на входе
-    # freqs = fftshift(solver.omega / (2 * np.pi)) + 299792458.0 / 1050.0 * 1e-3  # THz
-    # wlengths = 299792458.0 / freqs * 1e-3  # nm
-    # my_spectrum_magnitude = {
-    #     f'{idx}-core': fftshift(abs(fft(current_solution[0, idx, :]))) * solver.com.tau / np.sqrt(2 * np.pi)
-    #     for idx in range(solver.eq.size)}
-    # plot2D_multicore(wlengths, my_spectrum_magnitude, xlabel='$\\lambda, nm$',
-    #                  ylabel='$|\\hat{A_n} \\text{(t, z=0)}|$, $\\sqrt{J/nm}$',
-    #                  y_max=np.max(abs(current_solution[0, 3, :])**2) * 1.1,
-    #                  y_logscale=True, path=path, name="спектр_вход")
+    # спектр на входе
+    freqs = fftshift(solver.omega / (2 * np.pi)) + 299792458.0 / 1050.0 * 1e-3  # THz
+    wlengths = 299792458.0 / freqs * 1e-3  # nm
+    my_spectrum_magnitude = {
+        f'{idx}-core': fftshift(abs(fft(current_solution[0, idx, :]))) * solver.com.tau / np.sqrt(2 * np.pi)
+        for idx in range(solver.eq.size)}
+    plot2D_multicore(wlengths, my_spectrum_magnitude, xlabel='$\\lambda, nm$',
+                     ylabel='$|\\hat{A_n} \\text{(t, z=0)}|$, $\\sqrt{J/nm}$',
+                     y_max=np.max(abs(current_solution[0, 3, :])**2) * 1.1,
+                     y_logscale=True, path=path, name="спектр_вход")
 
-    # # спектр на выходе
-    # my_spectrum_magnitude = {
-    #     f'{idx}-core': fftshift(abs(fft(current_solution[-1, idx, :]))) * solver.com.tau / np.sqrt(2 * np.pi)
-    #     for idx in range(solver.eq.size)}
-    # plot2D_multicore(wlengths, my_spectrum_magnitude, xlabel='$\\lambda, nm$',
-    #                  ylabel='$|\\hat{A_n} \\text{(t, z=end)}|$, $\\sqrt{J/nm}$',
-    #                  y_max=np.max(abs(current_solution[0, 3, :])**2) * 1.1,
-    #                  y_logscale=True, path=path, name="спектр_выход")
+    # спектр на выходе
+    my_spectrum_magnitude = {
+        f'{idx}-core': fftshift(abs(fft(current_solution[-1, idx, :]))) * solver.com.tau / np.sqrt(2 * np.pi)
+        for idx in range(solver.eq.size)}
+    plot2D_multicore(wlengths, my_spectrum_magnitude, xlabel='$\\lambda, nm$',
+                     ylabel='$|\\hat{A_n} \\text{(t, z=end)}|$, $\\sqrt{J/nm}$',
+                     y_max=np.max(abs(current_solution[0, 3, :])**2) * 1.1,
+                     y_logscale=True, path=path, name="спектр_выход")
 
     # доля по мощности в пике от z
-    all_magnitudes = {f'{idx}-core': abs(current_solution[:, idx, solver.com.M//2])**2 * 100 / abs(current_solution[0, 3, solver.com.M//2])**2
+    maximal_initial_power = abs(current_solution[0, 3, solver.com.M//2])**2
+    all_magnitudes = {f'{idx}-core': solver.peak_power[idx, :]*100.0 / maximal_initial_power
                       for idx in range(solver.eq.size)}
     # plot2D_dict(solver.z, all_magnitudes, xlabel='z, m', ylabel='$P_{out} / P_{in}$, %',
     #             title='average by peak power', marker_flag=False, y_max=100,
@@ -267,7 +269,7 @@ def visualize_res(solver, path):
     save_1d_arrays(axes_dict, all_magnitudes, all_magnitudes_file_name)
 
     # мощность в пике от z
-    all_magnitudes = {f'{idx}-core': abs(current_solution[:, idx, solver.com.M // 2])**2
+    all_magnitudes = {f'{idx}-core': solver.peak_power[idx, :]
                       for idx in range(solver.eq.size)}
     # plot2D_dict(solver.z, all_magnitudes, xlabel='z, m', ylabel='$P_{out}$, W',
     #             title='by peak power', marker_flag=False, y_max=all_magnitudes['3-core'][0]*1.05,
@@ -277,8 +279,9 @@ def visualize_res(solver, path):
     save_1d_arrays(axes_dict, all_magnitudes, all_magnitudes_file_name)
 
     # доля по средней мощности от z
+    maximal_energy = solver.energy[3, 0]
     all_mean_powers = {
-        f'{idx}-core': np.sum(abs(current_solution[:, idx, :])**2, axis=1) * solver.com.tau * 100 / get_energy_rectangles(current_solution[0, 3, :], solver.com.tau)
+        f'{idx}-core': solver.energy[idx]*100.0 / maximal_energy
         for idx in range(solver.eq.size)}
     # plot2D_dict(solver.z, all_mean_powers, xlabel='z, m', ylabel='$P_{out} / P_{in}$, % ',
     #             title='average by mean power', marker_flag=False, y_max=100,
@@ -287,9 +290,9 @@ def visualize_res(solver, path):
     all_mean_file_name = path + '\\распределение_средней_мощности'
     save_1d_arrays(axes_dict, all_mean_powers, all_mean_file_name)
 
-    # средняя мощность от z
+    # энергия от z
     all_mean_powers = {
-        f'{idx}-core': np.sum(abs(current_solution[:, idx, :])**2, axis=1) * solver.com.tau
+        f'{idx}-core': solver.energy[idx]
         for idx in range(solver.eq.size)}
     # plot2D_dict(solver.z, all_mean_powers, xlabel='z, m', ylabel='$P_{out}$, J',
     #             title='by mean power', marker_flag=False, y_max=all_mean_powers['3-core'][0],
@@ -380,7 +383,7 @@ if __name__ == "__main__":
                 file.write(key + ":\t\t\t" + str(val) + "\n")
     dir_path = os.path.dirname(os.path.abspath(__file__))
 
-    spatial_step = 3e-4  # [m]
+    spatial_step = 5e-4  # [m]
     curr_path = dir_path + "\\propagation_results"
     params_dict = {'spatial_step': spatial_step, 'dn': 1e-3,
                    'dn_step': 0.005, 'J_coef': 1e-4,

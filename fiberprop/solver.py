@@ -1,7 +1,7 @@
 import copy
 import time
 
-from julia_compute.functions import make_iteration_julia, make_iteration_dcalc_julia
+from julia_compute.functions import make_iteration_julia, make_iteration_dcalc_julia, calculate_short_noisefree_julia
 
 from tqdm import trange
 from scipy.fft import fftfreq
@@ -1051,6 +1051,7 @@ class Solver:
 
         if (self.com.method == "ssfm_order2_dnd"
                 or self.com.method == "ssfm_order2_dnd_short"
+                or self.com.method == "ssfm_order2_dnd_short_julia"
                 or self.com.method == "ssfm_order2_dnd_windowed_short"):
             if self.D_half is None:
                 # Посчитать D для половинного шага и СРАЗУ положить в D_half
@@ -1469,7 +1470,15 @@ class Solver:
         if not self.use_torch:
             if self.com.method == "ssfm_order2_dnd_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_short(self, damp_length=self.com.damp_length,
-                                                                             disable_progress_bar=not self.display_debug_info)
+                                                                    disable_progress_bar=not self.display_debug_info)
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+            elif self.com.method == "ssfm_order2_dnd_short_julia":
+                self.numerical_solution[-1] = calculate_short_noisefree_julia(psi_next,
+                                                                              self.com.N, self.com.M, self.com.L2, (self.com.T2 - self.com.T1),
+                                                                              self.eq.size, self.eq.beta1, self.eq.beta2, self.eq.gamma, 
+                                                                              self.eq.E_sat, self.eq.alpha, self.eq.g_0, 
+                                                                              self.D, self.D_half,
+                                                                              enable_pb=self.display_debug_info)
                 save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_windowed_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_windowed_short(self, window_size=self.com.window_size,

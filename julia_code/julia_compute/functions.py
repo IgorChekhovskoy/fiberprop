@@ -29,3 +29,14 @@ def make_iteration_dcalc_julia(initial_psi: NDArray[np.complex128],
                                                                             beta1, beta2, gamma,  E_sat, alpha, g_0, 
                                                                             noise_amplitude, linear_coeffs_array, self_coupling)
     return np.array(new_psi, dtype=np.complex128)
+
+def calculate_short_noisefree_julia(initial_psi: NDArray[np.complex128],
+                                    N: np.int64, M: np.int64, L2: np.float64, T: np.float64,
+                                    size: np.int16, beta1: NDArray[np.float64], beta2: NDArray[np.float64], gamma: NDArray[np.float64], 
+                                    E_sat: NDArray[np.float64], alpha: NDArray[np.float64], g_0: NDArray[np.float64], 
+                                    D: NDArray[np.complex128], D_half: NDArray[np.complex128],
+                                    enable_pb: bool) -> NDArray[np.complex128]:
+    new_psi = Main.ComputingJuliaModule.calculate_dnd_short_noisefree_for_python(initial_psi, N, M, L2, T, size, 
+                                                                                 beta1, beta2, gamma,  E_sat, alpha, g_0, 
+                                                                                 D, D_half, enable_pb=enable_pb)
+    return np.array(new_psi, dtype=np.complex128)
