@@ -16,7 +16,7 @@ from .pulses import zero_pulse
 from .drawing import *
 from .rk4 import rk4_step
 from .ssfm_compact_scheme_mcf import ssfm_order2_ndn_compact_windowed, prepare_compact_solver_for_linear_step, \
-    ssfm_order2_dnd_compact_windowed, ssfm_order2_dnd_compact_windowed_short
+    ssfm_order2_dnd_compact_windowed, ssfm_order2_dnd_compact_windowed_short, ssfm_order2_dnd_compact_short
 from .ssfm_mcf import ssfm_order2_ndn, get_energy_rectangles, ssfm_order1_resonator_nocos, \
     ssfm_order1_resonator_fullcos, \
     ssfm_order2_2_in_fourier_space, ssfm_order2_dnd, ssfm_order2_ndn_windowed, ssfm_order2_dnd_windowed_short, \
@@ -1440,7 +1440,7 @@ class Solver:
         if self.com.method == "ssfm_order2_ndn_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h)
 
-        if self.com.method == "ssfm_order2_dnd_compact_windowed" or self.com.method == "ssfm_order2_dnd_compact_windowed_short":
+        if self.com.method == "ssfm_order2_dnd_compact_windowed":
             prepare_compact_solver_for_linear_step(self, self.com.h * 0.5)
 
         if self.gamma_h_half is None:
@@ -1465,6 +1465,10 @@ class Solver:
         if not self.use_torch:
             if self.com.method == "ssfm_order2_dnd_short":
                 self.numerical_solution[-1] = ssfm_order2_dnd_short(self, damp_length=self.com.damp_length,
+                                                                             disable_progress_bar=not self.display_debug_info)
+                save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
+            if self.com.method == "ssfm_order2_dnd_compact_short":
+                self.numerical_solution[-1] = ssfm_order2_dnd_compact_short(self, damp_length=self.com.damp_length,
                                                                              disable_progress_bar=not self.display_debug_info)
                 save_idx = self.calculate_metrics(self.numerical_solution[-1], self.com.N - 1, save_every, save_idx)
             elif self.com.method == "ssfm_order2_dnd_windowed_short":
