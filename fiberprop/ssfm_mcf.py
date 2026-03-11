@@ -59,46 +59,147 @@ def get_rectangles_integral(arr_func, time_step):
     return arr_func * time_step
 
 
-def power_abs2_np(psi: np.ndarray) -> np.ndarray:
-    """|psi|^2 поэлементно, без sqrt/abs. Возвращает массив той же формы."""
-    return psi.real * psi.real + psi.imag * psi.imag
-
 def energy_from_power_np(P: np.ndarray, tau: float) -> np.ndarray:
     """Интеграл энергии по времени для каждого канала: sum_t P * tau  → (n,)"""
     return P.sum(axis=1) * tau
 
 
-def nonlinear_step(psi: np.ndarray,
-                   gamma_h, g0_h, exp_g0h, exp_2g0h,
-                   E_sat: np.ndarray,
-                   energy_in: np.ndarray | None = None,
-                   *,
-                   P: np.ndarray | None = None) -> None:
-    """in-place обновление psi (n,M).
-       Если P передан — используем его как |psi|^2, иначе посчитаем быстро.
+def power_abs2_np(psi: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
     """
+    out: optional float array with same shape as psi (n, M).
+    """
+    if out is None:
+        out = np.empty(psi.shape, dtype=np.float32 if psi.dtype == np.complex64 else np.float64)
+    np.multiply(psi.real, psi.real, out=out)
+    out += psi.imag * psi.imag
+    return out
+
+
+from dataclasses import dataclass
+
+@dataclass
+class NonlinearStepWorkspace:
+    phase: np.ndarray  # (M,) float
+    tmp: np.ndarray    # (M,) complex
+
+
+def make_nonlinear_workspace(M: int, *, complex_dtype: np.dtype) -> NonlinearStepWorkspace:
+    float_dtype = np.float32 if complex_dtype == np.complex64 else np.float64
+    phase = np.empty(M, dtype=float_dtype)
+    tmp = np.empty(M, dtype=complex_dtype)
+    return NonlinearStepWorkspace(phase=phase, tmp=tmp)
+
+
+def _amp_theta_scalar(Ek: float,
+                      es: float,
+                      g0h: float,
+                      gamh: float,
+                      eg1: float,
+                      eg2: float) -> tuple[float, float]:
+    """
+    Возвращает (amp, theta0) для одного ядра:
+      psi <- psi * amp * exp(i * theta0 * |psi|^2)
+
+    amp — множитель по амплитуде (на поле), theta0 — коэффициент при |psi|^2 в фазе.
+    """
+    # "почти нулевая энергия" — берём точный предел, чтобы избежать 0/0
+    eps_e = np.finfo(np.float64).tiny * 1e6
+    if Ek <= eps_e:
+        amp = float(np.exp(g0h))
+        if abs(g0h) <= 1e-12:
+            theta0 = float(gamh)
+        else:
+            theta0 = float(gamh * (eg2 - 1.0) / (2.0 * g0h))
+        return amp, theta0
+
+    E = float(np.sqrt((Ek * Ek + 2.0 * Ek * es) * eg2 + es * es) - es)
+
+    F_Ek = float(Ek + es - es * np.log(Ek + 2.0 * es))
+    F_E = float(E + es - es * np.log(E + 2.0 * es))
+
+    A = float(eg1 * np.sqrt((Ek + 2.0 * es) / Ek) * np.sqrt(E / (E + 2.0 * es)))
+    amp = float(np.sqrt(A))
+    theta0 = float((gamh * (F_E - F_Ek)) / (g0h * Ek))
+    return amp, theta0
+
+
+def nonlinear_step(psi: np.ndarray,
+                              gamma_h,
+                              g0_h,
+                              exp_g0h,
+                              exp_2g0h,
+                              E_sat,
+                              energy_in: np.ndarray | None = None,
+                              *,
+                              P: np.ndarray | None = None,
+                              work: NonlinearStepWorkspace | None = None) -> None:
+    """
+    Быстрый точный нелинейный шаг (in-place), без boolean indexing и без временных аллокаций.
+
+    psi: (n, M) complex64/complex128
+    P:   (n, M) float32/float64, |psi|^2 (если None — будет посчитано)
+    energy_in: (n,) float, энергия ДО шага (нужна при g0_h != 0)
+    work: буферы (phase,tmp) длины M для исключения аллокаций.
+    """
+    if psi.ndim != 2:
+        raise ValueError("psi must be 2D array of shape (n, M)")
+
+    n, M = psi.shape
+
     if P is None:
         P = power_abs2_np(psi)
 
-    no_gain = (g0_h == 0.0)
-    if np.any(no_gain):          # без усиления
-        psi[no_gain] *= np.exp(1j * gamma_h[no_gain, _na] * P[no_gain])
+    gamma_h = np.asarray(gamma_h, dtype=np.float64).reshape(-1)
+    g0_h = np.asarray(g0_h, dtype=np.float64).reshape(-1)
+    exp_g0h = np.asarray(exp_g0h, dtype=np.float64).reshape(-1)
+    exp_2g0h = np.asarray(exp_2g0h, dtype=np.float64).reshape(-1)
+    E_sat = np.asarray(E_sat, dtype=np.float64).reshape(-1)
 
-    gain = ~no_gain
-    if np.any(gain):             # с усилением
-        Ek   = energy_in[gain, _na]
-        Pk   = P[gain]
-        esat = E_sat[gain, _na]
-        g0h  = g0_h[gain, _na]
-        eg1  = exp_g0h[gain, _na]
-        eg2  = exp_2g0h[gain, _na]
-        gamh = gamma_h[gain, _na]
+    if gamma_h.size != n or g0_h.size != n or exp_g0h.size != n or exp_2g0h.size != n or E_sat.size != n:
+        raise ValueError("gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat must have length n")
 
-        E  = np.sqrt((Ek**2 + 2*Ek*esat) * eg2 + esat**2) - esat
-        C  = -gamh*Pk*(Ek+esat-esat*np.log(Ek+2*esat)) / (g0h*Ek) + np.angle(psi[gain])
-        Pn = Pk*eg1*np.sqrt((Ek+2*esat)/Ek)*np.sqrt(E/(E+2*esat))
-        phi= gamh*Pk*(E+esat-esat*np.log(E+2*esat)) / (g0h*Ek) + C
-        psi[gain] = np.sqrt(Pn) * np.exp(1j*phi)
+    if np.any(g0_h != 0.0):
+        if energy_in is None:
+            raise ValueError("energy_in must be provided when any g0_h != 0")
+        energy_in = np.asarray(energy_in, dtype=np.float64).reshape(-1)
+        if energy_in.size != n:
+            raise ValueError("energy_in must have length n")
+
+    if work is None or work.phase.shape[0] != M or work.tmp.shape[0] != M or work.tmp.dtype != psi.dtype:
+        work = make_nonlinear_workspace(M, complex_dtype=psi.dtype)
+
+    phase = work.phase
+    tmp = work.tmp
+
+    # Основной цикл по ядрам: никаких копий больших массивов.
+    for i in range(n):
+        P_i = P[i]        # view (M,)
+        psi_i = psi[i]    # view (M,)
+
+        g0h = float(g0_h[i])
+        gamh = float(gamma_h[i])
+
+        if g0h == 0.0:
+            amp = 1.0
+            theta0 = gamh
+        else:
+            Ek = float(energy_in[i])
+            es = float(E_sat[i])
+            eg1 = float(exp_g0h[i])
+            eg2 = float(exp_2g0h[i])
+            amp, theta0 = _amp_theta_scalar(Ek, es, g0h, gamh, eg1, eg2)
+
+        # phase[:] = theta0 * P_i   (без аллокаций)
+        np.multiply(P_i, theta0, out=phase)
+
+        # tmp[:] = exp(i*phase) через cos/sin (без аллокаций)
+        np.cos(phase, out=tmp.real)
+        np.sin(phase, out=tmp.imag)
+
+        if amp != 1.0:
+            psi_i *= amp
+
+        psi_i *= tmp
 
 
 def linear_step(psi, has_beta, D):

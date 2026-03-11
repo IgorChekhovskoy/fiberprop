@@ -40,7 +40,7 @@ def prepare_compact_solver_for_linear_step(solver, h) -> None:
 
     # коэффициенты компактной схемы -----------------------------------
     tau2  = solver.com.tau**2
-    b = 1 * solver.eq.beta2.astype(float)
+    b = solver.eq.beta2.astype(float)
 
     cur   = h / tau2
     R     = -0.5j * b * cur
@@ -183,15 +183,54 @@ def ssfm_order2_ndn_compact_windowed(psi, current_energy, solver,
 
     nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
                             solver.exp_g0h_half, solver.exp_2g0h_half,
-                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+                            solver.eq.E_sat, tau, window_size)
 
     psi = linear_step_compact(psi, solver, h)
 
     nonlinear_step_windowed(psi, solver.gamma_h_half, solver.g0_h_half,
                             solver.exp_g0h_half, solver.exp_2g0h_half,
-                            solver.eq.E_sat, solver.eq.g_0, tau, window_size)
+                            solver.eq.E_sat, tau, window_size)
 
     # current_energy[:] = np.sum(np.abs(psi)**2, axis=1)*tau
+
+    return psi
+
+
+def ssfm_order2_dnd_compact_short(solver, damp_length=0.0, disable_progress_bar=False):
+
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, solver.com.h * 0.5)
+    psi = linear_step_compact(solver.numerical_solution[0], solver, solver.com.h * 0.5)
+
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, solver.com.h)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
+
+    g0 = solver.eq.g_0
+    gain = g0 != 0.0
+    current_energy = np.zeros(psi.shape[0], dtype=solver.dtype)
+
+    for _ in trange(solver.com.N, disable=disable_progress_bar):
+        if gain.any():
+            current_energy[gain] = (np.abs(psi[gain]) ** 2).sum(1) * solver.com.tau
+
+        nonlinear_step(psi, solver.gamma_h, solver.g0_h,
+                                solver.exp_g0h, solver.exp_2g0h,
+                                solver.eq.E_sat, current_energy)
+
+        psi = linear_step_compact(psi, solver, solver.com.h)
+
+        if damp_length:
+            psi = apply_absorbing_boundary(psi, solver=solver)
+
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, -0.5 * solver.com.h)
+    psi = linear_step_compact(psi, solver, -0.5 * solver.com.h)
+
+    if damp_length:
+        psi = apply_absorbing_boundary(psi, solver=solver)
 
     return psi
 
@@ -213,14 +252,19 @@ def ssfm_order2_dnd_compact_windowed(psi, current_energy, solver,
     return psi
 
 
-def ssfm_order2_dnd_compact_windowed_short(solver, window_size, damp_length=0.0):
+def ssfm_order2_dnd_compact_windowed_short(solver, window_size, damp_length=0.0, disable_progress_bar=False):
 
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, 0.5 * solver.com.h)
     psi = linear_step_compact(solver.numerical_solution[0], solver, solver.com.h * 0.5)
+
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, solver.com.h)
 
     if damp_length:
         psi = apply_absorbing_boundary(psi, solver=solver)
 
-    for n in trange(solver.com.N):
+    for _ in trange(solver.com.N, disable=disable_progress_bar):
 
         nonlinear_step_windowed(psi, solver.gamma_h, solver.g0_h,
                                 solver.exp_g0h, solver.exp_2g0h,
@@ -232,7 +276,9 @@ def ssfm_order2_dnd_compact_windowed_short(solver, window_size, damp_length=0.0)
         if damp_length:
             psi = apply_absorbing_boundary(psi, solver=solver)
 
-    psi = linear_step_compact(psi, solver, solver.com.h * 0.5)
+    solver._compact_ready = False
+    prepare_compact_solver_for_linear_step(solver, -0.5 * solver.com.h)
+    psi = linear_step_compact(psi, solver, -solver.com.h * 0.5)
 
     if damp_length:
         psi = apply_absorbing_boundary(psi, solver=solver)

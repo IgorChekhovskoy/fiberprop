@@ -8,21 +8,25 @@ from fiberprop.solver import ComputationalParameters, EquationParameters, Solver
 from fiberprop.fiber import Fiber, FiberMaterial, CoreConfig
 from fiberprop.fiber_geometry import get_core_count
 from fiberprop.light import Light
-from fiberprop.fiber_base_functions import get_coupling_coefficients, get_coupling_coefficients_2d
+from fiberprop.fiber_base_functions import get_coupling_coefficients_2d
 from fiberprop.drawing import *
 from fiberprop.parallel_runtime import physical_cpu_count, temporary_thread_limits
 
 from time import time
-import numpy as np #; np.show_config()
+import numpy as np  # ; np.show_config()
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 
 from pathlib import Path
+import json
+
+from scripts.mcf_reservoir_computing.mcf_auxiliary_functions import calc_p_pump_per_core_from_slm, \
+    calc_g0_psat_from_p_pump_josab, nrmse, sha256_of_json, CACHE_DIR, json_dumps_compact, \
+    learning_curve_for_result_plotly, plot_laser_gain_curve_from_params, MM, COL1, COL15, COL2, apply_readout, \
+    ridge_alpha_sweep_diagnostics
+
 STYLE_PATH = Path(__file__).with_name("styles") / "mcf.mplstyle"
 plt.style.use(str(STYLE_PATH))
-
-MM = 1/25.4
-COL1, COL15, COL2 = 89*MM, 136*MM, 183*MM   # Nature: 1, 1.5, 2 колонки
 
 
 def mackey_glass(t_size, tau=17.0, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0):
@@ -222,6 +226,92 @@ def _fft_padding_params(M: int, min_fraction: float = 0.1) -> Tuple[int, float, 
     return offset_size0, offset_part, target_len
 
 
+def generate_ase_noise(
+        *,
+        size: tuple[int, int],
+        dt_ps: float,
+        lambda0_um: float,
+        g0_array: tuple[float, ...] | np.ndarray,
+        fiber_length_m: float,
+        nf_db: float = 5.0,
+        optical_bw_hz: float = 12.5e9,
+        n_polarizations: int = 1,
+        seed: int | None = None,
+        step_index: int = 0,
+        dtype: np.dtype = np.complex128,
+) -> np.ndarray:
+    """
+    Генерация комплексного ASE шума (additive complex AWGN) в огибающей поля (√W).
+
+    Модель (в духе стандартных оценок для оптического усилителя):
+        S_ASE = n_pol * n_sp * h * nu * (G - 1)    [W/Hz],
+    где nu = c / lambda0, а n_sp ≈ NF/2 в пределе большого усиления (NF — линейная, не в dB).
+
+    В дискретном времени задаём суммарную мощность шума в полосе:
+        P_noise = S_ASE * B_eff,   B_eff = min(optical_bw_hz, 1/dt),
+    и генерируем комплексный гауссов шум так, что E|n|^2 = P_noise.
+
+    Для воспроизводимости используется SeedSequence([seed, step_index]): фиксированный seed ⇒ разные шумы на разных
+    оборотах (step_index), но полностью повторяемые при повторном запуске.
+    """
+    # --- проверки ---
+    dt_s = float(dt_ps) * 1e-12
+    if dt_s <= 0.0:
+        raise ValueError("dt_ps must be > 0")
+
+    C, T = int(size[0]), int(size[1])
+    if C <= 0 or T <= 0:
+        return np.zeros((max(C, 0), max(T, 0)), dtype=dtype)
+
+    if float(optical_bw_hz) <= 0.0:
+        return np.zeros((C, T), dtype=dtype)
+
+    # --- константы ---
+    h = 6.62607015e-34  # J*s (точное значение в СИ)
+    c = 299792458.0  # m/s
+
+    # --- параметры усиления ---
+    g0 = np.asarray(g0_array, dtype=float).ravel()
+    if g0.size == 0:
+        return np.zeros((C, T), dtype=dtype)
+
+    if g0.size not in (1, C):
+        raise ValueError(f"g0_array size mismatch: got {g0.size}, expected 1 or {C}")
+
+    if g0.size == 1 and C > 1:
+        g0 = np.full(C, float(g0[0]), dtype=float)
+
+    # Оценка малого-сигнала: G = exp(g0 * L), отрицательный g0 не даёт ASE (обнуляем по (G-1)+).
+    G = np.exp(np.maximum(g0, 0.0) * float(fiber_length_m))
+    Gm1 = np.maximum(G - 1.0, 0.0)
+
+    # --- n_sp и PSD ASE ---
+    nf_lin = 10.0 ** (float(nf_db) / 10.0)
+    n_sp = 0.5 * nf_lin  # high-gain approx: NF ≈ 2 n_sp
+
+    # Физический минимум n_sp = 1 (полная инверсия) ⇒ NF_min = 2 (≈3 dB).
+    if n_sp < 1.0:
+        n_sp = 1.0
+
+    nu_hz = c / (float(lambda0_um) * 1e-6)
+    s_ase_w_per_hz = float(n_polarizations) * n_sp * h * nu_hz * Gm1  # (C,)
+
+    # --- мощность в полосе, которую реально может представить дискретизация ---
+    b_sim_hz = 1.0 / dt_s
+    b_eff_hz = min(float(optical_bw_hz), b_sim_hz)
+    p_noise_w = s_ase_w_per_hz * b_eff_hz  # (C,)
+
+    # --- воспроизводимый RNG: seed + индекс оборота ---
+    ss = np.random.SeedSequence([int(seed) if seed is not None else 0, int(step_index)])
+    rng = np.random.default_rng(ss)
+
+    re = rng.standard_normal((C, T))
+    im = rng.standard_normal((C, T))
+    noise = (re + 1j * im) * np.sqrt(0.5)  # E|noise|^2 = 1
+    noise = noise * np.sqrt(p_noise_w).reshape(C, 1)
+    return np.asarray(noise, dtype=dtype)
+
+
 def mcf_nn_reservoir_computing(
         data_in=None,  # ndarray (C, M_in)
         fiber_length_m=5.0,  # длина MCF, m
@@ -245,7 +335,9 @@ def mcf_nn_reservoir_computing(
         max_hours_total: Optional[float] = None,
         precision: Optional[str] = 'float64',
         use_dispersion: bool = True,
-        disable_core0: bool = False,
+        ase_noise_seed: int | None = None,
+        ase_noise_nf_db: float = 5.0,
+        ase_noise_optical_bw_hz: float = 12.5e9,
 ):
     """
         Численно моделирует единичный *пробег* комплексного сигнала по
@@ -350,14 +442,7 @@ def mcf_nn_reservoir_computing(
     if window_size <= 0 or window_size > M:
         raise ValueError("window_size должен быть >= 1")
 
-    # Нейтральное отключение ядра 0: зануляем вход для core=0.
-    # Для шести активных ядер 7-ядерного волокна достаточно, чтобы канал 0 был нулём,
-    # а связи к нему и от него — отключены (см. ниже).
-    if disable_core0 and eq_size >= 1:
-        data_in_mod = np.array(data_in, copy=True)
-        data_in_mod[0, :] = 0
-    else:
-        data_in_mod = data_in
+    data_in_mod = data_in
 
     core_configuration = CoreConfig.hexagonal
     light = Light(lambda0=1.55)  # µm
@@ -381,7 +466,7 @@ def mcf_nn_reservoir_computing(
         save_scheme_path = str(Path(__file__).parent / "fig_mcf_scheme")
 
     import hashlib
-    d = os.path.join(os.path.dirname(__file__), ".ccache");
+    d = os.path.join(os.path.dirname(__file__), ".ccache")
     os.makedirs(d, exist_ok=True)
     h = hashlib.sha1(repr((getattr(fiber, "core_configuration", None), getattr(fiber, "ring_count", None),
                            getattr(fiber, "core_radius", None), getattr(fiber, "cladding_diameter", None),
@@ -399,16 +484,12 @@ def mcf_nn_reservoir_computing(
         )
         np.save(p, np.asarray(coupling_matrix))
 
+    # coupling_matrix = np.zeros((core_count, core_count))
+
     coupling_coefficient = coupling_matrix[central_core_ind - 1][central_core_ind] if eq_size > 1 else 1e-10
     max_val = np.max(np.abs(coupling_matrix))
     threshold = max_val * 1e-3
     coupling_matrix = np.where(np.abs(coupling_matrix) > threshold, coupling_matrix, 0)
-
-    # Жёстко отключаем связи к и от ядра 0 при его деактивации.
-    if disable_core0 and eq_size >= 1:
-        coupling_matrix = np.array(coupling_matrix, copy=True)
-        coupling_matrix[0, :] = 0
-        coupling_matrix[:, 0] = 0
 
     gamma = fiber.get_gamma(light, eps=1e-3)  # [1/(W·m)]
     beta1 = fiber.get_beta1(light)  # [ps/m]
@@ -428,7 +509,9 @@ def mcf_nn_reservoir_computing(
 
     tau_ps = beta1_air * feedback_length_m  # [ps]
     omega0_rad_per_ps = 2 * np.pi * light.c_light * 1e-12 / (light.lambda0 * 1e-6)
-    feedback_coeff = kappa * np.exp(1j * (omega0_rad_per_ps * tau_ps + delta_phase))
+    phase_air = omega0_rad_per_ps * tau_ps
+    phase_fiber = 0  #
+    feedback_coeff = kappa * np.exp(1j * delta_phase)
 
     if feedback_length_m < fiber_length_m:
         # print("feedback_length_m < fiber_length_m", feedback_length_m, fiber_length_m)
@@ -452,14 +535,11 @@ def mcf_nn_reservoir_computing(
     # ─── масштабы и временное окно ──────────────────────────────
     fiber_length_dimensionless = fiber_length_m / length_scale
     n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
-    esat_array = np.asarray(psat_array) * window_size * time_step_ps
-
-    # При выключенной 0-й сердцевине можно обнулить её g₀ для чистоты.
-    if disable_core0 and len(g0_array) >= 1:
-        g0_array_mod = np.array(g0_array, dtype=float, copy=True)
-        g0_array_mod[0] = 0.0
-    else:
-        g0_array_mod = np.asarray(g0_array, dtype=float) if len(g0_array) else np.asarray(g0_array)
+    window_duration_ps = window_size * time_step_ps
+    psat_array_w = np.asarray(psat_array)
+    esat_array = psat_array_w * window_duration_ps  # [pJ]
+    mean_power_per_core_w = np.mean(np.abs(data_in_mod) ** 2, axis=1).astype(float, copy=False)
+    energy_per_window = mean_power_per_core_w * window_duration_ps
 
     if display_debug_info:
         print("data_in.shape=", data_in_mod.shape)
@@ -469,13 +549,19 @@ def mcf_nn_reservoir_computing(
         print("fiber_length_dimensionless =", fiber_length_dimensionless)
         print("length_scale =", length_scale)
         print("n_z =", n_z)
-        print("esat = ", esat_array)
-        print("\nwindow_size * time_step_ps =", window_size * time_step_ps)
+        print("g0 =", g0_array)
+        print("esat = ", esat_array, "pJ")
+        print("\nwindow_size * time_step_ps =", window_duration_ps)
+        if len(psat_array):
+            print("P_sat [W] =", psat_array_w)
+            print("E_sat [pJ] =", esat_array)
+            print("mean_power_per_core [W] =", mean_power_per_core_w)
+            print("Energy_per_window [pJ] =", energy_per_window)
 
     # --- режим без дисперсии (beta2=0) с оконным стримингом ---
     if not use_dispersion:
 
-        T_half_stream = (window_size * time_step_ps) / 2.0
+        T_half_stream = window_duration_ps / 2.0
 
         comp = ComputationalParameters(N=n_z, M=window_size,
                                        L1=0.0, L2=fiber_length_m,
@@ -488,7 +574,7 @@ def mcf_nn_reservoir_computing(
                                 ring_count=layer_count,
                                 coupling_matrix=coupling_matrix,
                                 beta1=0, beta2=0.0, gamma=gamma,
-                                E_sat=esat_array, alpha=0.0, g_0=tuple(g0_array_mod),
+                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
                                 display_debug_info=display_debug_info)
 
         # начальные данные окна: уже с занулённой 0-й сердцевиной при необходимости
@@ -532,6 +618,20 @@ def mcf_nn_reservoir_computing(
                     seg = tmp
                 solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
 
+            if ase_noise_seed is not None:
+                solver.numerical_solution[0] = solver.numerical_solution[0] + generate_ase_noise(
+                    size=solver.numerical_solution[0].shape,
+                    dt_ps=time_step_ps,
+                    lambda0_um=light.lambda0,
+                    g0_array=g0_array,
+                    fiber_length_m=fiber_length_m,
+                    nf_db=ase_noise_nf_db,
+                    optical_bw_hz=ase_noise_optical_bw_hz,
+                    seed=ase_noise_seed,
+                    step_index=batch_index,
+                    dtype=dtype,
+                )
+
             dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
 
             if (batch_index == 0) and (max_hours_total is not None):
@@ -551,10 +651,10 @@ def mcf_nn_reservoir_computing(
             fb_buf = solver.numerical_solution[-1]
             s = batch_index * window_size
             e = min(s + window_size, M)
-            data_out_stream[:, s:e] = fb_buf[:, :e - s]
+            data_out_stream[:, s:e] = fb_buf[:, :e - s] * np.exp(
+                1j * phase_fiber)  # добавляем набег фазы самого поля E = A * F * exp(i*beta*z)
 
             if display_debug_plots:
-
                 number_of_points_for_display = solver.com.M  # np.min([5000, solver.com.M])
                 step = int(solver.com.M / number_of_points_for_display)
 
@@ -617,6 +717,15 @@ def mcf_nn_reservoir_computing(
             "iteration_count": int(n_batches),
             "offset_size": 0,
             "offset_part": 0.0,
+            # характеристики сигнала
+            "E_sat": esat_array.tolist(),
+            "mean_power_per_core:": mean_power_per_core_w.tolist(),
+            "Energy_per_window": energy_per_window.tolist(),
+            "ase_noise": {
+                "seed": int(ase_noise_seed) if ase_noise_seed is not None else None,
+                "nf_db": float(ase_noise_nf_db) if ase_noise_seed is not None else None,
+                "optical_bw_hz": float(ase_noise_optical_bw_hz) if ase_noise_seed is not None else None,
+            },
         }
         return {
             "data_out": data_out_stream,
@@ -654,7 +763,7 @@ def mcf_nn_reservoir_computing(
                                 coupling_matrix=coupling_matrix,
                                 beta1=0,
                                 beta2=beta2, gamma=gamma,
-                                E_sat=esat_array, alpha=0.0, g_0=tuple(g0_array_mod),
+                                E_sat=esat_array, alpha=0.0, g_0=g0_array,
                                 display_debug_info=display_debug_info)
 
         solver = Solver(comp, eq,
@@ -668,7 +777,7 @@ def mcf_nn_reservoir_computing(
                         display_debug_info=display_debug_info)
 
         if display_debug_plots:
-            number_of_points_for_display = 10000 #solver.com.M  # np.min([5000, solver.com.M])
+            number_of_points_for_display = 10000  # solver.com.M  # np.min([5000, solver.com.M])
             step = int(solver.com.M / number_of_points_for_display)
 
         iteration_count = int(np.ceil(M / window_size))
@@ -696,7 +805,22 @@ def mcf_nn_reservoir_computing(
 
         for iteration_index in range(iteration_count + 1):  # одна доп. итерация для окончательного установления
             # if display_debug_info:
-            print("\nC =", coupling_coefficient,", L_coupling =", L_coupling, ", layer_radii_array =", layer_radii_array[-1], ", iteration", iteration_index, "of", iteration_count)
+            print("\nC =", coupling_coefficient, ", L_coupling =", L_coupling, ", layer_radii_array =",
+                  layer_radii_array[-1], ", iteration", iteration_index, "of", iteration_count)
+
+            if ase_noise_seed is not None:
+                solver.numerical_solution[0] = solver.numerical_solution[0] + generate_ase_noise(
+                    size=solver.numerical_solution[0].shape,
+                    dt_ps=time_step_ps / upsampling,
+                    lambda0_um=light.lambda0,
+                    g0_array=g0_array,
+                    fiber_length_m=fiber_length_m,
+                    nf_db=ase_noise_nf_db,
+                    optical_bw_hz=ase_noise_optical_bw_hz,
+                    seed=ase_noise_seed,
+                    step_index=iteration_index,
+                    dtype=dtype,
+                )
 
             dt_b = solver.run_numerical_simulation(
                 # draw_modulus=display_debug_info,
@@ -763,6 +887,9 @@ def mcf_nn_reservoir_computing(
                 print("Iterations stopped after", iteration_index, "of ", iteration_count, "iterations.")
                 break
 
+        # добавляем набег фазы самого поля E = A * F * exp(i*beta*z)
+        solver.numerical_solution[-1] *= np.exp(1j * phase_fiber)
+
         if display_debug_info:
             print("Elapsed time =", time() - t1)
 
@@ -823,13 +950,21 @@ def mcf_nn_reservoir_computing(
                 "iteration_count": int(iteration_count + 1),  # с учётом финальной
                 "offset_size": int(offset_size),
                 "offset_part": float(offset_part),
+                # характеристики сигнала
+                "E_sat": esat_array.tolist(),
+                "mean_power_per_core:": mean_power_per_core_w.tolist(),
+                "Energy_per_window": energy_per_window.tolist(),
+                "ase_noise": {
+                    "seed": int(ase_noise_seed) if ase_noise_seed is not None else None,
+                    "nf_db": float(ase_noise_nf_db) if ase_noise_seed is not None else None,
+                    "optical_bw_hz": float(ase_noise_optical_bw_hz) if ase_noise_seed is not None else None,
+                },
             },
         }
 
 
 ######################################################################
 
-import json, hashlib
 import dataclasses as _dc
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Tuple, Literal, Optional
@@ -838,72 +973,16 @@ from typing import Dict, Any, Tuple, Literal, Optional
 # Утилиты, метрики, кэш
 # =========================
 
-CACHE_DIR = Path("mcf_rc_cache")
 
-
-def json_dumps_compact(obj):
-    """
-    Компактная JSON-сериализация с безопасным приведением numpy-типов:
-    - numpy scalars (np.int64, np.float64, np.bool_) -> обычные int/float/bool через .item()
-    - numpy.ndarray -> list через .tolist()
-    - коллекции и словари обходим рекурсивно
-    """
-    def _to_jsonable(x):
-        # numpy скаляры → базовые типы
-        if isinstance(x, np.generic):
-            return x.item()
-        # numpy массивы → списки
-        if isinstance(x, np.ndarray):
-            return x.tolist()
-        # словари → рекурсивно
-        if isinstance(x, dict):
-            # ключи на всякий случай приводим к строке (если вдруг попались не-строки)
-            return {str(k): _to_jsonable(v) for k, v in x.items()}
-        # последовательности/множества → рекурсивно в список
-        if isinstance(x, (list, tuple, set)):
-            return [_to_jsonable(v) for v in x]
-        # остальное — как есть
-        return x
-
-    return json.dumps(_to_jsonable(obj), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def sha256_of_json(obj: Any) -> str:
-    s = json_dumps_compact(obj).encode("utf-8")
-    return hashlib.sha256(s).hexdigest()
-
-
-def nrmse(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
-    """
-    NRMSE = RMSE / std(y_true). Возвращает NaN для пустых входов без генерации ворнингов NumPy.
-    Если std≈0: RMSE≈0 → 0.0, иначе → +inf.
-    """
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-
-    n = y_true.size
-    if n == 0:
-        return float('nan')  # валидно, и без предупреждений
-
-    # На всякий случай подровняем длины (если расходятся).
-    if y_pred.size != n:
-        m = min(n, y_pred.size)
-        if m == 0:
-            return float('nan')
-        y_true = y_true[:m]
-        y_pred = y_pred[:m]
-
-    diff = y_true - y_pred
-    rmse = float(np.sqrt((diff * diff).mean()))  # безопасно: массив гарантированно непустой
-
-    s = float(np.std(y_true))  # безопасно: массив гарантированно непустой
-    if not np.isfinite(s) or s < eps:
-        return 0.0 if rmse < eps else float('inf')
-
-    return rmse / s
-
-
-def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: bool = True):
+def train_ridge(
+        X: np.ndarray,
+        y: np.ndarray,
+        alpha: float | str | None = 1e-6,
+        add_bias: bool = True,
+        *,
+        X_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+):
     if add_bias:
         Xb = np.hstack([X, np.ones((X.shape[0], 1))])
     else:
@@ -913,92 +992,261 @@ def train_ridge(X: np.ndarray, y: np.ndarray, alpha: float = 1e-6, add_bias: boo
     Xb = Xb.astype(np.float64)
     y = y.astype(np.float64)
 
-    # Выбираем форму решения: dual при F >> N, иначе primal
-    N, F = Xb.shape
-    use_dual = F > N
+    # Решаем ridge устойчиво через SVD, без формирования X^T X (normal equations).
+    # Xb = U diag(s) V^T
+    # W = V diag(s / (s^2 + alpha)) U^T y
+    U, s, Vt = np.linalg.svd(Xb, full_matrices=False)
 
-    if not use_dual:
-        # Вычисляем матрицу системы
-        A = Xb.T @ Xb
-        n_features = A.shape[0]
+    # Диагностика обусловленности
+    # cond(Xb) = s_max / s_min, cond_ridge ~ (s_max^2 + alpha) / (s_min^2 + alpha)
+    s_max = float(s[0]) if s.size > 0 else 0.0
+    s_min = float(s[-1]) if s.size > 0 else 0.0
 
-        # Добавляем регуляризацию
-        A_reg = A + alpha * np.eye(n_features)
-
-        # Вычисляем число обусловленности
-        cond_number = np.linalg.cond(A_reg)
-        # print(f"Alpha: {alpha}, Condition number: {cond_number}")
-
-        # Если число обусловленности слишком высокое, увеличиваем alpha
-        if cond_number > 1e15:
-            # print("Condition number too high, increasing alpha...")
-            for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
-                A_reg_new = A + new_alpha * np.eye(n_features)
-                new_cond = np.linalg.cond(A_reg_new)
-                # print(f"Trying alpha={new_alpha}, condition={new_cond}")
-                if new_cond < 1e15:
-                    alpha = new_alpha
-                    A_reg = A_reg_new
-                    # print(f"Using alpha={alpha}")
-                    break
-
-        # Используем псевдообратную матрицу для устойчивого решения
-        try:
-            W = np.linalg.solve(A_reg, Xb.T @ y)
-        except np.linalg.LinAlgError:
-            print("Using SVD solution due to numerical issues")
-            U, s, Vt = np.linalg.svd(A_reg, full_matrices=False)
-            s_inv = np.zeros_like(s)
-            threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
-            for i in range(len(s)):
-                if s[i] > threshold:
-                    s_inv[i] = 1.0 / s[i]
-            W = Vt.T @ np.diag(s_inv) @ U.T @ (Xb.T @ y)
-
-        return W, alpha
-
+    if s_min == 0.0:
+        cond_x = np.inf
     else:
-        # Dual-форма (без X^T X) для уменьшения потребления ОЗУ
-        K = Xb @ Xb.T                       # (N, N)
-        K_reg = K + alpha * np.eye(N)
+        cond_x = s_max / s_min
 
-        cond_number = np.linalg.cond(K_reg)
-        # print(f"Alpha: {alpha}, Condition number: {cond_number}")
+    s_max2 = s_max * s_max
+    s_min2 = s_min * s_min
 
-        if cond_number > 1e15:
-            # print("Condition number too high, increasing alpha...")
-            for new_alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e+1, 1e+2, 1e+3]:
-                K_reg_new = K + new_alpha * np.eye(N)
-                new_cond = np.linalg.cond(K_reg_new)
-                # print(f"Trying alpha={new_alpha}, condition={new_cond}")
-                if new_cond < 1e15:
-                    alpha = new_alpha
-                    K_reg = K_reg_new
-                    # print(f"Using alpha={alpha}")
-                    break
+    # -------------------------------------------------------------------------
+    # Auto alpha selection: val_max_plateau_0.2 (block-wise worst-case) + cond cap.
+    #
+    # Summary:
+    #   - Split val into sequential blocks (time order preserved).
+    #   - For each alpha: compute block-wise MSE, take max over blocks, then take sqrt and normalize:
+    #         e_max(alpha) = sqrt( max_b MSE_b(alpha) / Var_global(val) )
+    #     (i.e., worst-case NRMSE with *global* sigma, but aggregated via MSE then sqrt).
+    #   - Select the largest alpha satisfying:
+    #         e_max(alpha) <= (1 + max_rtol) * min_alpha e_max(alpha)
+    #     ("right edge of plateau" for stability).
+    #   - Enforce numerical stability by requiring cond_ridge(alpha) <= max_cond when possible,
+    #     and finally alpha = max(alpha, alpha_needed_for_max_cond).
+    #
+    # References (high-level motivation):
+    #   - Blocked CV for dependent (temporal/spatial) data:
+    #       Roberts et al., Ecography 2017: https://nsojournals.onlinelibrary.wiley.com/doi/10.1111/ecog.02881
+    #       Bergmeir, Hyndman, Koo 2018 (time-series CV): https://robjhyndman.com/papers/cv-wp.pdf
+    #   - Train-only ridge parameter selection (fallback without val): GCV
+    #       Golub, Heath, Wahba 1979: https://pages.stat.wisc.edu/~wahba/ftp1/oldie/golub.heath.wahba.pdf
+    #   - Worst-case / stability-aware hyperparameter selection (general context):
+    #       Pfohl et al. 2022 (worst-case model selection): https://pmc.ncbi.nlm.nih.gov/articles/PMC8885701/
+    #       Cory-Wright & Gómez 2025 (stability-regularized CV): https://optimization-online.org/wp-content/uploads/2025/05/Stability_Adjusted_Cross_Validation_for_NeurIPS_2025.pdf
+    # -------------------------------------------------------------------------
 
-        try:
-            A = np.linalg.solve(K_reg, y)   # (N, T)
-        except np.linalg.LinAlgError:
-            print("Using SVD solution due to numerical issues")
-            U, s, Vt = np.linalg.svd(K_reg, full_matrices=False)
-            s_inv = np.zeros_like(s)
-            threshold = np.finfo(np.float64).eps * max(U.shape) * np.max(s)
-            for i in range(len(s)):
-                if s[i] > threshold:
-                    s_inv[i] = 1.0 / s[i]
-            A = Vt.T @ np.diag(s_inv) @ U.T @ y
+    max_cond = 1e5
+    val_blocks = 8
+    max_rtol = 0.2
+    n_alpha = 61
+    auto_min_decades = 12.0
+    auto_lo_factor_vs_smax2 = 1e-12
+    auto_hi_factor_vs_smax2 = 1e3
 
-        W = Xb.T @ A                         # (F(+1), T)
-        return W, alpha
-
-
-def apply_readout(X: np.ndarray, W: np.ndarray, add_bias: bool = True) -> np.ndarray:
-    if add_bias:
-        Xb = np.hstack([X, np.ones((X.shape[0], 1))])
+    alpha_is_auto = False
+    if alpha is None:
+        alpha_is_auto = True
+    elif isinstance(alpha, str):
+        alpha_is_auto = (alpha.strip().lower() == "auto")
     else:
-        Xb = X
-    return Xb @ W
+        try:
+            a0 = float(alpha)
+            alpha_is_auto = (not np.isfinite(a0)) or (a0 <= 0.0)
+        except Exception:
+            alpha_is_auto = True
+
+    s = np.asarray(s, dtype=np.float64)
+    s2 = s * s
+    Ut_y_sel = U.T @ y  # (M, T)
+
+    def _cond_ridge(a: float) -> float:
+        a = float(a)
+        if not np.isfinite(a) or a < 0.0:
+            a = 0.0
+        denom = s_min2 + a
+        if denom <= 0.0:
+            denom = np.finfo(np.float64).tiny
+        return float((s_max2 + a) / denom)
+
+    def _alpha_needed_for_max_cond(target_cond: float) -> float:
+        """
+        Minimal alpha so that cond_ridge(alpha) <= target_cond.
+        Solve (s_max^2 + a)/(s_min^2 + a) <= k (monotone in a).
+        """
+        k = float(target_cond)
+        if not np.isfinite(k) or k <= 1.0:
+            return 0.0
+        if s_max2 <= 0.0:
+            return 0.0
+
+        if s_min2 <= 0.0:
+            # (s_max^2 + a)/a <= k  ->  a >= s_max^2/(k-1)
+            return float(s_max2 / (k - 1.0))
+
+        num = s_max2 - k * s_min2
+        if num <= 0.0:
+            return 0.0
+        return float(num / (k - 1.0))
+
+    alpha_cond = _alpha_needed_for_max_cond(max_cond)
+
+    def _compute_W_for_alpha(a: float) -> np.ndarray:
+        a = float(a)
+        denom = s2 + a
+        denom[denom == 0.0] = np.finfo(np.float64).tiny
+        filt = (s / denom)[:, None]  # (M, 1)
+        return Vt.T @ (filt * Ut_y_sel)  # (F(+1), T)
+
+    def _alpha_grid_auto() -> np.ndarray:
+        if s_max2 > 0.0:
+            lo = max(float(s_max2) * float(auto_lo_factor_vs_smax2), np.finfo(np.float64).tiny)
+            hi = float(s_max2) * float(auto_hi_factor_vs_smax2)
+            if hi <= lo:
+                hi = lo * 1e6
+            decades = float(np.log10(hi) - np.log10(lo))
+            if decades < float(auto_min_decades):
+                hi = lo * (10.0 ** float(auto_min_decades))
+        else:
+            lo, hi = 1e-12, 1e3
+
+        if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+            lo = min(lo, float(alpha_cond))
+            hi = max(hi, float(alpha_cond))
+
+        grid = np.logspace(np.log10(lo), np.log10(hi), int(max(2, n_alpha))).astype(np.float64)
+        return np.unique(grid)
+
+    def _block_slices(n: int, k: int) -> list[slice]:
+        n = int(n)
+        k = int(k)
+        if n <= 0 or k <= 1:
+            return [slice(0, n)]
+        k = max(2, min(k, n))
+        edges = np.linspace(0, n, num=k + 1, dtype=int)
+        out = []
+        for i in range(k):
+            a, b = int(edges[i]), int(edges[i + 1])
+            if b - a >= 2:
+                out.append(slice(a, b))
+        return out if out else [slice(0, n)]
+
+    def _gcv_score(a: float) -> float:
+        """
+        Train-only fallback: GCV(alpha) ~ MSE(alpha) / (1 - df(alpha)/n)^2,
+        df(alpha) = sum s^2/(s^2+alpha).
+        """
+        W_loc = _compute_W_for_alpha(a)
+        y_hat = apply_readout(X, W_loc, add_bias=add_bias)
+        r = (y_hat - y).astype(np.float64, copy=False)
+        mse = float(np.mean(r * r))
+
+        n = float(max(1, X.shape[0]))
+        df = float(np.sum(s2 / (s2 + float(a))))
+        denom = 1.0 - df / n
+        denom = float(np.clip(denom, 1e-12, 1.0))
+        return mse / (denom * denom)
+
+    def _val_emax_from_blocks_mse(a: float, blocks: list[slice], var_global: float) -> float:
+        W_loc = _compute_W_for_alpha(a)
+        y_hat = apply_readout(X_val, W_loc, add_bias=add_bias)
+
+        y_true = np.asarray(y_val, dtype=np.float64)
+        y_pred = np.asarray(y_hat, dtype=np.float64)
+
+        n = min(int(y_true.shape[0]), int(y_pred.shape[0]))
+        if n < 2 or not np.isfinite(var_global) or var_global <= 0.0:
+            return float("nan")
+
+        y_true = y_true[:n]
+        y_pred = y_pred[:n]
+
+        max_mse = -np.inf
+        for sl in blocks:
+            a0, b0 = int(sl.start or 0), int(sl.stop or 0)
+            a0 = max(0, min(a0, n))
+            b0 = max(0, min(b0, n))
+            if b0 - a0 < 2:
+                continue
+
+            d = y_true[a0:b0] - y_pred[a0:b0]
+            mse_b = float(np.mean(d * d))
+            max_mse = max(max_mse, mse_b)
+
+        if not np.isfinite(max_mse) or max_mse < 0.0:
+            return float("nan")
+
+        # requested aggregation: max over block MSE, then sqrt
+        return float(np.sqrt(max_mse / var_global))
+
+    # ---- choose alpha ----
+    if alpha_is_auto:
+        use_val = (
+            X_val is not None and y_val is not None and
+            isinstance(X_val, np.ndarray) and isinstance(y_val, np.ndarray) and
+            X_val.ndim == 2 and y_val.ndim == 2 and
+            X_val.shape[0] == y_val.shape[0] and X_val.shape[0] >= 8
+        )
+
+        grid = _alpha_grid_auto()
+
+        if use_val:
+            blocks = _block_slices(int(X_val.shape[0]), int(val_blocks))
+
+            yv = np.asarray(y_val, dtype=np.float64).reshape(-1)
+            if yv.size < 2:
+                var_global = float("nan")
+            else:
+                var_global = float(np.var(yv))
+
+            emax = np.array([_val_emax_from_blocks_mse(a, blocks, var_global) for a in grid], dtype=np.float64)
+            m = np.isfinite(emax)
+
+            if not np.any(m):
+                alpha = float(alpha_cond) if np.isfinite(alpha_cond) and alpha_cond > 0.0 else float(grid[0])
+            else:
+                e_min = float(np.min(emax[m]))
+                thr = (1.0 + float(max_rtol)) * e_min
+                ok = m & (emax <= thr)
+
+                if not np.any(ok):
+                    alpha = float(grid[int(np.nanargmin(emax))])
+                else:
+                    # prefer alphas that already satisfy the cond cap (alpha >= alpha_cond), if any in plateau
+                    if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+                        ok2 = ok & (grid >= float(alpha_cond))
+                        alpha = float(np.max(grid[ok2])) if np.any(ok2) else float(np.max(grid[ok]))
+                    else:
+                        alpha = float(np.max(grid[ok]))
+        else:
+            # fallback: train-only GCV (no val supplied)
+            gcv = np.array([_gcv_score(a) for a in grid], dtype=np.float64)
+            m = np.isfinite(gcv)
+            if np.any(m):
+                alpha = float(grid[int(np.nanargmin(gcv))])
+            else:
+                alpha = float(alpha_cond) if np.isfinite(alpha_cond) and alpha_cond > 0.0 else float(grid[0])
+    else:
+        alpha = float(alpha)
+        if not np.isfinite(alpha) or alpha < 0.0:
+            alpha = 0.0
+
+    # final stability clamp by cond cap
+    if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+        alpha = float(max(alpha, alpha_cond))
+
+    cond_ridge = _cond_ridge(alpha)
+    # print(f"[train_ridge] alpha={alpha:.6g}  cond_ridge={cond_ridge:.6g}")
+
+    # -------------------------------------------------------------------------
+    # Конец блока подбора alpha
+    # -------------------------------------------------------------------------
+
+    # Считаем W (НЕ ТРОГАЕМ)
+    Ut_y = U.T @ y  # (M, T)
+    filt = (s / (s * s + alpha))[:, None]  # (M, 1)
+    W = Vt.T @ (filt * Ut_y)  # (F(+1), T)
+
+    return W, alpha
 
 
 # =========================
@@ -1066,8 +1314,8 @@ class ReservoirConfig:
     upsampling: int = 2
     layer_count: float = 1.0
     layer_radii_array: Tuple[float, ...] = (0.0, 17.3)
-    g0_array: Tuple[float, ...] = (10.0,)   # [1/m]
-    psat_array: Tuple[float, ...] = (0.02,) # [W]
+    g0_array: Tuple[float, ...] = (10.0,)  # [1/m]
+    psat_array: Tuple[float, ...] = (0.02,)  # [W]
     kappa: float = 0.9
     delta_phase: float = 0
     use_gpu: bool = False
@@ -1082,9 +1330,10 @@ class ReservoirConfig:
     window_size: Optional[
         int] = None  # Пользователь НЕ задаёт руками; вычисляется из delay_factor_in_symbols/phase внутри запуска
     max_hours_total: Optional[float] = None  # ОГРАНИЧЕНИЕ: оценка общего времени прогона (часы)
-    precision: Optional[str] = 'float64' # Размер данных в вычислениях ('float64', 'float32')
+    precision: Optional[str] = 'float64'  # Размер данных в вычислениях ('float64', 'float32')
     use_dispersion: Optional[bool] = True  # Включать ли слагаемое с дисперсией в модель
-    disable_core0: bool = False  # Выключить нулевую периферийную сердцевину (обнулить вход и связи)
+    ase_noise_seed: Optional[int] = None  # Включение ASE шума в модель, если установлен seed для генерации шума
+
 
 @dataclass
 class TrainingConfig:
@@ -1115,6 +1364,7 @@ class TrainingConfig:
     train_frac: float = 0.6
     val_frac: float = 0.2
 
+
 @dataclass
 class ExperimentConfig:
     core_count: int
@@ -1123,6 +1373,7 @@ class ExperimentConfig:
     reservoir: ReservoirConfig
     training: TrainingConfig
     variant: MaskVariant
+
 
 # =========================
 # Графики
@@ -1138,6 +1389,7 @@ def _plot_temporal_masks(ax, masks: np.ndarray, mask_kind: str):
     ax.set_ylabel("core index")
     return im
 
+
 def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Spatial weights by cores"):
     """Bar-чарт по ядрам."""
     C = weights.shape[0]
@@ -1145,6 +1397,7 @@ def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Spatial weights
     ax.set_title(title, loc="left")
     ax.set_xlabel("core index")
     ax.set_ylabel("weight")
+
 
 def _reconstruct_masks_or_weights(core_count: int,
                                   variant: str,
@@ -1198,6 +1451,7 @@ def _default_fig_path(basename: str) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         p = out_dir / f"{basename}_{ts}.{fmt}"
     return p
+
 
 def _maybe_savefig(fig,
                    basename: str,
@@ -1267,7 +1521,15 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     S = int(cfg.mg.t_size)
     assert mg_series_used.shape[0] == S, "mg_series_used длиной не равно t_size"
 
+    # Проверка: mg_series_used должен совпадать с куском полного ряда после warmup (это те же данные).
+    x_used_norm = x_full_norm[int(warmup):int(warmup) + S]
+    diff = float(np.max(np.abs(x_used_norm.reshape(-1) - mg_series_used.reshape(-1)))) if S > 0 else 0.0
+    if diff > 1e-6:
+        print(f"[WARN] debug_plot_input_overview: mg_series_used != x_full_norm[warmup:] (max|diff|={diff:.3e})")
+
     # --- индексы сегментов на оси полного ряда (в символах)
+    taps = int(getattr(cfg.training, "taps", 1) or 1)
+    taps_drop = max(0, int(taps) - 1)  # столько символов теряем из-за tapped-state (taps-1)
     shift_syms = int(getattr(cfg.training, "target_shift", 0) or 0)
 
     # ЕДИНО: washout → в отсчётах → в символы
@@ -1275,28 +1537,38 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     w_samples = get_washout_samples(cfg)
     w_syms = int(np.ceil(int(w_samples) / max(1, int(M_eff))))
 
-    # Эффективный хвост под train/val/test
-    N_eff = S - shift_syms - w_syms
+    # Эффективный хвост под train/val/test (точно как в run_single_experiment):
+    #   y_aligned = y[(taps-1 + shift):], затем washout в символах
+    align_drop = taps_drop + shift_syms
+    N_eff = max(0, int(S) - int(align_drop) - int(w_syms))
     train_frac = float(getattr(cfg.training, "train_frac", 0.6))
     val_frac = float(getattr(cfg.training, "val_frac", 0.2))
-    n_train = max(0, int(N_eff * train_frac))
-    n_val = max(0, int(N_eff * val_frac))
-    n_test = max(0, N_eff - n_train - n_val)
+    sl_train, sl_val, sl_test = split_train_val_test(N_eff, train_frac, val_frac)
+    n_train = int(sl_train.stop - sl_train.start)
+    n_val = int(sl_val.stop - sl_val.start)
+    n_test = int(sl_test.stop - sl_test.start)
 
-    # Границы по полной оси (0..S) в символах
+    # Границы по полной оси (0..S+warmup) в символах
     i_warmup_L = 0
-    i_warmup_R = warmup
-    i_shift_L = i_warmup_R
-    i_shift_R = i_warmup_R + shift_syms
+    i_warmup_R = int(warmup)
+
+    # tapped-state: первые (taps-1) символов после warmup не участвуют в обучении (из-за формирования лагов)
+    i_taps_L = i_warmup_R
+    i_taps_R = i_taps_L + int(taps_drop)
+
+    # target shift: сдвиг таргета относительно состояния
+    i_shift_L = i_taps_R
+    i_shift_R = i_shift_L + int(shift_syms)
+
     i_wash_L = i_shift_R
-    i_wash_R = i_shift_R + w_syms
-    tr_start = i_wash_R
-    i_tr_L = tr_start
-    i_tr_R = tr_start + n_train
+    i_wash_R = i_wash_L + int(w_syms)
+
+    i_tr_L = i_wash_R
+    i_tr_R = i_tr_L + int(n_train)
     i_va_L = i_tr_R
-    i_va_R = i_va_L + n_val
+    i_va_R = i_va_L + int(n_val)
     i_te_L = i_va_R
-    i_te_R = i_te_L + n_test
+    i_te_R = i_te_L + int(n_test)
 
     # --- рисуем
     fig = plt.figure(figsize=(COL2, COL2 * 0.62))  # соотношение ~3:2
@@ -1308,6 +1580,10 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     ax1.plot(t_full, x_full_norm, label="Mackey-Glass series")  # ← подпись линии
     ax1.set_xlim(t_full[0], t_full[-1])
     ax1.margins(x=0.0)
+
+    # Явная граница warmup (на случай, если полоса слишком узкая и визуально теряется)
+    if int(warmup) > 0:
+        ax1.axvline(i_warmup_R, color="k", lw=1, alpha=0.25)
 
     def span_if(a, b, color, label, alpha=0.18):
         # рисуем даже для интервала шириной 1 символ (раньше было ≥2)
@@ -1324,6 +1600,8 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     shown = []
     if span_if(i_warmup_L, i_warmup_R, "#888888", "warmup"):
         shown.append("warmup")
+    if taps_drop > 0 and span_if(i_taps_L, i_taps_R, "#17becf", f"taps-1={taps_drop}"):
+        shown.append("taps")
     if span_if(i_shift_L, i_shift_R, "#1f77b4", "target shift"):
         shown.append("target shift")
     if w_syms > 0 and span_if(i_wash_L, i_wash_R, "#ff7f0e", "washout"):
@@ -1340,10 +1618,11 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     ax1.set_xlabel("symbol index")
     ax1.set_ylabel("normalized amplitude")
 
+    # легенда (линия + зоны)
     handles, labels = ax1.get_legend_handles_labels()
     if handles:
-        uniq = dict(zip(labels, handles))
-        leg = ax1.legend(uniq.values(), uniq.keys(), ncols=3, bbox_to_anchor=(0.98, 0.98), frameon=True)
+        leg = ax1.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.98, 0.98),
+                         frameon=True)
         leg.get_frame().set_facecolor((1, 1, 1, 0.6))
         leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
@@ -1357,7 +1636,7 @@ def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
     if masks_info["type"] == "temporal":
         ax2 = fig.add_subplot(gs[1, 0])
         im = _plot_temporal_masks(ax2, masks_info["masks"], cfg.mask.mask_kind)
-        cbar = fig.colorbar(im, ax=ax2, fraction=0.46/10, pad=0.04)
+        cbar = fig.colorbar(im, ax=ax2, fraction=0.46 / 10, pad=0.04)
         cbar.set_label("mask value")
     else:
         ax2 = fig.add_subplot(gs[1, 0])
@@ -1388,9 +1667,9 @@ def debug_plot_mg_attractor(cfg,
         return
 
     # delay-вложение
-    X = x1d[off:]                         # x(t)
-    Y = x1d[tau_samples:-tau_samples]     # x(t-τ)
-    Z = x1d[:-off]                        # x(t-2τ)
+    X = x1d[off:]  # x(t)
+    Y = x1d[tau_samples:-tau_samples]  # x(t-τ)
+    Z = x1d[:-off]  # x(t-2τ)
     L = X.shape[0]
 
     # границы сегментов в ИНДЕКСАХ mg_series_used (0..S)
@@ -1403,16 +1682,16 @@ def debug_plot_mg_attractor(cfg,
 
     N_eff = S - shift_syms - w_syms
     n_train = int(N_eff * cfg.training.train_frac) if N_eff > 0 else 0
-    n_val   = int(N_eff * cfg.training.val_frac) if N_eff > 0 else 0
-    n_test  = max(0, N_eff - n_train - n_val)
+    n_val = int(N_eff * cfg.training.val_frac) if N_eff > 0 else 0
+    n_test = max(0, N_eff - n_train - n_val)
 
     i_shift = (0, max(0, shift_syms))
-    i_wash  = (i_shift[1], i_shift[1] + max(0, w_syms))
-    i_tr    = (i_wash[1],  i_wash[1]  + max(0, n_train))
-    i_va    = (i_tr[1],    i_tr[1]    + max(0, n_val))
-    i_te    = (i_va[1],    min(S, i_va[1] + max(0, n_test)))
+    i_wash = (i_shift[1], i_shift[1] + max(0, w_syms))
+    i_tr = (i_wash[1], i_wash[1] + max(0, n_train))
+    i_va = (i_tr[1], i_tr[1] + max(0, n_val))
+    i_te = (i_va[1], min(S, i_va[1] + max(0, n_test)))
 
-    fig = plt.figure(figsize=(COL2*0.62, COL2*0.62), constrained_layout=True)
+    fig = plt.figure(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
     ax = fig.add_subplot(111, projection="3d")
 
     ax.set_proj_type('ortho')
@@ -1442,7 +1721,7 @@ def debug_plot_mg_attractor(cfg,
             if hi - lo >= min_len:
                 (line,) = ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
                 line.set_path_effects([
-                    pe.Stroke(linewidth=base_lw*1.8, foreground='white'),
+                    pe.Stroke(linewidth=base_lw * 1.8, foreground='white'),
                     pe.Normal()
                 ])
                 return True
@@ -1450,10 +1729,10 @@ def debug_plot_mg_attractor(cfg,
 
     segments = [
         ("target shift", "#1f77b4", i_shift),
-        ("washout",      "#ff7f0e", i_wash),
-        ("train",        "#2ca02c", i_tr),
-        ("val",          "#9467bd", i_va),
-        ("test",         "#d62728", i_te),
+        ("washout", "#ff7f0e", i_wash),
+        ("train", "#2ca02c", i_tr),
+        ("val", "#9467bd", i_va),
+        ("test", "#d62728", i_te),
     ]
     for name, color, bounds in segments:
         plot_segment(name, color, bounds)
@@ -1484,7 +1763,11 @@ def debug_plot_post_training_comparison(cfg,
                                         n_show: int = 2000,
                                         start: int = 0) -> float:
     """
-    Рисует сравнение на тесте и возвращает NRMSE по видимому окну.
+    Рисует сравнение на тесте и возвращает NRMSE по ВСЕМУ переданному сегменту.
+
+    Важно: отображаемое окно (start/n_show) влияет только на картинку, а не на метрику.
+    Это нужно, чтобы NRMSE здесь совпадал с тем, что рисуется/считается по train/val/test в других местах.
+
     Устойчиво работает при коротких окнах: если точек < 2, вместо линии рисуется маркер,
     легенда и NRMSE подавляются, а set_xlim не вызывается (чтобы не ловить warning).
     """
@@ -1493,12 +1776,24 @@ def debug_plot_post_training_comparison(cfg,
 
     N = min(y_true.shape[0], y_pred.shape[0])
     if N == 0:
-        print("debug_plot_post_training_comparison: пустые входы — нечего рисовать.")
+        fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
+        ax.set_title(f"{title}   •   NRMSE=—", loc="left")
+        ax.set_xlabel("symbol index")
+        ax.set_ylabel("MG series value")
+        _maybe_savefig(fig, f"post_training_comparison_{cfg.variant}_C{cfg.core_count}",
+                       enabled=getattr(cfg.reservoir, "save_figs", False))
+        plt.show()
         return float('nan')
 
-    # окно отображения
-    start = max(0, min(int(start), N - 1))
-    end = min(start + int(n_show), N)
+    y_true = y_true[:N]
+    y_pred = y_pred[:N]
+
+    # NRMSE по ПОЛНОМУ сегменту (как в result['metrics']).
+    err = float('nan') if N < 2 else float(nrmse(y_true, y_pred))
+
+    # окно визуализации
+    start = int(max(0, start))
+    end = int(min(N, start + int(max(1, n_show))))
     x = np.arange(start, end)
     Lvis = int(end - start)
 
@@ -1508,15 +1803,7 @@ def debug_plot_post_training_comparison(cfg,
         x = np.arange(start, end)
         Lvis = end - start
 
-    # NRMSE только если точек >= 2 и std > 0
-    if Lvis >= 2:
-        denom = float(np.std(y_true[start:end]))
-        err = (np.sqrt(np.mean((y_true[start:end] - y_pred[start:end]) ** 2)) /
-               (denom + 1e-12)) if denom > 0.0 else float('nan')
-    else:
-        err = float('nan')
-
-    fig, ax = plt.subplots(figsize=(COL2, COL2*0.33), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
 
     if Lvis >= 2:
         ax.plot(x, y_true[start:end], label="ground truth")
@@ -1543,7 +1830,7 @@ def debug_plot_post_training_comparison(cfg,
             leg.get_frame().set_facecolor((1, 1, 1, 0.6))  # полупрозрачный фон
             leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
 
-    _maybe_savefig(fig, f"readout_train_val_test_{cfg.variant}_C{cfg.core_count}",
+    _maybe_savefig(fig, f"post_training_comparison_{cfg.variant}_C{cfg.core_count}",
                    enabled=getattr(cfg.reservoir, "save_figs", False))
     plt.show()
 
@@ -1560,47 +1847,47 @@ def debug_plot_readout_train_val_test(res: dict,
     # --- извлечение (оставляем вашу схему имён) ---
     W = res["W_out"]
     Xtr, ytr = res["X_train"], res["y_train"].reshape(-1, 1)
-    Xva, yva = res["X_val"],   res["y_val"].reshape(-1, 1)
-    Xte, yte = res["X_test"],  res["y_test"].reshape(-1, 1)
+    Xva, yva = res["X_val"], res["y_val"].reshape(-1, 1)
+    Xte, yte = res["X_test"], res["y_test"].reshape(-1, 1)
 
     # предсказания
     ytr_hat = apply_readout(Xtr, W)
     yva_hat = apply_readout(Xva, W) if Xva.size else np.zeros_like(yva)
-    yte_hat = apply_readout(Xte, W)
+    yte_hat = apply_readout(Xte, W) if Xte.size else np.zeros_like(yte)
 
-    # склейка
-    y_true = np.concatenate([ytr, yva, yte], axis=0).ravel()
-    y_pred = np.concatenate([ytr_hat, yva_hat, yte_hat], axis=0).ravel()
+    def _nrmse_safe(y, yhat):
+        y = np.asarray(y).ravel();
+        yhat = np.asarray(yhat).ravel()
+        if y.size < 2 or yhat.size < 2:
+            return float('nan')
+        # используем тот же nrmse(), что и result["metrics"]
+        return float(nrmse(y, yhat))
 
-    n_tr, n_va, n_te = len(ytr), len(yva), len(yte)
+    m = {
+        "nrmse_train": _nrmse_safe(ytr, ytr_hat),
+        "nrmse_val": _nrmse_safe(yva, yva_hat),
+        "nrmse_test": _nrmse_safe(yte, yte_hat),
+    }
+
+    # конкатенация
+    y_all = np.concatenate([ytr, yva, yte], axis=0).reshape(-1)
+    yhat_all = np.concatenate([ytr_hat, yva_hat, yte_hat], axis=0).reshape(-1)
+    N = y_all.size
+
+    n_tr = int(ytr.shape[0])
+    n_va = int(yva.shape[0])
+    n_te = int(yte.shape[0])
+
     b_tr = (0, n_tr)
     b_va = (n_tr, n_tr + n_va)
     b_te = (n_tr + n_va, n_tr + n_va + n_te)
 
-    # безопасный NRMSE: только если длина ≥ 2 и std > 0
-    def _nrmse_safe(y, yhat):
-        y = np.asarray(y).ravel(); yhat = np.asarray(yhat).ravel()
-        if y.size < 2 or yhat.size < 2:
-            return float('nan')
-        s = float(np.std(y))
-        if s == 0.0:
-            return float('nan')
-        return float(np.sqrt(np.mean((yhat - y) ** 2)) / (s + 1e-12))
+    fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
+    x = np.arange(N)
 
-    m = {
-        "nrmse_train": _nrmse_safe(ytr, ytr_hat),
-        "nrmse_val":   _nrmse_safe(yva, yva_hat),
-        "nrmse_test":  _nrmse_safe(yte, yte_hat),
-    }
+    ax.plot(x, y_all, label="ground truth")
+    ax.plot(x, yhat_all, label="prediction")
 
-    # --- рисуем ---
-    fig, ax = plt.subplots(figsize=(COL2, COL2*0.33), constrained_layout=True)
-    x = np.arange(y_true.shape[0])
-
-    ax.plot(x, y_true, label="ground truth")
-    ax.plot(x, y_pred, label="prediction")
-
-    # зоны (рисуем и подписываем только если длина ≥ 2)
     def span_if(bounds, color, label):
         lo, hi = int(bounds[0]), int(bounds[1])
         if hi - lo >= 2:
@@ -1608,13 +1895,12 @@ def debug_plot_readout_train_val_test(res: dict,
             return True
         return False
 
-    shown_any = False
-    if span_if(b_tr, "#2ca02c", f"train  (NRMSE={m['nrmse_train']:.4f})") and np.isfinite(m["nrmse_train"]):
-        shown_any = True
-    if n_va >= 2 and np.isfinite(m["nrmse_val"]):
-        shown_any |= span_if(b_va, "#9467bd", f"val    (NRMSE={m['nrmse_val']:.4f})")
-    if n_te >= 2 and np.isfinite(m["nrmse_test"]):
-        shown_any |= span_if(b_te, "#d62728", f"test   (NRMSE={m['nrmse_test']:.4f})")
+    def _fmt_nrmse(v: float) -> str:
+        return f"{v:.4f}" if np.isfinite(v) else "—"
+
+    span_if(b_tr, "#2ca02c", f"train  (NRMSE={_fmt_nrmse(m['nrmse_train'])})")
+    span_if(b_va, "#9467bd", f"val    (NRMSE={_fmt_nrmse(m['nrmse_val'])})")
+    span_if(b_te, "#d62728", f"test   (NRMSE={_fmt_nrmse(m['nrmse_test'])})")
 
     # разделители — только если есть правая граница предыдущего сегмента
     if n_tr >= 1: ax.axvline(b_tr[1], color="k", lw=1, alpha=0.6)
@@ -1625,14 +1911,10 @@ def debug_plot_readout_train_val_test(res: dict,
     ax.set_ylabel("MG series value")
     ax.margins(x=0.0)
 
-    # легенда без дублей; только если что-то добавили
+    # Легенда
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        uniq = dict(zip(labels, handles))
-        leg = ax.legend(uniq.values(), uniq.keys(),
-                        ncol=2,
-                        # loc="upper right",
-                        bbox_to_anchor=(0.98, 0.98),
+        leg = ax.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.98, 0.98),
                         frameon=True)
         leg.get_frame().set_facecolor((1, 1, 1, 0.6))
         leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
@@ -1656,7 +1938,9 @@ def _mg_series_from_cfg(cfg: MGConfig) -> np.ndarray:
     x_used = x_full[cfg.warmup:]
     return _normalize_zero_mean_unit_std(x_used)
 
-def generate_input_temporal_unique_per_core(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[np.ndarray, np.ndarray]:
+
+def generate_input_temporal_unique_per_core(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
+    np.ndarray, np.ndarray]:
     mg_series = _mg_series_from_cfg(mg_cfg)
     data_in = mackey_glass_masked(core_count=core_count,
                                   mackey_glass_symbol_count=mg_cfg.t_size,
@@ -1669,7 +1953,9 @@ def generate_input_temporal_unique_per_core(core_count: int, mg_cfg: MGConfig, m
                                   initial_condition=mg_cfg.initial_condition, dt=mg_cfg.dt)
     return data_in, mg_series
 
-def generate_input_temporal_same_all_cores(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[np.ndarray, np.ndarray]:
+
+def generate_input_temporal_same_all_cores(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
+    np.ndarray, np.ndarray]:
     rng = np.random.default_rng(mask_cfg.seed)
     mg_series = _mg_series_from_cfg(mg_cfg)
     if mask_cfg.mask_size == 1:
@@ -1680,7 +1966,9 @@ def generate_input_temporal_same_all_cores(core_count: int, mg_cfg: MGConfig, ma
     data_in = np.tile(pattern, (core_count, 1))
     return data_in, mg_series
 
-def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[np.ndarray, np.ndarray]:
+
+def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
+    np.ndarray, np.ndarray]:
     """
     Spatial-only вход: один и тот же временной сигнал подаётся на все ядра, но с разными постоянными весами.
 
@@ -1703,6 +1991,7 @@ def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: Mas
 
     data_in = (weights[:, None] * mg_series[None, :]) * mask_cfg.gain_in
     return data_in, mg_series
+
 
 # =========================
 # Ключ для кэша и запуск MCF
@@ -1975,7 +2264,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
         max_hours_total=rc.get("max_hours_total", None),
         precision=rc.get("precision", None),
         use_dispersion=bool(rc.get("use_dispersion", True)),
-        disable_core0=bool(rc.get("disable_core0", False)),
+        ase_noise_seed=rc.get("ase_noise_seed", True),
     )
 
     data_out = res["data_out"]
@@ -2031,11 +2320,11 @@ def run_mcf_with_cache(data_in: np.ndarray,
 # =========================
 
 def make_states(
-    data_out: np.ndarray,
-    mask_cfg,
-    feature_mode: Literal["intensity", "realimag"] = "intensity",
-    *,
-    phase_shift: int = 0,
+        data_out: np.ndarray,
+        mask_cfg,
+        feature_mode: Literal["intensity", "realimag"] = "intensity",
+        *,
+        phase_shift: int = 0,
 ) -> Tuple[np.ndarray, int, int]:
     """
     Собирает матрицу признаков для time-multiplexed RC по символам.
@@ -2086,36 +2375,165 @@ def make_states(
         N = T
 
     if feature_mode == "intensity":
-        feats = np.abs(data_out)**2              # (C, T)
+        feats = np.abs(data_out) ** 2  # (C, T)
         C_feat = C
     elif feature_mode == "realimag":
         feats = np.vstack([data_out.real, data_out.imag])  # (2C, T)
-        C_feat = 2*C
+        C_feat = 2 * C
     else:
         raise ValueError(f"unknown feature_mode={feature_mode!r}")
 
     # Укладка по символам: (C_feat, N*M) -> (C_feat, N, M) -> (N, C_feat, M) -> (N, C_feat*M)
-    feats_blk = feats.reshape(C_feat, N, M)      # (C_feat, N, M)
+    feats_blk = feats.reshape(C_feat, N, M)  # (C_feat, N, M)
     X = np.transpose(feats_blk, (1, 0, 2)).reshape(N, C_feat * M)
     return X, N, M
 
 
-def split_train_val_test(N: int, train_frac: float, val_frac: float):
-    n_train = int(N * train_frac)
-    n_val = int(N * val_frac)
+def split_train_val_test(xw_len: int,
+                         train_frac: float,
+                         val_frac: float,
+                         *,
+                         data_out: Optional[np.ndarray] = None,
+                         settle: bool = True,
+                         tail_frac: float = 0.15,
+                         win_symbols: int = 200,
+                         tol_rel: float = 0.03,
+                         tol_abs: float = 0.0,
+                         k_sigma: float = 3.0,
+                         align_to: Optional[int] = None) -> tuple[slice, slice, slice]:
+    """
+    Возвращает срезы (train, val, test), которые применяются к Xw (т.е. по оси времени Xw).
 
-    # аккуратно подрезаем под доступные N, чтобы не получить отрицательный test
-    n_train = max(0, min(n_train, N))
-    n_val = max(0, min(n_val, N - n_train))
+    1) Если data_out is None, то режем Xw длины xw_len по train_frac/val_frac.
 
-    # test может быть нулевым — это ок
-    # Возвращаем (slice_trainval, slice_train, slice_val, slice_test)
-    return (
-        slice(0, n_train + n_val),
-        slice(0, n_train),
-        slice(n_train, n_train + n_val),
-        slice(n_train + n_val, N),
-    )
+    2) Если передан data_out (сырые данные из run_mcf_with_cache), то по мощности |E|^2:
+       - оцениваем "конечную" среднюю мощность по хвосту сигнала (tail),
+       - находим самый ранний момент i (в шкале data_out), после которого одновременно:
+           (a) локальная средняя мощность на окне близка к конечной средней,
+           (b) средняя мощность по всей оставшейся части [i:конец] близка к конечной средней,
+         что защищает от случая "ранняя стационарность → потом переход в другой режим",
+       - переводим найденный i в индекс Xw через масштабирование длинами (data_out vs Xw),
+       - и только затем режем оставшуюся часть Xw по train_frac/val_frac.
+
+    Параметры подбора точки установления (для data_out):
+      settle: включить/выключить поиск установления.
+      tail_frac: доля конца сигнала для оценки стационарной средней мощности.
+      win_symbols: размер окна (в единицах Xw); в шкалу data_out переводится пропорционально длинам.
+      tol_rel/tol_abs: допуски на отличие средней мощности от конечной.
+      k_sigma: допуск через дисперсию хвоста (k_sigma * std / sqrt(win)).
+      align_to: если задано, найденный старт в Xw делается кратным align_to (например mask_size или иной блок).
+    """
+    if train_frac + val_frac > 1.0:
+        raise ValueError("train_frac + val_frac must be <= 1.0")
+
+    if not isinstance(xw_len, (int, np.integer)):
+        raise TypeError("xw_len must be an integer (e.g., Xw.shape[0])")
+
+    T_xw = int(xw_len)
+    if T_xw < 0:
+        raise ValueError("xw_len must be non-negative")
+    if T_xw == 0:
+        return slice(0, 0), slice(0, 0), slice(0, 0)
+
+    # --- Case A: classic behaviour (no data_out) -> split Xw directly
+    if data_out is None or not settle:
+        train_N = round(T_xw * train_frac)
+        val_N = round(T_xw * val_frac)
+        test_N = T_xw - train_N - val_N
+
+        i0 = 0
+        i1 = i0 + train_N
+        i2 = i1 + val_N
+        i3 = i2 + test_N
+        return slice(i0, i1), slice(i1, i2), slice(i2, i3)
+
+    # --- Case B: data_out provided -> find "settled" start point using power statistics (in data_out),
+    #             then map it to Xw indices
+    data = np.asarray(data_out)
+    if data.ndim < 1:
+        raise ValueError(f"Unsupported data_out ndim={data.ndim}; expected array with time as the last axis.")
+
+    power = np.abs(data) ** 2
+    if power.ndim > 1:
+        # Усредняем по всем осям, кроме последней (время): "исходя из всех данных о мощности"
+        power_t = np.mean(power, axis=tuple(range(power.ndim - 1)))
+    else:
+        power_t = power
+
+    power_t = power_t.astype(np.float64, copy=False)
+    T_pow = int(power_t.shape[0])
+    if T_pow <= 0:
+        # Нечего анализировать по мощности -> режем как обычно
+        train_N = round(T_xw * train_frac)
+        val_N = round(T_xw * val_frac)
+        test_N = T_xw - train_N - val_N
+        return slice(0, train_N), slice(train_N, train_N + val_N), slice(train_N + val_N, T_xw)
+
+    start_xw = 0
+
+    if T_pow >= 10:
+        tail_len = max(1, int(round(T_pow * tail_frac)))
+        tail_start = max(0, T_pow - tail_len)
+        tail = power_t[tail_start:]
+        mu_tail = float(np.mean(tail))
+        std_tail = float(np.std(tail))
+
+        # Перевод "окна в Xw" -> "окно в data_out" по пропорции длин:
+        # samples_per_xw ~ T_pow / T_xw
+        samples_per_xw = float(T_pow) / max(1.0, float(T_xw))
+
+        win_xw = int(max(1, win_symbols))
+        if align_to is not None and align_to > 0:
+            win_xw = int(max(1, win_xw * int(align_to)))
+
+        win = int(max(1, round(win_xw * samples_per_xw)))
+        win = min(win, T_pow)
+
+        tol = max(
+            float(tol_abs),
+            float(tol_rel) * max(abs(mu_tail), 1e-30),
+            float(k_sigma) * std_tail / max(float(np.sqrt(win)), 1.0),
+        )
+
+        # prefix sums for fast means
+        cs = np.cumsum(np.concatenate(([0.0], power_t)))
+
+        # mean on [i:i+win)
+        mu_local = (cs[win:] - cs[:-win]) / float(win)  # len = T_pow - win + 1
+
+        # mean on [i:T_pow)
+        idx = np.arange(T_pow, dtype=np.int64)
+        mu_from = (cs[-1] - cs[:-1]) / (T_pow - idx).astype(np.float64)  # len = T_pow
+
+        L = int(mu_local.shape[0])
+        ok_local = np.abs(mu_local - mu_tail) <= tol
+        ok_from = np.abs(mu_from[:L] - mu_tail) <= tol
+        ok = ok_local & ok_from
+
+        if np.any(ok):
+            start_pow = int(np.argmax(ok))  # first True, in data_out index space
+
+            # Map data_out index -> Xw index by length proportion (robust when sizes differ)
+            start_xw = int(round(start_pow * float(T_xw) / max(1.0, float(T_pow))))
+
+            # Align start to block boundary in Xw space if requested (e.g., mask_size)
+            if align_to is not None and align_to > 1:
+                start_xw = int(((start_xw + align_to - 1) // align_to) * align_to)
+
+            start_xw = max(0, min(start_xw, T_xw - 1))
+
+    # Split the remaining Xw samples [start_xw:T_xw)
+    T_eff = max(0, T_xw - start_xw)
+    train_N = round(T_eff * train_frac)
+    val_N = round(T_eff * val_frac)
+    test_N = T_eff - train_N - val_N
+
+    i0 = start_xw
+    i1 = i0 + train_N
+    i2 = i1 + val_N
+    i3 = i2 + test_N
+
+    return slice(i0, i1), slice(i1, i2), slice(i2, i3)
 
 
 def pseudo_free_run(y_seed: np.ndarray,
@@ -2242,119 +2660,6 @@ def estimate_required_t_size_fast(cfg) -> int:
     S_total = int(S_needed + washout + max(target_shift, 0))
     return S_total
 
-def learning_curve_for_result_plotly(
-    result: dict,
-    *,
-    add_bias: bool = True,
-) -> dict:
-    """
-    Строит лёрнинг-кривую (validation NRMSE vs S_train) на УЖЕ посчитанных состояниях,
-    без пересчёта физики. Ожидает в result поля:
-      - "X_train", "y_train", "X_val", "y_val".
-    Внутри:
-      • берёт сетку S_train (6 точек от ~10% до 100% train),
-      • в каждой точке подбирает alpha риджа по лог-сетке через ОДНУ SVD,
-      • возвращает список метрик + сохраняет интерактивный HTML-график (Plotly).
-
-    Возвращает:
-      {
-        "curve": [{"S_train", "alpha_best", "nrmse_train", "nrmse_val"}, ...],
-        "plot_saved_to": "<путь к .html>" | None
-      }
-    """
-
-    # ---- входные массивы ----
-    Xtr_full = result["X_train"]
-    ytr_full = result["y_train"]
-    Xva = result["X_val"]
-    yva = result["y_val"]
-
-    n_train = Xtr_full.shape[0]
-    # Сетка S_train: 6 точек от ~10% до 100% train
-    lo = max(5, n_train // 10)
-    train_sizes_syms = sorted(set(np.linspace(lo, n_train, num=100, dtype=int).tolist()))
-
-    # Сетка alpha по умолчанию
-    alphas = np.logspace(-6, 2, 41)
-
-    curve = []
-    for S in train_sizes_syms:
-        if S < 2:
-            continue
-        S_use = min(S, n_train)
-        Xtr = Xtr_full[:S_use, :]
-        ytr = ytr_full[:S_use, :]
-
-        if add_bias:
-            Xb_tr = np.hstack([Xtr, np.ones((Xtr.shape[0], 1))])
-            Xb_va = np.hstack([Xva, np.ones((Xva.shape[0], 1))])
-        else:
-            Xb_tr, Xb_va = Xtr, Xva
-
-        # --- одна SVD на весь путь по alpha ---
-        U, Svd, Vt = np.linalg.svd(Xb_tr, full_matrices=False)
-        Ut_y = U.T @ ytr
-
-        best_alpha, best_W, best_val = None, None, np.inf
-        for a in alphas:
-            shrink = Svd / (Svd * Svd + a)
-            W = (Vt.T * shrink) @ Ut_y
-            val = nrmse(yva, Xb_va @ W)
-            if val < best_val:
-                best_val, best_alpha, best_W = val, float(a), W
-        print("best_alpha =", best_alpha)
-        nrmse_tr = nrmse(ytr, Xb_tr @ best_W)
-
-        curve.append({
-            "S_train": int(S_use),
-            "alpha_best": float(best_alpha),
-            "nrmse_train": float(nrmse_tr),
-            "nrmse_val": float(best_val),
-        })
-
-    # ---- график (Plotly) ----
-    plot_saved_to = None
-    try:
-        import plotly.graph_objects as go
-
-        Ss = [d["S_train"] for d in curve]
-        vals = [d["nrmse_val"] for d in curve]
-        trs  = [d["nrmse_train"] for d in curve]
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=Ss, y=vals, mode="lines+markers", name="val NRMSE"))
-        fig.add_trace(go.Scatter(x=Ss, y=trs,  mode="lines+markers", name="train NRMSE", line=dict(dash="dash")))
-        fig.update_layout(
-            title="Learning curve (validation NRMSE vs S_train)",
-            xaxis_title="Число обучающих символов S_train",
-            yaxis_title="NRMSE",
-            template="plotly_white",
-            legend=dict(x=0.02, y=0.98),
-        )
-
-        # Автогенерация имени HTML рядом с экспериментом.
-        # Пытаемся использовать несколько полей из result["params"], если есть
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tag = "lc"
-        try:
-            p = result.get("params", {})
-            ms = p.get("mask_size", "M")
-            df = p.get("delay_factor_in_symbols", "D")
-            up = p.get("upsampling", "U")
-            tag = f"lc_m{ms}_d{df}_u{up}"
-        except Exception:
-            pass
-        plot_saved_to = f"{tag}_{stamp}.html"
-        # fig.write_html(plot_saved_to, include_plotlyjs="cdn")
-        # Покажем интерактивно
-        fig.show()
-    except Exception as _e:
-        # не роняем эксперимент из-за графика
-        result["_learning_curve_plot_error"] = str(_e)
-
-    return {"curve": curve, "plot_saved_to": plot_saved_to}
-
-
 
 # =========================
 # Сценарии запуска
@@ -2475,8 +2780,8 @@ def run_single_experiment(cfg: ExperimentConfig,
         Xw, yw = X_aligned, y_aligned
 
     # сплиты
-    sl_trainval, sl_train, sl_val, sl_test = split_train_val_test(
-        Xw.shape[0], cfg.training.train_frac, cfg.training.val_frac
+    sl_train, sl_val, sl_test = split_train_val_test(
+        Xw.shape[0], cfg.training.train_frac, cfg.training.val_frac, data_out=data_out
     )
     Xtr, ytr = Xw[sl_train], yw[sl_train]
     Xva, yva = Xw[sl_val], yw[sl_val]
@@ -2490,7 +2795,7 @@ def run_single_experiment(cfg: ExperimentConfig,
     Xte = (Xte - mu) / sigma
 
     # обучение рид-аута
-    W, ridge_alpha = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True)
+    W, ridge_alpha = train_ridge(Xtr, ytr, alpha=cfg.training.ridge_alpha, add_bias=True, X_val=Xva, y_val=yva)
 
     # метрики
     ytr_hat = apply_readout(Xtr, W)
@@ -2576,6 +2881,10 @@ def run_single_experiment(cfg: ExperimentConfig,
 # Оптимизация (только Optuna)
 # =========================
 
+def _round(x, digit=13) -> float:
+    return float(round(float(x), digit))
+
+
 def optimize_hyperparams(base_cfg: ExperimentConfig,
                          n_trials: int,
                          n_jobs: Optional[int] = None,
@@ -2589,20 +2898,24 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     Управление поисковым пространством из main:
       param_space: dict | None
-        Ключи: "kappa", "delta_phase", "g0", "psat", "fiber_length_m", "gain_in",
-               "mask_size", "delay_factor_in_symbols".
+        Ключи: "kappa", "delta_phase", "fiber_length_m", "gain_in",
+               "mask_size", "delay_factor_in_symbols", "time_step_ps",
+               и ЛИБО ("g0", "psat"), ЛИБО pump-параметры:
+                 - "ppump" (как число или список per-core),
+                 - ИЛИ "p_pump_total" + "pump_slm_w" (pump_slm_w как список per-core).
         Значение для ключа:
           • число → фиксировать (не оптимизировать);
-          • {"low":a,"high":b,"log":bool?} → suggest_float(..., log=?);
-          • {"int":True,"low":a,"high":b,"step":s?} → suggest_int(...);
-          • {"choices":[...]} или список/кортеж длиной ≥ 3 → suggest_categorical(...);
+          • {"low":a,"high":b,"log":bool?,"step":s?,"sig":int?,"kind":"float"/"int"} → suggest_*;
+          • {"choices":[...]} или список/кортеж длиной >1 → categorical;
           • (a, b) → suggest_float(a..b).
-        Отсутствующий ключ → используется дефолтный диапазон из функции.
 
     Всегда в 1 поток внутри trial (temporary_thread_limits(1)).
 
     Важно (кластер / много процессов):
-      Печать "GLOBAL BEST" синхронизируется через lock-файл на общей ФС, чтобы не спамили все процессы.
+      Печать "GLOBAL BEST" синхронизируется через lock-файл на общей ФС.
+    Прогресс:
+      MCF_OPTUNA_PROGRESS_EVERY (default: 1000) — печатает
+        [optuna][PROGRESS] trial=<n> ts=<iso8601>
     """
     import optuna
     import warnings
@@ -2643,6 +2956,9 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     best = dict(score=float("inf"), res=None, params=None)
 
+    progress_every = int(os.getenv("MCF_OPTUNA_PROGRESS_EVERY", "1000") or "1000")
+    if progress_every <= 0:
+        progress_every = 1000
     # --- "GLOBAL BEST" печатаем только один раз на улучшение (межпроцессная синхронизация) ---
     best_state_path = base_dir / ".optuna_global_best.json"
     best_lock_path = base_dir / ".optuna_global_best.lock"
@@ -2663,6 +2979,16 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
         print("-" * 80, flush=True)
 
+    def _print_progress(trial_number: int) -> None:
+        if trial_number <= 0:
+            return
+        if (trial_number % int(progress_every)) != 0:
+            return
+        print(
+            f"[optuna][PROGRESS] trial={trial_number} ts={datetime.now().isoformat(timespec='seconds')}",
+            flush=True,
+        )
+
     def _print_global_best_if_updated(study: "optuna.study.Study") -> None:
         """
         Печатает best_trial только тогда, когда глобальный best действительно обновился.
@@ -2678,7 +3004,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         if best_no < 0:
             return
 
-        # На POSIX делаем межпроцессный lock; на остальных платформах fallback на локальный guard.
         if os.name == "posix":
             try:
                 import fcntl  # noqa: WPS433
@@ -2720,18 +3045,29 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     _print_best_trial(bt)
                     return
 
-        # Fallback: хотя бы не спамить в одном процессе.
         if best_no <= int(last_best_printed_local["trial_number"]):
             return
         last_best_printed_local["trial_number"] = best_no
         _print_best_trial(bt)
 
-    def _round(x, digit=13) -> float:
-        return float(round(float(x), digit))
-
     def _as_num(x):
         import numbers
         return isinstance(x, numbers.Number)
+
+    DEFAULT_SIG = 5
+    _log_grid_cache = {}
+
+    def _round_sig(x: float, sig: int) -> float:
+        if float(x) == 0.0:
+            return 0.0
+        return float(f"{float(x):.{int(sig)}g}")
+
+    def _step_from_sig(low_val: float, high_val: float, sig: int) -> float:
+        s = max(abs(float(low_val)), abs(float(high_val)))
+        if not np.isfinite(s) or s == 0.0:
+            return 10.0 ** (-int(sig) + 1)
+        order = int(np.floor(np.log10(s)))
+        return 10.0 ** (order - int(sig) + 1)
 
     def _suggest(
             name: str,
@@ -2750,26 +3086,18 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         - Если список длиной >1 — трактуется как categorical.
         - Если dict — читаются поля: kind, low, high, step, log, choices.
         - Если параметр не описан в search_space — используются default_*.
-
-        ВАЖНО: для IntDistribution параметр step должен быть положительным целым.
-        При log=True допустим только step=1. Если step None — не передаём его вовсе,
-        чтобы Optuna взяла step=1 по умолчанию.
         """
-
         spec = None
         if search_space and name in search_space:
             spec = search_space[name]
 
-        # --- фиксированные значения / простые списки ---
         if isinstance(spec, (int, float, str, bool)):
             return spec
         if isinstance(spec, (list, tuple)):
             if len(spec) == 1:
                 return spec[0]
-            # список значений -> категориальный выбор
             return trial.suggest_categorical(name, list(spec))
 
-        # --- читаем конфиг из dict или берём умолчания ---
         if isinstance(spec, dict):
             kind = spec.get("kind", default_kind)
             low = spec.get("low", default_low)
@@ -2777,6 +3105,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             step = spec.get("step", None)
             log = bool(spec.get("log", False))
             choices = spec.get("choices", None)
+            sig = spec.get("sig", None)
         else:
             kind = default_kind
             low = default_low
@@ -2784,100 +3113,158 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             step = default_step
             log = bool(default_log)
             choices = None
+            sig = None
 
-        # --- категориальные ---
         if choices is not None:
             return trial.suggest_categorical(name, list(choices))
 
-        # Валидация границ (минимально необходимая)
         if low is None or high is None:
             raise ValueError(f"{name}: missing low/high for {kind}")
 
-        # --- ветки по типам ---
         if kind == "int":
-            # Если step не задан, не передаём его — Optuna возьмёт step=1 по умолчанию.
             if step is None:
                 return trial.suggest_int(name, int(low), int(high), log=log)
 
-            # Нормализация step
             s = int(step)
             if s <= 0:
                 s = 1
-            # При log=True Optuna требует step == 1
             if log and s != 1:
                 s = 1
             return trial.suggest_int(name, int(low), int(high), step=s, log=log)
 
         if kind == "float":
+            low_f = float(low)
+            high_f = float(high)
+            if low_f == high_f:
+                return low_f
+
+            try:
+                sig_i = int(sig) if sig is not None else DEFAULT_SIG
+            except Exception:
+                sig_i = DEFAULT_SIG
+
+            if log:
+                # В Optuna нельзя одновременно использовать log=True и step для float.
+                # Теперь: suggest_float(..., log=True) + квантизация по sig в "мультипликативной" шкале без списков.
+                if low_f <= 0.0 or high_f <= 0.0:
+                    raise ValueError(
+                        f"{name}: log-parameter requires low>0 and high>0, got low={low_f}, high={high_f}"
+                    )
+                if low_f > high_f:
+                    low_f, high_f = high_f, low_f
+
+                raw = float(trial.suggest_float(name, low_f, high_f, log=True))
+
+                rel = 10.0 ** (-int(sig_i) + 1)
+                ratio = 1.0 + rel
+                if ratio <= 1.0:
+                    ratio = 1.0 + 1e-12
+
+                try:
+                    n = int(round(np.log(raw / low_f) / np.log(ratio)))
+                except Exception:
+                    n = 0
+
+                v = low_f * (ratio ** n)
+                v = _round_sig(v, sig_i)
+
+                if v < low_f:
+                    v = low_f
+                if v > high_f:
+                    v = high_f
+                return v
+
             if step is None:
-                return trial.suggest_float(name, float(low), float(high), log=log)
-            # У float step допускается, но должен быть >0
-            s = float(step)
-            if s <= 0:
-                s = None  # эквивалент "не дискретизируем"
-            if s is None:
-                return trial.suggest_float(name, float(low), float(high), log=log)
-            return trial.suggest_float(name, float(low), float(high), step=s, log=log)
+                step = _step_from_sig(low_f, high_f, sig_i)
 
-        # По умолчанию — categorical (на случай непредвидённых kind)
+            s = float(step) if step is not None else None
+            if s is None or (not np.isfinite(s)) or s <= 0:
+                return trial.suggest_float(name, low_f, high_f, log=False)
+            return trial.suggest_float(name, low_f, high_f, step=s, log=False)
+
         return trial.suggest_categorical(name, list(choices) if choices is not None else [])
-
-    def _flatten(prefix, obj):
-        import numbers
-        if obj is None:
-            yield (prefix, None)
-            return
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                newp = f"{prefix}.{k}" if prefix else str(k)
-                yield from _flatten(newp, v)
-        elif isinstance(obj, (list, tuple)):
-            for i, v in enumerate(obj):
-                newp = f"{prefix}[{i}]"
-                yield from _flatten(newp, v)
-        elif isinstance(obj, (numbers.Number, str, bool)):
-            yield (prefix, obj)
-        else:
-            yield (prefix, str(obj))
 
     def objective(trial: "optuna.trial.Trial") -> float:
         with temporary_thread_limits(1):
-            # --- 1) гиперпараметры из внешнего пространства (или дефолтные диапазоны) ---
             kappa = (_suggest("kappa", trial, default_kind="float", default_low=0.1, default_high=0.99,
                               search_space=param_space))
             delta_phase = (_suggest("delta_phase", trial, default_kind="float", default_low=0.0,
                                     default_high=2 * np.pi, search_space=param_space))
 
+            fiber_length = (_suggest("fiber_length_m", trial, default_kind="float",
+                                     default_low=0.2, default_high=3.0, default_log=True, search_space=param_space))
+
+            def _suggest_per_core_list(name: str,
+                                       *,
+                                       default_kind: str,
+                                       default_low,
+                                       default_high,
+                                       default_log: bool = False) -> list:
+                """
+                Если param_space[name] = list/tuple, то это per-core спецификации.
+                Для каждого ядра создаём локальный search_space, где ключ name_i -> spec_i,
+                иначе Optuna не увидит bounds (потому что в исходном param_space нет name_i).
+                """
+                if not param_space or name not in param_space:
+                    v = _suggest(name, trial, default_kind=default_kind, default_low=default_low,
+                                 default_high=default_high, default_log=default_log, search_space=param_space)
+                    return [v] * base_cfg.core_count
+
+                spec = param_space.get(name)
+
+                if isinstance(spec, (list, tuple)):
+                    out = []
+                    for i in range(base_cfg.core_count):
+                        spec_i = spec[i] if i < len(spec) else spec[-1]
+                        local_space = dict(param_space)
+                        local_space[f"{name}_{i}"] = spec_i
+                        v = _suggest(f"{name}_{i}", trial, default_kind=default_kind, default_low=default_low,
+                                     default_high=default_high, default_log=default_log, search_space=local_space)
+                        out.append(v)
+                    return out
+
+                v = _suggest(name, trial, default_kind=default_kind, default_low=default_low,
+                             default_high=default_high, default_log=default_log, search_space=param_space)
+                return [v] * base_cfg.core_count
+
+            # --- g0/psat либо напрямую, либо через pump -> (g0, psat) ---
             g0_array = []
             psat_array = []
 
-            # Проверяем, нужно ли оптимизировать отдельно для каждого ядра
-            if param_space and isinstance(param_space.get("g0"), list):
-                # Если g0 задан как список в param_space
-                for i in range(base_cfg.core_count):
-                    g0 = _suggest(f"g0_{i}", trial, default_kind="float", default_low=0.01, default_high=20.0,
-                                  default_log=True, search_space=param_space)
-                    g0_array.append(g0)
-            else:
-                # Стандартная оптимизация одного значения для всех ядер
-                g0 = (_suggest("g0", trial, default_kind="float", default_low=0.01, default_high=20.0,
-                               default_log=True, search_space=param_space))
-                g0_array = [g0] * base_cfg.core_count
+            has_p_pump = bool(param_space and ("ppump" in param_space))
+            has_p_pump_total = bool(
+                param_space and (("p_pump_total" in param_space) or ("p_pump_total_w" in param_space))
+            )
+            has_pump_slm_w = bool(param_space and ("pump_slm_w" in param_space))
 
-            if param_space and isinstance(param_space.get("psat"), list):
-                # Если psat задан как список в param_space
-                for i in range(base_cfg.core_count):
-                    psat = _suggest(f"psat_{i}", trial, default_kind="float", default_low=1e-5, default_high=0.1,
-                                    default_log=True, search_space=param_space)
-                    psat_array.append(psat)
-            else:
-                # Стандартная оптимизация одного значения для всех ядер
-                psat = (_suggest("psat", trial, default_kind="float", default_low=1e-5, default_high=0.1,
-                                 default_log=True, search_space=param_space))
-                psat_array = [psat] * base_cfg.core_count
+            if has_p_pump_total and has_pump_slm_w:
+                p_total_name = "p_pump_total_w" if ("p_pump_total_w" in param_space) else "p_pump_total"
+                p_pump_total = _suggest(p_total_name, trial, default_kind="float",
+                                        default_low=0.01, default_high=1.0, default_log=True, search_space=param_space)
+                pump_slm_w = _suggest_per_core_list("pump_slm_w", default_kind="float",
+                                                    default_low=-3.0, default_high=3.0, default_log=False)
+                p_pump_per_core = calc_p_pump_per_core_from_slm(float(p_pump_total), pump_slm_w)
 
-            fiber_length = (_suggest("fiber_length_m", trial, default_kind="float",
-                                     default_low=0.2, default_high=3.0, default_log=True, search_space=param_space))
+                g0_t, psat_t = calc_g0_psat_from_p_pump_josab(p_pump_per_core, float(fiber_length), alpha=0)
+                g0_array = list(g0_t)
+                psat_array = list(psat_t)
+
+            elif has_p_pump:
+                p_pump_per_core = _suggest_per_core_list("ppump", default_kind="float",
+                                                         default_low=0.01, default_high=1.0, default_log=True)
+
+                g0_t, psat_t = calc_g0_psat_from_p_pump_josab(
+                    tuple(float(x) for x in p_pump_per_core), float(fiber_length), alpha=0
+                )
+                g0_array = list(g0_t)
+                psat_array = list(psat_t)
+
+            else:
+                g0_array = _suggest_per_core_list("g0", default_kind="float",
+                                                  default_low=0.01, default_high=20.0, default_log=True)
+                psat_array = _suggest_per_core_list("psat", default_kind="float",
+                                                    default_low=1e-5, default_high=0.1, default_log=True)
+
             gain_in = (_suggest("gain_in", trial, default_kind="float",
                                 default_low=1.0, default_high=1e2, default_log=True, search_space=param_space))
             mask_size = _suggest("mask_size", trial, default_kind="int", default_low=30, default_high=400,
@@ -2889,7 +3276,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                                     default_high=base_cfg.reservoir.time_step_ps,
                                     search_space=param_space)
 
-            # --- 2) конфиг trial'а (delay_factor_in_symbols, а не window_size) ---
             cfg = ExperimentConfig(
                 core_count=base_cfg.core_count,
                 mg=base_cfg.mg,
@@ -2911,7 +3297,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     use_gpu=base_cfg.reservoir.use_gpu,
                     use_torch=base_cfg.reservoir.use_torch,
                     num_threads=1,
-                    display_debug_info=base_cfg.reservoir.display_debug_info,
+                    display_debug_info=False,
                     display_debug_plots=False,
                     save_figs=False,
                     save_gif=False,
@@ -2920,12 +3306,12 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     max_hours_total=base_cfg.reservoir.max_hours_total,
                     precision=base_cfg.reservoir.precision,
                     use_dispersion=base_cfg.reservoir.use_dispersion,
+                    ase_noise_seed=base_cfg.reservoir.ase_noise_seed,
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
             )
 
-            # --- 3) запуск и метрика (плохие конфиги помечаем PRUNED) ---
             try:
                 res = run_single_experiment(cfg, free_run_horizon=free_run_horizon,
                                             force_rerun=force_rerun, save_cache=save_cache)
@@ -2945,27 +3331,28 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     raise TrialPruned("no convergence")
                 raise
 
-            score = min(float(res["metrics"]["nrmse_val"]), 2)
+            score = min(float(res["metrics"]["nrmse_test"]), 2)
             if not np.isfinite(score):
                 trial.set_user_attr("skip_reason", f"non-finite score {score}")
                 raise TrialPruned("skip_reason: non-finite score")
 
-            # --- мини-логирование в user_attrs ---
-            trial.set_user_attr("nrmse_train", float(res["metrics"]["nrmse_train"]))
-            trial.set_user_attr("nrmse_val", float(res["metrics"]["nrmse_val"]))
-            trial.set_user_attr("ridge_alpha", float(res["metrics"]["ridge_alpha"]))
-
-            fiber_params = res.get("fiber_params", {}) or {}
-            for k, v in _flatten("fiber", fiber_params):
-                trial.set_user_attr(k, v)
-
-            trial.set_user_attr("cfg.mask.mask_size", int(cfg.mask.mask_size))
-            trial.set_user_attr("cfg.mask.gain_in", float(cfg.mask.gain_in))
-            trial.set_user_attr("cfg.reservoir.kappa", float(cfg.reservoir.kappa))
-            trial.set_user_attr("cfg.reservoir.delta_phase", float(cfg.reservoir.delta_phase))
-            trial.set_user_attr("cfg.reservoir.upsampling", int(cfg.reservoir.upsampling))
-            trial.set_user_attr("cfg.reservoir.delay_factor_in_symbols", int(cfg.reservoir.delay_factor_in_symbols))
-            trial.set_user_attr("cfg.reservoir.time_step_ps", int(cfg.reservoir.time_step_ps))
+            trial.set_user_attr(
+                "mcf",
+                {
+                    "nrmse_train": float(res["metrics"]["nrmse_train"]),
+                    "nrmse_val": float(res["metrics"]["nrmse_val"]),
+                    "nrmse_test": float(res["metrics"]["nrmse_test"]),
+                    "ridge_alpha": float(res["metrics"]["ridge_alpha"]),
+                    "cfg.mask.mask_size": int(cfg.mask.mask_size),
+                    "cfg.mask.gain_in": float(cfg.mask.gain_in),
+                    "cfg.reservoir.kappa": float(cfg.reservoir.kappa),
+                    "cfg.reservoir.delta_phase": float(cfg.reservoir.delta_phase),
+                    "cfg.reservoir.upsampling": int(cfg.reservoir.upsampling),
+                    "cfg.reservoir.delay_factor_in_symbols": int(cfg.reservoir.delay_factor_in_symbols),
+                    "cfg.reservoir.time_step_ps": float(cfg.reservoir.time_step_ps),
+                    "cfg.reservoir.fiber_length_m": float(cfg.reservoir.fiber_length_m),
+                },
+            )
 
             nonlocal best
             if score < best["score"]:
@@ -2994,16 +3381,26 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         sampler=sampler
     )
 
+    try:
+        study_id = storage.get_study_id_from_name(study_name)
+    except Exception:
+        study_id = None
     print(f"[optimize] Target COMPLETE trials = {n_trials}")
 
     def _optuna_global_best_callback(study_: "optuna.study.Study", frozen_trial: "optuna.trial.FrozenTrial") -> None:
+        tn = int(getattr(frozen_trial, "number", -1))
+        if tn >= 0:
+            _print_progress(tn)
         if getattr(frozen_trial, "state", None) != TrialState.COMPLETE:
             return
         _print_global_best_if_updated(study_)
 
     if os.getenv("MCF_BASH", ""):
         while True:
-            complete_cnt = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
+            if study_id is not None:
+                complete_cnt = int(storage.get_n_trials(study_id, state=(TrialState.COMPLETE,)))
+            else:
+                complete_cnt = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
             if complete_cnt >= n_trials:
                 break
             trial = study.ask()
@@ -3011,13 +3408,17 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                 value = objective(trial)
                 study.tell(trial, value)
                 _print_global_best_if_updated(study)
+                _print_progress(int(getattr(trial, "number", -1)))
             except TrialPruned:
                 study.tell(trial, state=TrialState.PRUNED)
+                _print_progress(int(getattr(trial, "number", -1)))
             except (AssertionError, ValueError, RuntimeError) as _e:
                 study.tell(trial, state=TrialState.FAIL)
+                _print_progress(int(getattr(trial, "number", -1)))
                 continue
             except Exception as _e:
                 study.tell(trial, state=TrialState.FAIL)
+                _print_progress(int(getattr(trial, "number", -1)))
                 continue
     else:
         print("[mode] Local study.optimize (no MCF_BASH)")
@@ -3042,7 +3443,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         optuna_best_value=float(best_trial.value),
         study_name=study_name,
     )
-
 
 
 def _update_plots_and_save(results_stream: list[dict],
@@ -3113,11 +3513,11 @@ def _update_plots_and_save(results_stream: list[dict],
     xc_va, yc_va = _sorted_xy(coupl, y_va)
     drew = False
     if xc_tr is not None:
-        ax_c.plot(xc_tr, yc_tr, # marker="o",
+        ax_c.plot(xc_tr, yc_tr,  # marker="o",
                   label="Train NRMSE")
         drew = True
     if xc_va is not None:
-        ax_c.plot(xc_va, yc_va, # marker="s",
+        ax_c.plot(xc_va, yc_va,  # marker="s",
                   linestyle="--", label="Val NRMSE")
         drew = True
     ax_c.set_xlabel("coupling coefficient, 1/m")
@@ -3141,11 +3541,11 @@ def _update_plots_and_save(results_stream: list[dict],
     xl_va, yl_va = _sorted_xy(Lc, y_va)
     drew = False
     if xl_tr is not None:
-        ax_l.plot(xl_tr, yl_tr, #marker="o",
+        ax_l.plot(xl_tr, yl_tr,  # marker="o",
                   label="Train NRMSE")
         drew = True
     if xl_va is not None:
-        ax_l.plot(xl_va, yl_va, #marker="s",
+        ax_l.plot(xl_va, yl_va,  # marker="s",
                   linestyle="--", label="Val NRMSE")
         drew = True
     ax_l.set_xlabel("coupling length, m")
@@ -3169,12 +3569,12 @@ def _update_plots_and_save(results_stream: list[dict],
     drew = False
     if xr_tr is not None:
         ax_r.plot(xr_tr, yr_tr,
-                  #marker="o",
+                  # marker="o",
                   label="Train NRMSE")
         drew = True
     if xr_va is not None:
         ax_r.plot(xr_va, yr_va,
-                  #marker="s",
+                  # marker="s",
                   linestyle="--", label="Val NRMSE")
         drew = True
     ax_r.set_xlabel("inter-core radius, µm")
@@ -3242,7 +3642,7 @@ def _scan_single_radius_task(args):
 
     # выбираем правильный сценарий
     res = run_experiments(cfg_i, n_trials_opt=0, free_run_horizon=0,
-                               force_rerun=force_rerun, save_cache=save_cache)
+                          force_rerun=force_rerun, save_cache=save_cache)
 
     # фактический коэффициент связи через L_coupling (если есть)
     fp = res.get("fiber_params", {}) or {}
@@ -3344,7 +3744,7 @@ def find_best_coupling_coefficient(radii: list,
 
     # итоговая фильтрация и финальная отрисовка
     results = [r for r in results_stream if np.isfinite(r.get("coupling", np.nan))
-               and abs(r.get("nrmse_val") - r.get("nrmse_train") ) < 0.1]
+               and abs(r.get("nrmse_val") - r.get("nrmse_train")) < 0.1]
     if not results:
         print("find_best_coupling_coefficient: все прогоны вернули нечисловой coupling — пропуск.")
         return
@@ -3419,7 +3819,7 @@ def plot_combined_csv_results(base_cfg, logx: bool = False, logy: bool = False, 
     Lc = valid["L_coupling_m"].to_numpy(float)
     rad = valid["radius"].to_numpy(float)
     y_tr = valid.get("nrmse_train", pd.Series(np.nan, index=valid.index)).to_numpy(float)
-    y_va = valid.get("nrmse_val",   pd.Series(np.nan, index=valid.index)).to_numpy(float)
+    y_va = valid.get("nrmse_val", pd.Series(np.nan, index=valid.index)).to_numpy(float)
 
     def _sorted_xy(x_raw, y_raw):
         x = np.asarray(x_raw, float)
@@ -3525,6 +3925,7 @@ def plot_combined_csv_results(base_cfg, logx: bool = False, logy: bool = False, 
             combined_df.to_csv(p_csv, index=False)
         except Exception as e:
             print(f"[warn] write combined csv failed: {e}")
+
 
 def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
                                   radii: list[float] | tuple[float, ...],
@@ -3674,8 +4075,15 @@ def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
     return {"results_stream": results_stream, "paths": paths}
 
 
-
-
+def _per_core(params, key: str, default: float, core_count: int):
+    v = params.get(key, default)
+    if isinstance(v, (list, tuple, np.ndarray)):  # строк тут быть не должно
+        if len(v) == core_count:
+            return tuple(v)
+        if len(v) == 1:
+            return (v[0],) * core_count
+        raise ValueError(f"{key}: expected len 1 or {core_count}, got {len(v)}")
+    return (v,) * core_count
 
 # =========================
 # Пример точки входа
@@ -3691,92 +4099,7 @@ if __name__ == "__main__":
 
     params = {}
 
-    # # best 1-core with temporal mask (0.534051376182763)
-    # params = {
-    #     "layer_count": 0,
-    #     "variant": "temporal_same_all_cores",
-    #     "delay_factor_in_symbols": 9,
-    #     "fiber_length_m": 0.025452927924700015,
-    #     "g0": 25.263000926144148,
-    #     "gain_in": 70.73874859737282,
-    #     "kappa": 0.3468221607798453,
-    #     "psat": 0.000989736646092226
-    # }
-    #
-    # # # best 1-core with temporal mask (0.6046692821976254)
-    # params = {
-    #     "layer_count": 0,
-    #     "variant": "temporal_same_all_cores",
-    #     "delay_factor_in_symbols": 4,
-    #     "fiber_length_m": 0.20824462603995597,
-    #     "g0": 0.00012112194746004569,
-    #     "gain_in": 109.16390472938491,
-    #     "kappa": 0.7605799908679632,
-    #     "mask_size": 158,
-    #     "psat": 1.5188531613954726,
-    # }
-    #
-    # # best 7-core with equal temporal masks ("nrmse_val": 0.3765429442430391)
-    # params = {
-    #     "layer_count": 1,
-    #     "variant": "temporal_same_all_cores",
-    #     "delay_factor_in_symbols": 3,
-    #     "fiber_length_m": 0.029532836852220454,
-    #     "g0": 0.003994483003827699,
-    #     "gain_in": 63.1325986315943,
-    #     "kappa": 0.767900837893305,
-    #     "mask_size": 269,
-    #     "psat": 0.043516668288062166
-    # }
-    #
-    # # best 7-core with different temporal masks (value=0.00048644843214891366)
-    # params = {
-    #     "layer_count": 1,
-    #     "variant": "temporal_unique_per_core",
-    #     "delay_factor_in_symbols": 4,
-    #     "fiber_length_m": 0.195738262714597,
-    #     "g0": 2.4250900923903105,
-    #     "gain_in": 18.937924821977948,
-    #     "kappa": 0.8096486533100956,
-    #     "mask_size": 321,
-    #     "psat": 0.0002199642471655403,
-    # }
-    #
-    # # best 7-core with spatial mask ("nrmse_val": 0.534051376182763)
-    # params = {
-    #     "layer_count": 1,
-    #     "variant": "spatial_only",
-    #     "delay_factor_in_symbols": 9,
-    #     "fiber_length_m": 0.025452927924700015,
-    #     "g0": 25.263000926144148,
-    #     "gain_in": 70.73874859737282,
-    #     "kappa": 0.3468221607798453,
-    #     "psat": 0.000989736646092226,
-    # }
-    #
-    # # best 19-core with spatial mask ('optuna_best_value': 0.27960669434400703)
-    params = {
-        "layer_count": 2,
-        "variant": "spatial_only",
-        'kappa': 0.7514549959835767,
-        'g0': 0.03333587932400271,
-        'psat': 5.5359281838356184e-05,
-        'fiber_length_m': 0.004480407948553015,
-        'gain_in': 119.59275595623892,
-        'delay_factor_in_symbols': 3,
-    }
-    #
-    # # best 37-core with spatial mask ('optuna_best_value': 0.16953488306286332)
-    # params = {
-    #     "layer_count": 3,
-    #     "variant": "spatial_only",
-    #     'kappa': 0.5089340404443606,
-    #     'g0': 0.0004533592157416011,
-    #     'psat': 6.265629327274745e-05,
-    #     'fiber_length_m': 0.017535040039437726,
-    #     'gain_in': 155.58427927073484,
-    #     'delay_factor_in_symbols': 6,
-    # }
+
 
     #####################################################
 
@@ -3793,7 +4116,7 @@ if __name__ == "__main__":
         if i == 0:
             layer_radii_array[i] = 0  # [mkm]
         if i == 1:
-            layer_radii_array[i] = 30 # 17.3 * 1  # 17.3 # [mkm]
+            layer_radii_array[i] = 30  # 17.3 * 1  # 17.3 # [mkm]
         if i == 2:
             layer_radii_array[i] = 30 * 2  # [mkm]
         if i == 3:
@@ -3801,9 +4124,26 @@ if __name__ == "__main__":
 
         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
 
+    if "ppump" in params:
+        pp = params["ppump"]
+        if np.isscalar(pp):
+            p_pump_tuple = (float(pp),) * int(core_count)
+        else:
+            p_pump_tuple = tuple(float(p) for p in pp)
+
+        g0_t, psat_t = calc_g0_psat_from_p_pump_josab(
+            p_pump_tuple,
+            float(params.get("fiber_length_m", 0.1)),
+            alpha=0,
+        )
+
+        params["g0"] = tuple(float(x) for x in np.asarray(g0_t).reshape(-1))
+        params["psat"] = tuple(float(x) for x in np.asarray(psat_t).reshape(-1))
+
     temporal_mask_modulation_frequency_ghz = 40  # GHz
 
-    variant = params.get("variant", "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = params.get("variant",
+                         "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
         temporal_mask_size = params.get("mask_size", 294)
@@ -3812,7 +4152,8 @@ if __name__ == "__main__":
 
     mg_cfg = MGConfig(t_size=2 ** 10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
 
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42, gain_in=params.get("gain_in", 30.96))
+    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42,
+                          gain_in=params.get("gain_in", 30.96))
 
     reservoir_cfg = ReservoirConfig(
         fiber_length_m=params.get("fiber_length_m", 0.1),  # 0.1
@@ -3823,38 +4164,63 @@ if __name__ == "__main__":
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=tuple([params.get("g0", 0.0158)] * core_count),  # 10
-        psat_array=tuple([params.get("psat", 1.1054e-05)] * core_count),  # 0.02
+        g0_array=_per_core(params, "g0", 0.0158, core_count),
+        psat_array=_per_core(params, "psat", 1.1054e-05, core_count),
         kappa=params.get("kappa", 0.793),  # 0.9
         delta_phase=params.get("delta_phase", 0),
         use_gpu=False,
         use_torch=False,
         num_threads=1,
-        display_debug_plots=True,
+        display_debug_plots=False,
         display_debug_info=False,
         save_figs=False,
         max_hours_total=24,
         precision='float64',
         use_dispersion=False,
-        disable_core0=False,
+        ase_noise_seed=None,  # mask_cfg.seed,
     )
 
-    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=1e-4, washout=500,
+    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=0, washout=500,
                                   target_shift=1,
-                                  train_frac=0.7, val_frac=0.3)  # для одиночного запуска
+                                  train_frac=0.6, val_frac=0.2)  # для одиночного запуска
 
     base_cfg = ExperimentConfig(core_count=core_count, mg=mg_cfg, mask=mask_cfg,
                                 reservoir=reservoir_cfg, training=training_cfg,
                                 variant=variant)
 
-    mg_cfg.t_size = 10000 # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
+    mg_cfg.t_size = 20000  # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
 
     t = time()
 
-    # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
-    res = run_experiments(base_cfg,force_rerun=force_rerun, save_cache=save_cache)
-
-    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+    # ================== DEBUG: gain saturation curve at current operating point ==================
+    # data_in_dbg, _mg = (None, None)
+    # if variant == "temporal_unique_per_core":
+    #     data_in_dbg, _mg = generate_input_temporal_unique_per_core(core_count, mg_cfg, mask_cfg)
+    # elif variant == "temporal_same_all_cores":
+    #     data_in_dbg, _mg = generate_input_temporal_same_all_cores(core_count, mg_cfg, mask_cfg)
+    # elif variant == "spatial_only":
+    #     data_in_dbg, _mg = generate_input_spatial_only(core_count, mg_cfg, mask_cfg)
+    # else:
+    #     raise ValueError(f"Unknown variant: {variant}")
+    #
+    # plot_laser_gain_curve_from_params(
+    #         params,
+    #         data_in_dbg,
+    #         core_count=core_count,
+    #         curve_kind="signal",
+    #         core_index=None,          # по умолчанию центральное ядро
+    #         plot_all_cores=True,     # True, если хотите наложить кривые всех ядер
+    #         show_plot=True,
+    #         save_plot=False,
+    #     )
+    #
+    # # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
+    # res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+    #
+    # # исследование параметра регуляризации
+    # ridge_alpha_sweep_diagnostics(res, title="Current main params")
+    #
+    # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # =============== Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===================
 
@@ -3868,58 +4234,120 @@ if __name__ == "__main__":
     # На линуксе порт 18080, поэтому
     # открой в браузере http://127.0.0.1:18080/dashboard
 
+    # !!! в статье формула 10 аппроксимирует волокно с потерями 0.75 1/m. А у нас потерь нет!
+    # test_calc_formula10_and_plot_fig7b(
+    #     calc_g0_psat_func=calc_g0_psat_from_p_pump_josab,
+    #     g0_to_gA_factor=1,  # или 1.0 — в зависимости от того, что именно возвращает твой g0
+    #     p_pump_min_mw=25.0,
+    #     p_pump_max_mw=210.0,
+    #     n_grid=500,
+    #     title_suffix="",
+    #     show_psat_fig7a=True,
+    # )
+
+    # --- Bounds derived from pump->(g0, Psat) fits (Shtyrina et al., JOSAB 34(2), 227 (2017), doi:10.1364/JOSAB.34.000227) ---
+    # Psat[mW] = 0.1292 * Ppump[mW] - 1.096  =>  Psat > 0 при Ppump > ~8.48 mW
+    p_pump_min_w_for_positive_psat = _round((1.096 / 0.1292) * 1e-3 * 0.7, digit=3)  # W
+
+    # Оценка верхних границ g0 и psat (на одно ядро) при заданной длине.
+    # Подстрой p_pump_max_single_core_w под доступный (или планируемый) pump laser.
+    p_pump_max_single_core_w = 3  # W
+    fiber_length_for_bounds_m = float(params.get("fiber_length_m", 0.3))
+    try:
+        _g0_b, _psat_b = calc_g0_psat_from_p_pump_josab(p_pump_max_single_core_w, fiber_length_for_bounds_m, alpha=0)
+        g0_max_bound = float(np.asarray(_g0_b).reshape(-1)[0])
+        psat_max_bound = float(np.asarray(_psat_b).reshape(-1)[0])
+    except Exception:
+        g0_max_bound, psat_max_bound = None, None
+
+    print(f"[pump->gain] Psat>0 requires Ppump > {p_pump_min_w_for_positive_psat * 1e3:.2f} mW per core.")
+    if g0_max_bound is not None and psat_max_bound is not None:
+        print(
+            f"[pump->gain] Upper bound estimate (single core): g0~{g0_max_bound:.3g} 1/m, Psat~{psat_max_bound:.3g} W")
+
+    # SLM для накачки: оптимизируем общую мощность pump laser и «веса» распределения по ядрам.
+    # pump_slm_w_spec = [{"low": -3.0, "high": 3.0} for _ in range(core_count)]
+    #
     # param_space = {
-    #     "kappa": {"low": 0.2, "high": 0.99},
-    #     "delta_phase": 0, # {"low": 0.0, "high": 2 * np.pi},
-    #     "g0": {"low": 0.0001, "high": 100.0, "log": True},
-    #     "psat": {"low": 1e-5, "high": 10, "log": True},       # 1e-4  # фиксированное, не тюним
-    #     "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
-    #     "gain_in": {"low": 0.001, "high": 200.0, "log": True},
-    #     "mask_size": 1, # {"int": True, "low": 5, "high": 300, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
-    #     "time_step_ps": reservoir_cfg.time_step_ps, # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+    #     "kappa": {"low": 0.2, "high": 0.99, "sig": 5},
+    #     "delta_phase": 0,  # {"low": 0.0, "high": 2 * np.pi, "sig": 5},
+    #
+    #     # Pump-laser total power (W) + SLM weights -> per-core pump powers via softmax.
+    #     "p_pump_total": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 5},
+    #     "pump_slm_w": pump_slm_w_spec,
+    #
+    #     # Если хочешь вернуться к независимой оптимизации ppump по ядрам — используй ключ "ppump" вместо двух выше.
+    #     # "ppump": [{"low": 0.01, "high": 1.0, "log": True} for _ in range(core_count)],
+    #
+    #     "fiber_length_m": {"low": 0.001, "high": 10, "log": True, "sig": 5},
+    #     "gain_in": {"low": 0.001, "high": 0.1, "log": True, "sig": 5},
+    #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
+    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
+    #     "time_step_ps": reservoir_cfg.time_step_ps,
+    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True, "sig": 5},
     # }
 
-    # param_space = {
-    #     "kappa": {"low": 0.2, "high": 0.99},
-    #     "delta_phase": 0,  # {"low": 0.0, "high": 2 * np.pi},
-    #     "g0": [
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 0
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 1
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 2
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 3
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 4
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 5
-    #         {"low": 0.0001, "high": 100.0, "log": True},  # ядро 6
-    #     ],
-    #     # psat как список - оптимизируется для каждого ядра отдельно
-    #     "psat": [
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 0
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 1
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 2
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 3
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 4
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 5
-    #         {"low": 1e-5, "high": 10, "log": True},  # ядро 6
-    #     ],
-    #     "fiber_length_m": {"low": 0.000001, "high": 3, "log": True},
-    #     "gain_in": {"low": 0.001, "high": 200.0, "log": True},
-    #     "mask_size": 1,  # {"int": True, "low": 5, "high": 300, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 150},
-    #     "time_step_ps": reservoir_cfg.time_step_ps,
-    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
-    # }
-    #
-    # base_cfg.training.train_frac = 0.7
-    # base_cfg.training.val_frac = 0.3
-    # res = run_experiments(
-    #     base_cfg,
-    #     n_trials_opt=200000,  # сколько попробовать конфигураций
-    #     param_space=param_space,
-    #     force_rerun=False,  # используй кэш, если ключ совпал
-    #     save_cache=False,
-    # )
-    # print("Лучший результат Optuna:\n", res)
+    param_space = {
+        "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
+        "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
+        # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
+        "ppump": [
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
+            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 10
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 11
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 12
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 13
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 14
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 15
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 16
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 17
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 18
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 19
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 20
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 21
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 22
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 23
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 24
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 25
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 26
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 27
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 28
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 29
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 30
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 31
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 32
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 33
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 34
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
+            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
+        ],
+        "fiber_length_m": {"low": 0.01, "high": 2, "log": False, "sig": 3},
+        "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
+        "mask_size": 1, #{"int": True, "low": 5, "high": 350, "step": 1},
+        "delay_factor_in_symbols": {"int": True, "low": 1, "high": 250},
+        "time_step_ps": reservoir_cfg.time_step_ps,
+        # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+    }
+
+    base_cfg.training.train_frac = 0.7
+    base_cfg.training.val_frac = 0.3
+    res = run_experiments(
+        base_cfg,
+        n_trials_opt=1000000,  # сколько попробовать конфигураций
+        param_space=param_space,
+        force_rerun=False,  # используй кэш, если ключ совпал
+        save_cache=False,
+    )
+    print("Лучший результат Optuna:\n", res)
 
     # ==================== Зависимость NMRSE от коэффициента связи при наличии временной маски =========================
 
@@ -3944,7 +4372,7 @@ if __name__ == "__main__":
     # param_space = {
     #     "kappa": {"low": 0.2, "high": 0.99},
     #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
-    #     "g0": {"low": 0.001, "high": 5.0, "log": True},
+    #     "g0": {"low": 0.001, "high": g0_max "log": True},
     #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
     #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
     #     "gain_in": {"low": 1.0, "high": 100.0, "log": True},
