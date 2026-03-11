@@ -55,7 +55,12 @@ def calculate_error(num: np.ndarray, ana: np.ndarray, tau: float) -> float:
 
 def make_solver(pulse: str, *, M: int, N: int) -> Solver:
     """Return a configured `Solver` instance for given grid sizes."""
-    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0, method="ssfm_order2_dnd_short")
+    com = CP(N=N, M=M, L1=0.0, L2=1.0, T1=-30.0, T2=30.0, damp_length=0.0,
+                method="ssfm_order2_dnd_short")
+                # method="ssfm_order2_dnd_compact_short")
+                # method="ssfm_order2_dnd_compact_windowed")
+                # method="ssfm_order2_ndn_compact_windowed")
+                # method="ssfm_order2_dnd_compact_windowed_short")
 
     if pulse == "fundamental":
         # Classic NLSE – only dispersion & Kerr non‑linearity
@@ -112,7 +117,7 @@ def _dbg_plot(t, num, ana, title):
 # Grids (nested)
 # -----------------------------------------------------------------------------
 Ms = [2 ** k for k in (5, 6, 7, 8, 9, 10, 11, 12)]
-Ns = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560]
+Ns = [10, 20, 40, 80, 160, 320, 640, 1280, 2560]
 
 # -----------------------------------------------------------------------------
 # PyTest parametrisations
