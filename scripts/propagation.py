@@ -9,6 +9,7 @@ from scipy.fft import fftshift, fft
 import matplotlib.pyplot as plt
 from numpy.typing import NDArray
 import numpy as np
+import copy
 import os
 
 
@@ -365,6 +366,34 @@ def plot_duple_picture(x_arr, dict_list):
     plt.show()
     print('plot_duple: \tDone')
 
+def init_dicts(my_path):
+    sp_step = 1.0
+    params_dict1 = {'spatial_step': sp_step, 'dn': 1e-3,
+                    'dn_step': 0.005, 'J_coef': 1e-5,
+                    'beta2_coef': 0.0, 'gamma_coef': 5e-3,
+                    'path': copy.deepcopy(my_path)}
+    
+    params_dict2 = {'spatial_step': sp_step, 'dn': 1e-4,
+                    'dn_step': 0.005, 'J_coef': 1e-5,
+                    'beta2_coef': 0.0, 'gamma_coef': 5e-3,
+                    'path': copy.deepcopy(my_path)}
+    
+    params_dict3 = {'spatial_step': sp_step, 'dn': 5e-5,
+                    'dn_step': 0.005, 'J_coef': 1e-5,
+                    'beta2_coef': 0.0, 'gamma_coef': 5e-3,
+                    'path': copy.deepcopy(my_path)}
+    
+    params_dict4 = {'spatial_step': sp_step*1e-1, 'dn': 1e-3,
+                    'dn_step': 0.005, 'J_coef': 1e-4,
+                    'beta2_coef': 0.0, 'gamma_coef': 5e-3,
+                    'path': copy.deepcopy(my_path)}
+    
+    params_dict5 = {'spatial_step': sp_step*1e-1, 'dn': 1e-3,
+                    'dn_step': 0.005, 'J_coef': 5e-5,
+                    'beta2_coef': 0.0, 'gamma_coef': 5e-3,
+                    'path': copy.deepcopy(my_path)}
+    return [params_dict1, params_dict2, params_dict3, params_dict4, params_dict5]
+
 
 if __name__ == "__main__":
     ###
@@ -381,42 +410,51 @@ if __name__ == "__main__":
             for key in dict_info:
                 val = dict_info[key]
                 file.write(key + ":\t\t\t" + str(val) + "\n")
-    dir_path = os.path.dirname(os.path.abspath(__file__))
+    dir_path = os.path.dirname(os.path.abspath(__file__)) + "\\propagation_results"
 
-    spatial_step = 5e-4  # [m]
-    curr_path = dir_path + "\\propagation_results"
-    params_dict = {'spatial_step': spatial_step, 'dn': 1e-3,
-                   'dn_step': 0.005, 'J_coef': 1e-4,
-                   'beta2_coef': 0.0, 'gamma_coef': 5e-3,
-                   'path': curr_path}
-
-    dicts_list = [params_dict]
-
-    for params_dict in dicts_list:
-        curr_path = params_dict['path']
-        os.makedirs(curr_path, exist_ok=True)
+    dicts_list = init_dicts(dir_path)
+    for i, params_dict in enumerate(dicts_list):
+        params_dict['spatial_step'] = params_dict['spatial_step'] * 10.0
+        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x10"
+        os.makedirs(params_dict['path'], exist_ok=True)
         simulation_of_propagation_in_mcf(**params_dict)
-        save_readme(curr_path, params_dict)
+        save_readme(params_dict['path'], params_dict)
 
+    dicts_list = init_dicts(dir_path)
+    for i, params_dict in enumerate(dicts_list):
+        params_dict['spatial_step'] = params_dict['spatial_step']
+        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}"
+        os.makedirs(params_dict['path'], exist_ok=True)
+        simulation_of_propagation_in_mcf(**params_dict)
+        save_readme(params_dict['path'], params_dict)
 
-    ### Ниже код для построения графиков, как в отчёте у Алёны Колесниковой
+    dicts_list = init_dicts(dir_path)
+    for i, params_dict in enumerate(dicts_list):
+        params_dict['spatial_step'] = params_dict['spatial_step'] * 0.1
+        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x01"
+        os.makedirs(params_dict['path'], exist_ok=True)
+        simulation_of_propagation_in_mcf(**params_dict)
+        save_readme(params_dict['path'], params_dict)
 
+    # ### Ниже код для построения графиков, как в отчёте у Алёны Колесниковой
+    
+    # dir_path = "D:\\Desktop\\для_отчёта\\сравнение_-_сгущеная_сетка"
     # x_arr = None
     # dict_list = []
     # for i in range(3):
-    #     curr_path = dir_path + f"\\data_{int(i+1)}\\распределение_средней_мощности.txt"
+    #     curr_path = dir_path + f"\\case_{int(i+1)}_step_x01\\распределение_средней_мощности.txt"
     #     curr_dict = read_1d_arrays(curr_path)
     #     x_arr = curr_dict['z']
     #     del curr_dict['z']
     #     dict_list.append(curr_dict)
     # plot_triple_picture(x_arr, dict_list)
-
-    # idxs_list = [41, 6]
+    
+    # idxs_list = [4, 5]
     # dict_list_new = []
     # for i in idxs_list:
-    #     curr_path = dir_path + f"\\data_{int(i)}\\распределение_средней_мощности.txt"
+    #     curr_path = dir_path + f"\\case_{int(i)}_step_x01\\распределение_средней_мощности.txt"
     #     curr_dict = read_1d_arrays(curr_path)
     #     x_arr = curr_dict['z']
     #     del curr_dict['z']
     #     dict_list_new.append(curr_dict)
-    # plot_duple_picture(x_arr, dict_list_new[::-1])
+    # plot_duple_picture(x_arr, dict_list_new)
