@@ -141,3 +141,53 @@ function ssfm_order2_dnd_short_noisefree(initial_psi::Array{ComplexF64, 2},
 
     return psi
 end
+
+# """
+# Численное моделирование без расчёта матриц D и D_half (симметричное расщепление D-N-D с учётом усиления и шума).
+# С кэшированием плана FFT
+# *глубокое копирование массивов происходит при передаче julia управления памятью
+# - initial_psi: начальное поле, комплексный массив размера (n, M)
+# - D: массив (n, n, M) или (n, n) экспонента матрицы для линейного шага
+# - D_half: массив (n, n, M) или (n, n) экспонента матрицы для линейного полушага
+
+# Возвращает решение в конечной точке.
+# """
+# function ssfm_order2_dnd_short_noisefree(initial_psi::Array{ComplexF64, 2},
+#                                          eq::EquationParameters,
+#                                          com::ComputationalParameters,
+#                                          D::Array{ComplexF64},
+#                                          D_half::Array{ComplexF64}, 
+#                                          enable_pb::Bool)::Array{ComplexF64, 2}
+#     psi = deepcopy(initial_psi)
+#     n, M = size(psi)
+#     plans = get_plans(n, M)
+
+#     E_sat = eq.E_sat
+#     gamma_h = com.h * eq.gamma
+#     g0_h = com.h * eq.g_0
+#     exp_g0h = exp.(g0_h)
+#     exp_2g0h = exp.(2.0 .* g0_h)
+
+#     # Линейный полушаг
+#     linear_step!(psi, D_half, plans)
+
+#     # Запуск цикла шагов с объединениями
+#     p = Progress(com.N-1, enabled=enable_pb, showspeed=true, desc="Computing short d-n-d scheme...")
+#     for _ in 1:com.N-1
+#         # Нелинейный шаг
+#         nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+
+#         # Линейный шаг
+#         linear_step!(psi, D, plans)
+
+#         # Обновление progress bar
+#         next!(p)
+#     end
+#     # Нелинейный шаг
+#     nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+
+#     # Линейный полушаг
+#     linear_step!(psi, D_half, plans)
+
+#     return psi
+# end

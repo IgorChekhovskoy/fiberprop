@@ -99,6 +99,8 @@ def compute_characteristic_lengths(beta2_ps2_m: float,
 
 def get_dn_of_z(eq, com, z_array,
                 dn, dn_step, n_ref, k_coef, J_coef, seed=42):
+    if dn_step == 0.0 or dn == 0.0:
+        return None, None
     np.random.seed(seed)
     steps_num = int((com.L2 - com.L1) / dn_step) + 1
     if steps_num < 5:
@@ -121,7 +123,7 @@ def get_dn_of_z(eq, com, z_array,
 
 
 def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4, J_coef=9e-7,
-                                     beta2_coef=0.0, gamma_coef=5e-3, path=''):
+                                     beta2_coef=0.0, gamma_coef=5e-3, path='', calc_method="ssfm_order2_ndn_by_julia"):
     mcf_size = 7
 
     # параметры вычислительной сетки
@@ -133,8 +135,7 @@ def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4
     td_width = 5e3  # ширина временного интервала [ps]
     computational_params = ComputationalParameters(N=my_N, M=my_M, L1=0.0, L2=fiber_length,
                                                    T1=-td_width/2, T2=td_width/2, 
-                                                   method="ssfm_order2_ndn_by_julia")
-    # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn"
+                                                   method=calc_method)
 
     # параметры уравнения
     EquationParameters.get_info()
@@ -160,7 +161,7 @@ def simulation_of_propagation_in_mcf(spatial_step=0.25e-3, dn=4e-6, dn_step=1e-4
                            {}, {}]
     solver = Solver(computational_params, eq_params, use_dimensional=True,
                     pulses=input_pulses, pulse_params_list=input_pulses_params,
-                    stored_steps_count=2, display_debug_info=True, use_gpu=False)
+                    stored_steps_count=2, display_debug_info=True, use_gpu=False, use_torch=False)
     solver.beta1_of_z, solver.self_coupling_of_z = get_dn_of_z(solver.eq, solver.com, solver.z,
                                                                dn, dn_step, n_ref, k_coef, J_coef)
 
@@ -394,6 +395,20 @@ def init_dicts(my_path):
                     'path': copy.deepcopy(my_path)}
     return [params_dict1, params_dict2, params_dict3, params_dict4, params_dict5]
 
+def test_run(my_path):
+    sp_step = 5e-4
+    params_dict = {'spatial_step': sp_step, 'dn': 0.0,
+                   'dn_step': 0.005, 'J_coef': 1e-4,
+                   'beta2_coef': 0.1, 'gamma_coef': 5e-3,
+                   'path': copy.deepcopy(my_path),
+                   'calc_method': "ssfm_order2_dnd_short"}
+                   # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn", 
+                   # "ssfm_order2_dnd_short_julia", "ssfm_order2_dnd_short"
+    params_dict['path'] = params_dict['path'] + f"\\test_case"
+    os.makedirs(params_dict['path'], exist_ok=True)
+    simulation_of_propagation_in_mcf(**params_dict)
+    save_readme(params_dict['path'], params_dict)
+
 
 if __name__ == "__main__":
     ###
@@ -412,29 +427,31 @@ if __name__ == "__main__":
                 file.write(key + ":\t\t\t" + str(val) + "\n")
     dir_path = os.path.dirname(os.path.abspath(__file__)) + "\\propagation_results"
 
-    dicts_list = init_dicts(dir_path)
-    for i, params_dict in enumerate(dicts_list):
-        params_dict['spatial_step'] = params_dict['spatial_step'] * 10.0
-        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x10"
-        os.makedirs(params_dict['path'], exist_ok=True)
-        simulation_of_propagation_in_mcf(**params_dict)
-        save_readme(params_dict['path'], params_dict)
+    test_run(dir_path)
 
-    dicts_list = init_dicts(dir_path)
-    for i, params_dict in enumerate(dicts_list):
-        params_dict['spatial_step'] = params_dict['spatial_step']
-        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}"
-        os.makedirs(params_dict['path'], exist_ok=True)
-        simulation_of_propagation_in_mcf(**params_dict)
-        save_readme(params_dict['path'], params_dict)
+    # dicts_list = init_dicts(dir_path)
+    # for i, params_dict in enumerate(dicts_list):
+    #     params_dict['spatial_step'] = params_dict['spatial_step'] * 10.0
+    #     params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x10"
+    #     os.makedirs(params_dict['path'], exist_ok=True)
+    #     simulation_of_propagation_in_mcf(**params_dict)
+    #     save_readme(params_dict['path'], params_dict)
 
-    dicts_list = init_dicts(dir_path)
-    for i, params_dict in enumerate(dicts_list):
-        params_dict['spatial_step'] = params_dict['spatial_step'] * 0.1
-        params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x01"
-        os.makedirs(params_dict['path'], exist_ok=True)
-        simulation_of_propagation_in_mcf(**params_dict)
-        save_readme(params_dict['path'], params_dict)
+    # dicts_list = init_dicts(dir_path)
+    # for i, params_dict in enumerate(dicts_list):
+    #     params_dict['spatial_step'] = params_dict['spatial_step']
+    #     params_dict['path'] = params_dict['path'] + f"\\case_{i+1}"
+    #     os.makedirs(params_dict['path'], exist_ok=True)
+    #     simulation_of_propagation_in_mcf(**params_dict)
+    #     save_readme(params_dict['path'], params_dict)
+
+    # dicts_list = init_dicts(dir_path)
+    # for i, params_dict in enumerate(dicts_list):
+    #     params_dict['spatial_step'] = params_dict['spatial_step'] * 0.1
+    #     params_dict['path'] = params_dict['path'] + f"\\case_{i+1}_step_x01"
+    #     os.makedirs(params_dict['path'], exist_ok=True)
+    #     simulation_of_propagation_in_mcf(**params_dict)
+    #     save_readme(params_dict['path'], params_dict)
 
     # ### Ниже код для построения графиков, как в отчёте у Алёны Колесниковой
     
