@@ -6,7 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ==== Настройки (можно переопределить переменными окружения) ====
-SESSION="${SESSION:-mcf_rc}"                      # БАЗОВОЕ имя; при start будет выдано уникальное имя
+SESSION="${SESSION:-mcf_rc_20260222-145339}"                      # БАЗОВОЕ имя; при start будет выдано уникальное имя
+SESSION_PREFIX="${SESSION_PREFIX:-mcf_rc_}"                      # префикс tmux-сессий расчёта
 PROJECT_DIR="${PROJECT_DIR:-$REPO_ROOT}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 REQ_FILE="${REQ_FILE:-$PROJECT_DIR/requirements.txt}"
@@ -43,6 +44,65 @@ SESSION_FILE="$SCRIPT_DIR/.optuna_tmux_session"   # ← тут: в подпап�
 
 ensure_tmux(){ command -v tmux >/dev/null || { echo "tmux не установлен. sudo apt-get update && sudo apt-get install -y tmux"; exit 1; }; }
 ensure_taskset(){ command -v taskset >/dev/null || { echo "taskset не найден (package util-linux). Установи: sudo apt-get install -y util-linux"; exit 1; }; }
+
+_session_exists() {
+  local ses="$1"
+  [[ -n "$ses" ]] || return 1
+  tmux has-session -t "=$ses" 2>/dev/null
+}
+
+_list_all_sessions() {
+  tmux list-sessions -F '#S' 2>/dev/null || true
+}
+
+_list_matching_sessions() {
+  _list_all_sessions | awk -v p="$SESSION_PREFIX" 'index($0, p) == 1'
+}
+
+_print_session_help() {
+  if [[ -f "$SESSION_FILE" ]]; then
+    echo "SESSION_FILE: $(< "$SESSION_FILE")"
+  else
+    echo "SESSION_FILE отсутствует."
+  fi
+
+  echo "Подходящие tmux-сессии с префиксом $SESSION_PREFIX:"
+  _list_matching_sessions | sed 's/^/  /' || true
+
+  echo "Все tmux-сессии:"
+  _list_all_sessions | sed 's/^/  /' || true
+}
+
+_resolve_session_name() {
+  local ses=""
+  local matches=()
+  local all=()
+
+  # 1) Если файл есть и в нём имя живой сессии — берём его
+  if [[ -f "$SESSION_FILE" ]]; then
+    ses="$(< "$SESSION_FILE")"
+    if _session_exists "$ses"; then
+      echo "$ses"
+      return 0
+    fi
+  fi
+
+  # 2) Если среди расчётных tmux-сессий ровно одна — берём её
+  mapfile -t matches < <(_list_matching_sessions)
+  if (( ${#matches[@]} == 1 )); then
+    echo "${matches[0]}"
+    return 0
+  fi
+
+  # 3) Совсем последний фоллбэк: если у tmux вообще только одна сессия — берём её
+  mapfile -t all < <(_list_all_sessions)
+  if (( ${#all[@]} == 1 )); then
+    echo "${all[0]}"
+    return 0
+  fi
+
+  return 1
+}
 
 bootstrap() {
   echo "[bootstrap] Проект: $PROJECT_DIR"
@@ -155,7 +215,7 @@ _spawn_tmux_with_study() {
   touch "$JOURNAL_PATH"   # создаём пустой журнал заранее (для дашборда)
 
   # Кол-во воркеров = физическим ядрам (можно переопределить WORKERS в env)
-  WORKERS="${WORKERS:-$(($(physical_cores) - 0))}"
+  WORKERS="${WORKERS:-$(($(physical_cores) - 20))}"
   if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then WORKERS=1; fi
   echo "[start] WORKERS = $WORKERS (физические ядра)"
 
@@ -227,17 +287,9 @@ resume() {
   ensure_taskset
   bootstrap
 
-  # Если явно не задано SESSION — берем последнее созданное этим скриптом
-  local SES="${SESSION:-}"
-  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
-    SES="$(< "$SESSION_FILE")"
-  fi
-  if [[ -z "$SES" ]]; then
-    echo "Не задано имя tmux-сессии. Задай SESSION=... $0 resume, либо сначала запусти $0 start"
-    exit 1
-  fi
-  if tmux has-session -t "$SES" 2>/dev/null; then
-    tmux attach -t "$SES"
+  local SES=""
+  if SES="$(_resolve_session_name)"; then
+    tmux attach -t "=$SES"
     exit 0
   fi
 
@@ -249,39 +301,41 @@ resume() {
   fi
   if [[ -z "$STUDY_NAME" ]]; then
     echo "Не найдено имя study. Либо задай STUDY_NAME=... $0 resume, либо сначала запусти $0 start"
+    _print_session_help
     exit 1
   fi
 
   # Новое уникальное имя tmux-сессии на резюм
-  SESSION="$(_unique_session_name "$SES")"
+  SESSION="$(_unique_session_name "$SESSION")"
   echo "$SESSION" > "$SESSION_FILE"
   _spawn_tmux_with_study "$STUDY_NAME"
 }
 
 attach(){
   ensure_tmux
-  local SES="${SESSION:-}"
-  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
-    SES="$(< "$SESSION_FILE")"
-  fi
-  if [[ -z "$SES" ]]; then
-    echo "Не задано имя SESSION и нет $SESSION_FILE. Укажи SESSION=... $0 attach"
+  local SES=""
+  if ! SES="$(_resolve_session_name)"; then
+    echo "Не удалось автоматически определить tmux-сессию для attach."
+    _print_session_help
+    echo "Укажи SESSION=... $0 attach"
     exit 1
   fi
-  tmux attach -t "$SES"
+  tmux attach -t "=$SES"
 }
 
 status(){
-  local SES="${SESSION:-}"
-  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
-    SES="$(< "$SESSION_FILE")"
-  fi
+  local SES=""
 
   if tmux list-sessions >/dev/null 2>&1; then
     echo "Активные tmux-сессии:"
     tmux list-sessions -F '#S: #{session_windows} windows, attached=#{session_attached}'
     if [[ -f "$SESSION_FILE" ]]; then
       echo "Последняя, созданная этим скриптом: $(< "$SESSION_FILE")"
+    fi
+    if SES="$(_resolve_session_name)"; then
+      echo "Сессия по умолчанию для attach/stop/resume: $SES"
+    else
+      echo "Сессия по умолчанию автоматически не определена."
     fi
     echo "Последние логи:"
     ls -1t "$LOG_DIR" | sed "s|^|$LOG_DIR/|"
@@ -291,21 +345,20 @@ status(){
 }
 
 stop(){
-  local SES="${SESSION:-}"
-  if [[ -z "$SES" && -f "$SESSION_FILE" ]]; then
-    SES="$(< "$SESSION_FILE")"
-  fi
-  if [[ -z "$SES" ]]; then
-    echo "Не задано имя SESSION и нет $SESSION_FILE. Укажи SESSION=... $0 stop"
+  local SES=""
+  if ! SES="$(_resolve_session_name)"; then
+    echo "Не удалось автоматически определить tmux-сессию для остановки."
+    _print_session_help
+    echo "Укажи SESSION=... $0 stop"
     exit 1
   fi
-  if tmux has-session -t "$SES" 2>/dev/null; then
+  if tmux has-session -t "=$SES" 2>/dev/null; then
     echo "Останавливаю задачи (Ctrl-C) и закрываю сессию $SES…"
-    for w in $(tmux list-windows -t "$SES" -F '#W'); do
-      tmux send-keys -t "$SES:$w" C-c
+    for w in $(tmux list-windows -t "=$SES" -F '#W'); do
+      tmux send-keys -t "=$SES:$w" C-c
     done
     sleep 1 || true
-    tmux kill-session -t "$SES" || true
+    tmux kill-session -t "=$SES" || true
     echo "✓ Остановлено."
   else
     echo "Сессия $SES не найдена."

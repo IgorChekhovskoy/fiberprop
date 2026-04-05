@@ -23,7 +23,7 @@ import json
 from scripts.mcf_reservoir_computing.mcf_auxiliary_functions import calc_p_pump_per_core_from_slm, \
     calc_g0_psat_from_p_pump_josab, nrmse, sha256_of_json, CACHE_DIR, json_dumps_compact, \
     learning_curve_for_result_plotly, plot_laser_gain_curve_from_params, MM, COL1, COL15, COL2, apply_readout, \
-    ridge_alpha_sweep_diagnostics
+    ridge_alpha_sweep_diagnostics, ridge_alpha_selection_compare_diagnostics
 
 STYLE_PATH = Path(__file__).with_name("styles") / "mcf.mplstyle"
 plt.style.use(str(STYLE_PATH))
@@ -245,7 +245,13 @@ def generate_ase_noise(
 
     Модель (в духе стандартных оценок для оптического усилителя):
         S_ASE = n_pol * n_sp * h * nu * (G - 1)    [W/Hz],
-    где nu = c / lambda0, а n_sp ≈ NF/2 в пределе большого усиления (NF — линейная, не в dB).
+    где nu = c / lambda0.
+
+    Для связи noise figure и параметра спонтанной эмиссии используем точную формулу
+    для конечного усиления G:
+        NF_lin = (2 * n_sp * (G - 1) + 1) / G,
+    откуда
+        n_sp = (NF_lin * G - 1) / (2 * (G - 1)).
 
     В дискретном времени задаём суммарную мощность шума в полосе:
         P_noise = S_ASE * B_eff,   B_eff = min(optical_bw_hz, 1/dt),
@@ -287,11 +293,14 @@ def generate_ase_noise(
 
     # --- n_sp и PSD ASE ---
     nf_lin = 10.0 ** (float(nf_db) / 10.0)
-    n_sp = 0.5 * nf_lin  # high-gain approx: NF ≈ 2 n_sp
 
-    # Физический минимум n_sp = 1 (полная инверсия) ⇒ NF_min = 2 (≈3 dB).
-    if n_sp < 1.0:
-        n_sp = 1.0
+    n_sp = np.zeros_like(G, dtype=float)
+    gain_mask = Gm1 > 0.0
+    if np.any(gain_mask):
+        n_sp[gain_mask] = (nf_lin * G[gain_mask] - 1.0) / (2.0 * Gm1[gain_mask])
+
+        # Физический минимум n_sp = 1 (полная инверсия).
+        n_sp[gain_mask] = np.maximum(n_sp[gain_mask], 1.0)
 
     nu_hz = c / (float(lambda0_um) * 1e-6)
     s_ase_w_per_hz = float(n_polarizations) * n_sp * h * nu_hz * Gm1  # (C,)
@@ -540,6 +549,8 @@ def mcf_nn_reservoir_computing(
     esat_array = psat_array_w * window_duration_ps  # [pJ]
     mean_power_per_core_w = np.mean(np.abs(data_in_mod) ** 2, axis=1).astype(float, copy=False)
     energy_per_window = mean_power_per_core_w * window_duration_ps
+    ase_signal_power_sum = 0.0
+    ase_noise_power_sum = 0.0
 
     if display_debug_info:
         print("data_in.shape=", data_in_mod.shape)
@@ -619,7 +630,8 @@ def mcf_nn_reservoir_computing(
                 solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
 
             if ase_noise_seed is not None:
-                solver.numerical_solution[0] = solver.numerical_solution[0] + generate_ase_noise(
+                sig_power = float(np.mean(np.abs(solver.numerical_solution[0]) ** 2))
+                noise = generate_ase_noise(
                     size=solver.numerical_solution[0].shape,
                     dt_ps=time_step_ps,
                     lambda0_um=light.lambda0,
@@ -631,6 +643,10 @@ def mcf_nn_reservoir_computing(
                     step_index=batch_index,
                     dtype=dtype,
                 )
+
+                ase_signal_power_sum += sig_power
+                ase_noise_power_sum += float(np.mean(np.abs(noise) ** 2))
+                solver.numerical_solution[0] = solver.numerical_solution[0] + noise
 
             dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
 
@@ -693,6 +709,10 @@ def mcf_nn_reservoir_computing(
                 x_axis_label='t [ns]', y_axis_label='power [W]'
             )
 
+        ase_osnr_db = None
+        if ase_noise_seed is not None and ase_noise_power_sum > 0.0:
+            ase_osnr_db = 10.0 * np.log10(ase_signal_power_sum / ase_noise_power_sum)
+
         params = {
             "gamma": float(gamma),
             "beta1": float(beta1),
@@ -725,6 +745,7 @@ def mcf_nn_reservoir_computing(
                 "seed": int(ase_noise_seed) if ase_noise_seed is not None else None,
                 "nf_db": float(ase_noise_nf_db) if ase_noise_seed is not None else None,
                 "optical_bw_hz": float(ase_noise_optical_bw_hz) if ase_noise_seed is not None else None,
+                "osnr_db": float(ase_osnr_db) if ase_osnr_db is not None else None,
             },
         }
         return {
@@ -809,7 +830,8 @@ def mcf_nn_reservoir_computing(
                   layer_radii_array[-1], ", iteration", iteration_index, "of", iteration_count)
 
             if ase_noise_seed is not None:
-                solver.numerical_solution[0] = solver.numerical_solution[0] + generate_ase_noise(
+                sig_power = float(np.mean(np.abs(solver.numerical_solution[0]) ** 2))
+                noise = generate_ase_noise(
                     size=solver.numerical_solution[0].shape,
                     dt_ps=time_step_ps / upsampling,
                     lambda0_um=light.lambda0,
@@ -821,6 +843,10 @@ def mcf_nn_reservoir_computing(
                     step_index=iteration_index,
                     dtype=dtype,
                 )
+
+                ase_signal_power_sum += sig_power
+                ase_noise_power_sum += float(np.mean(np.abs(noise) ** 2))
+                solver.numerical_solution[0] = solver.numerical_solution[0] + noise
 
             dt_b = solver.run_numerical_simulation(
                 # draw_modulus=display_debug_info,
@@ -922,6 +948,10 @@ def mcf_nn_reservoir_computing(
                 x_axis_label='t [ns]', y_axis_label='power [W]'
             )
 
+        ase_osnr_db = None
+        if ase_noise_seed is not None and ase_noise_power_sum > 0.0:
+            ase_osnr_db = 10.0 * np.log10(ase_signal_power_sum / ase_noise_power_sum)
+
         return {
             "data_out": (solver.numerical_solution[-1][:,
                          offset_size:offset_size + data_in_mod.shape[1] * upsampling:upsampling]),
@@ -958,6 +988,7 @@ def mcf_nn_reservoir_computing(
                     "seed": int(ase_noise_seed) if ase_noise_seed is not None else None,
                     "nf_db": float(ase_noise_nf_db) if ase_noise_seed is not None else None,
                     "optical_bw_hz": float(ase_noise_optical_bw_hz) if ase_noise_seed is not None else None,
+                    "osnr_db": float(ase_osnr_db) if ase_osnr_db is not None else None,
                 },
             },
         }
@@ -977,7 +1008,7 @@ from typing import Dict, Any, Tuple, Literal, Optional
 def train_ridge(
         X: np.ndarray,
         y: np.ndarray,
-        alpha: float | str | None = 1e-6,
+        alpha: float | str | None,
         add_bias: bool = True,
         *,
         X_val: Optional[np.ndarray] = None,
@@ -1333,7 +1364,9 @@ class ReservoirConfig:
     precision: Optional[str] = 'float64'  # Размер данных в вычислениях ('float64', 'float32')
     use_dispersion: Optional[bool] = True  # Включать ли слагаемое с дисперсией в модель
     ase_noise_seed: Optional[int] = None  # Включение ASE шума в модель, если установлен seed для генерации шума
-
+    ase_noise_nf_db: Optional[float] = None  # Noise figure (dB) для ASE шума
+    ase_noise_optical_bw_hz: Optional[float] = None
+    ase_noise_compute_effective_osnr: Optional[bool] = False  # честный effective output OSNR по паре clean/noisy прогонов
 
 @dataclass
 class TrainingConfig:
@@ -1359,7 +1392,7 @@ class TrainingConfig:
     feature_mode: Literal["intensity", "realimag"] = "intensity"
     washout: Optional[int] = None
     taps: int = 1
-    ridge_alpha: float = 1e-6
+    ridge_alpha: float = None
     target_shift: int = 1
     train_frac: float = 0.6
     val_frac: float = 0.2
@@ -2007,6 +2040,7 @@ _VOLATILE_FIELDS = {
     ("reservoir", "save_figs"),
     ("reservoir", "save_gif"),
     ("reservoir", "max_hours_total"),
+    ("reservoir", "ase_noise_compute_effective_osnr"),
     ("training",),
 }
 
@@ -2264,7 +2298,9 @@ def run_mcf_with_cache(data_in: np.ndarray,
         max_hours_total=rc.get("max_hours_total", None),
         precision=rc.get("precision", None),
         use_dispersion=bool(rc.get("use_dispersion", True)),
-        ase_noise_seed=rc.get("ase_noise_seed", True),
+        ase_noise_seed=rc.get("ase_noise_seed", None),
+        ase_noise_nf_db=rc.get("ase_noise_nf_db", 5.0),
+        ase_noise_optical_bw_hz=rc.get("ase_noise_optical_bw_hz", 12.5e9),
     )
 
     data_out = res["data_out"]
@@ -2661,6 +2697,170 @@ def estimate_required_t_size_fast(cfg) -> int:
     return S_total
 
 
+def _compute_effective_output_osnr_on_arrays(
+        data_out_clean: np.ndarray,
+        data_out_noisy: np.ndarray,
+        eps: float = 1e-30,
+) -> dict:
+    """
+    Effective output OSNR по паре массивов:
+      clean  - прогон без шума
+      noisy  - прогон с шумом
+
+    OSNR_eff,out = 10 log10( <|U_clean|^2> / <|U_noisy - U_clean|^2> )
+    """
+    u_clean = np.asarray(data_out_clean)
+    u_noisy = np.asarray(data_out_noisy)
+
+    if u_clean.shape != u_noisy.shape:
+        raise ValueError(f"Shape mismatch: clean={u_clean.shape}, noisy={u_noisy.shape}")
+
+    if u_clean.size == 0:
+        return {
+            "p_signal_w": float("nan"),
+            "p_noise_eff_w": float("nan"),
+            "osnr_eff_out_db": float("nan"),
+            "n_time_samples": 0,
+        }
+
+    p_sig = float(np.mean(np.abs(u_clean) ** 2))
+    p_noise_eff = float(np.mean(np.abs(u_noisy - u_clean) ** 2))
+
+    if p_sig <= eps:
+        raise ValueError("Signal power is too small or zero in clean run")
+
+    if p_noise_eff <= eps:
+        osnr_db = float("inf")
+    else:
+        osnr_db = float(10.0 * np.log10(p_sig / p_noise_eff))
+
+    return {
+        "p_signal_w": p_sig,
+        "p_noise_eff_w": p_noise_eff,
+        "osnr_eff_out_db": osnr_db,
+        "n_time_samples": int(u_clean.shape[-1]),
+    }
+
+
+def _get_effective_osnr_time_slices(
+        cfg: ExperimentConfig,
+        data_out: np.ndarray,
+) -> dict:
+    """
+    Возвращает временные срезы data_out, соответствующие областям:
+      full, train, val, test, val_test
+
+    Срезы строятся честно в тех же координатах, что и обучение readout:
+      make_states -> taps -> target_shift -> washout -> split_train_val_test
+    """
+    if data_out.ndim != 2:
+        raise ValueError("data_out должен быть формы (C, T)")
+
+    cfg_with_ws = _dc.replace(
+        cfg,
+        reservoir=_dc.replace(cfg.reservoir, window_size=compute_window_size_samples(cfg))
+    )
+
+    T = int(data_out.shape[1])
+    M_eff = int(cfg.mask.mask_size) if int(cfg.mask.mask_size) > 0 else 1
+
+    if M_eff > 1:
+        S = T // M_eff
+        if S == 0:
+            raise ValueError("Недостаточно временных отсчётов для одного символа")
+    else:
+        S = T
+
+    taps = int(cfg.training.taps)
+    shift_syms = int(cfg.training.target_shift)
+
+    aligned_len = S - (taps - 1 + shift_syms)
+    if aligned_len < 0:
+        raise ValueError("target_shift или taps слишком велики для длины data_out")
+
+    w_samples = get_washout_samples(cfg_with_ws)
+    w_syms = int(np.ceil(w_samples / max(1, M_eff)))
+
+    xw_len = aligned_len - w_syms
+    if xw_len < 0:
+        raise ValueError("washout слишком велик для доступной длины после taps/shift")
+
+    sl_train, sl_val, sl_test = split_train_val_test(
+        xw_len,
+        cfg.training.train_frac,
+        cfg.training.val_frac,
+        data_out=data_out,
+    )
+
+    sym_offset = w_syms + taps - 1
+
+    def _to_time_slice(sl: slice) -> slice:
+        a = sym_offset + int(sl.start or 0)
+        b = sym_offset + int(sl.stop or 0)
+
+        a = max(0, min(a * M_eff, T))
+        b = max(0, min(b * M_eff, T))
+        return slice(a, b)
+
+    time_train = _to_time_slice(sl_train)
+    time_val = _to_time_slice(sl_val)
+    time_test = _to_time_slice(sl_test)
+
+    if (time_val.stop - time_val.start) > 0:
+        val_test_start = time_val.start
+    else:
+        val_test_start = time_test.start
+
+    if (time_test.stop - time_test.start) > 0:
+        val_test_stop = time_test.stop
+    else:
+        val_test_stop = time_val.stop
+
+    return {
+        "full": slice(0, T),
+        "train": time_train,
+        "val": time_val,
+        "test": time_test,
+        "val_test": slice(val_test_start, val_test_stop),
+    }
+
+
+def compute_effective_output_osnr_from_results(
+        clean_result: dict,
+        noisy_result: dict,
+        eps: float = 1e-30,
+) -> dict:
+    """
+    Считает честный effective output OSNR по одной и той же конфигурации
+    для пары прогонов clean/noisy.
+
+    OSNR считается на raw data_out, но отдельно по тем временным кускам,
+    которые соответствуют train / val / test после taps / shift / washout.
+    """
+    cfg = clean_result["cfg"]
+
+    data_out_clean = np.asarray(clean_result["data_out"])
+    data_out_noisy = np.asarray(noisy_result["data_out"])
+
+    if data_out_clean.shape != data_out_noisy.shape:
+        raise ValueError(
+            f"Shape mismatch: clean={data_out_clean.shape}, noisy={data_out_noisy.shape}"
+        )
+
+    scopes = _get_effective_osnr_time_slices(cfg, data_out_clean)
+
+    out = {}
+    for name, sl in scopes.items():
+        out[name] = _compute_effective_output_osnr_on_arrays(
+            data_out_clean[:, sl],
+            data_out_noisy[:, sl],
+            eps=eps,
+        )
+        out[name]["time_slice"] = (int(sl.start), int(sl.stop))
+
+    return out
+
+
 # =========================
 # Сценарии запуска
 # =========================
@@ -2687,11 +2887,37 @@ def run_experiments(base_cfg: ExperimentConfig,
                                     force_rerun=force_rerun,
                                     save_cache=save_cache,
                                     param_space=param_space)
-    else:
-        return run_single_experiment(cfg,
-                                     free_run_horizon=free_run_horizon,
-                                     force_rerun=force_rerun,
-                                     save_cache=save_cache)
+
+    res_noisy = run_single_experiment(cfg,
+                                      free_run_horizon=free_run_horizon,
+                                      force_rerun=force_rerun,
+                                      save_cache=save_cache)
+
+    if bool(getattr(cfg.reservoir, "ase_noise_compute_effective_osnr", False)) and cfg.reservoir.ase_noise_seed is not None:
+        cfg_clean = _dc.replace(
+            cfg,
+            reservoir=_dc.replace(
+                cfg.reservoir,
+                ase_noise_seed=None,
+                ase_noise_compute_effective_osnr=False,
+            ),
+        )
+
+        res_clean = run_single_experiment(cfg_clean,
+                                          free_run_horizon=free_run_horizon,
+                                          force_rerun=force_rerun,
+                                          save_cache=save_cache)
+
+        eff = compute_effective_output_osnr_from_results(res_clean, res_noisy)
+
+        res_noisy["effective_output_osnr"] = eff
+        res_noisy["metrics"]["effective_output_osnr_full_db"] = eff["full"]["osnr_eff_out_db"]
+        res_noisy["metrics"]["effective_output_osnr_train_db"] = eff["train"]["osnr_eff_out_db"]
+        res_noisy["metrics"]["effective_output_osnr_val_db"] = eff["val"]["osnr_eff_out_db"]
+        res_noisy["metrics"]["effective_output_osnr_test_db"] = eff["test"]["osnr_eff_out_db"]
+        res_noisy["metrics"]["effective_output_osnr_val_test_db"] = eff["val_test"]["osnr_eff_out_db"]
+
+    return res_noisy
 
 
 # =========================
@@ -2966,6 +3192,11 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     def _print_best_trial(bt: "optuna.trial.FrozenTrial") -> None:
         print(f"[optuna][GLOBAL BEST] trial={bt.number} value={bt.value}", flush=True)
+
+        best_params_main = bt.user_attrs.get("best_params_main")
+        if best_params_main:
+            print(best_params_main, flush=True)
+
         print("[params]", flush=True)
         for k in sorted(bt.params.keys()):
             print(f"  {k} = {bt.params[k]}", flush=True)
@@ -2973,6 +3204,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
         print("[user_attrs]", flush=True)
         if bt.user_attrs:
             for k in sorted(bt.user_attrs.keys()):
+                if k == "best_params_main":
+                    continue
                 print(f"  {k} = {bt.user_attrs[k]}", flush=True)
         else:
             print("  <empty>", flush=True)
@@ -3056,6 +3289,109 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
     DEFAULT_SIG = 5
     _log_grid_cache = {}
+
+    def _get_sig(name: str, idx: Optional[int] = None) -> int:
+        if not param_space or name not in param_space:
+            return DEFAULT_SIG
+
+        spec = param_space.get(name)
+
+        if idx is not None and isinstance(spec, (list, tuple)):
+            if 0 <= idx < len(spec) and isinstance(spec[idx], dict) and "sig" in spec[idx]:
+                try:
+                    return int(spec[idx]["sig"])
+                except Exception:
+                    return DEFAULT_SIG
+
+        if isinstance(spec, dict) and "sig" in spec:
+            try:
+                return int(spec["sig"])
+            except Exception:
+                return DEFAULT_SIG
+
+        return DEFAULT_SIG
+
+    def _format_number_for_main(x, sig: int = DEFAULT_SIG) -> str:
+        if isinstance(x, (bool, np.bool_)):
+            return "True" if x else "False"
+
+        if isinstance(x, (int, np.integer)) and not isinstance(x, bool):
+            return str(int(x))
+
+        if isinstance(x, (float, np.floating)):
+            xf = float(x)
+            if not np.isfinite(xf):
+                return repr(xf)
+            xr = _round_sig(xf, sig)
+            return repr(xr)
+
+        return repr(x)
+
+    def _format_tuple_for_main(name: str, values) -> str:
+        parts = []
+        for i, v in enumerate(values):
+            parts.append(_format_number_for_main(v, sig=_get_sig(name, idx=i)))
+        if len(parts) == 1:
+            return f"({parts[0]},)"
+        return "(" + ", ".join(parts) + ")"
+
+    def _variant_comment_label(variant: str) -> str:
+        if variant == "spatial_only":
+            return "spatial mask"
+        if variant == "temporal_same_all_cores":
+            return "equal temporal mask"
+        if variant == "temporal_unique_per_core":
+            return "unique temporal mask"
+        return variant
+
+    def _build_best_params_main(cfg: ExperimentConfig,
+                                metrics: dict,
+                                p_pump_per_core=None) -> str:
+        nrmse_val = float(metrics["nrmse_val"])
+        alpha = float(metrics["ridge_alpha"])
+
+        params_lines = [
+            f'# best {cfg.core_count}-core with {_variant_comment_label(cfg.variant)} '
+            f'("nrmse_val": {_format_number_for_main(nrmse_val, sig=5)}), '
+            f'alpha={_format_number_for_main(alpha, sig=5)}',
+            "params = {",
+            f'        "layer_count": {_format_number_for_main(cfg.reservoir.layer_count, sig=5)},',
+            f'        "variant": {repr(cfg.variant)},',
+            f'        "temporal_modulation_frequency_ghz": '
+            f'{_format_number_for_main(1e3 / float(cfg.reservoir.time_step_ps), sig=_get_sig("time_step_ps"))},',
+            f'        "delay_factor_in_symbols": '
+            f'{_format_number_for_main(cfg.reservoir.delay_factor_in_symbols, sig=_get_sig("delay_factor_in_symbols"))},',
+            f'        "delta_phase": {_format_number_for_main(cfg.reservoir.delta_phase, sig=_get_sig("delta_phase"))},',
+            f'        "fiber_length_m": {_format_number_for_main(cfg.reservoir.fiber_length_m, sig=_get_sig("fiber_length_m"))},',
+        ]
+
+        if p_pump_per_core is not None:
+            params_lines.append(f'        "ppump": {_format_tuple_for_main("ppump", p_pump_per_core)},')
+        else:
+            if len(cfg.reservoir.g0_array) == 1:
+                params_lines.append(
+                    f'        "g0": {_format_number_for_main(cfg.reservoir.g0_array[0], sig=_get_sig("g0", idx=0))},'
+                )
+            else:
+                params_lines.append(f'        "g0": {_format_tuple_for_main("g0", cfg.reservoir.g0_array)},')
+
+            if len(cfg.reservoir.psat_array) == 1:
+                params_lines.append(
+                    f'        "psat": {_format_number_for_main(cfg.reservoir.psat_array[0], sig=_get_sig("psat", idx=0))},'
+                )
+            else:
+                params_lines.append(f'        "psat": {_format_tuple_for_main("psat", cfg.reservoir.psat_array)},')
+
+        params_lines.extend(
+            [
+                f'        "gain_in": {_format_number_for_main(cfg.mask.gain_in, sig=_get_sig("gain_in"))},',
+                f'        "kappa": {_format_number_for_main(cfg.reservoir.kappa, sig=_get_sig("kappa"))},',
+                f'        "mask_size": {_format_number_for_main(cfg.mask.mask_size, sig=_get_sig("mask_size"))},',
+                "    }",
+            ]
+        )
+
+        return "\n".join(params_lines)
 
     def _round_sig(x: float, sig: int) -> float:
         if float(x) == 0.0:
@@ -3144,8 +3480,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                 sig_i = DEFAULT_SIG
 
             if log:
-                # В Optuna нельзя одновременно использовать log=True и step для float.
-                # Теперь: suggest_float(..., log=True) + квантизация по sig в "мультипликативной" шкале без списков.
                 if low_f <= 0.0 or high_f <= 0.0:
                     raise ValueError(
                         f"{name}: log-parameter requires low>0 and high>0, got low={low_f}, high={high_f}"
@@ -3230,6 +3564,7 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
             # --- g0/psat либо напрямую, либо через pump -> (g0, psat) ---
             g0_array = []
             psat_array = []
+            p_pump_per_core = None
 
             has_p_pump = bool(param_space and ("ppump" in param_space))
             has_p_pump_total = bool(
@@ -3307,14 +3642,20 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     precision=base_cfg.reservoir.precision,
                     use_dispersion=base_cfg.reservoir.use_dispersion,
                     ase_noise_seed=base_cfg.reservoir.ase_noise_seed,
+                    ase_noise_nf_db=base_cfg.reservoir.ase_noise_nf_db,
+                    ase_noise_optical_bw_hz=base_cfg.reservoir.ase_noise_optical_bw_hz,
+                    ase_noise_compute_effective_osnr=base_cfg.reservoir.ase_noise_compute_effective_osnr,
                 ),
                 training=base_cfg.training,
                 variant=base_cfg.variant
             )
 
             try:
-                res = run_single_experiment(cfg, free_run_horizon=free_run_horizon,
-                                            force_rerun=force_rerun, save_cache=save_cache)
+                res = run_experiments(cfg,
+                                      n_trials_opt=0,
+                                      free_run_horizon=free_run_horizon,
+                                      force_rerun=force_rerun,
+                                      save_cache=save_cache)
             except (AssertionError, ValueError, RuntimeError) as e:
                 msg = str(e).lower()
                 if ("feedback_length" in msg and "fiber" in msg) or "invalid_config" in msg:
@@ -3331,10 +3672,15 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     raise TrialPruned("no convergence")
                 raise
 
-            score = min(float(res["metrics"]["nrmse_test"]), 2)
+            score = min(float(res["metrics"]["nrmse_val"]), 2)  # для оптимизации нельзя использовать nrmse_test!
             if not np.isfinite(score):
                 trial.set_user_attr("skip_reason", f"non-finite score {score}")
                 raise TrialPruned("skip_reason: non-finite score")
+
+            trial.set_user_attr(
+                "best_params_main",
+                _build_best_params_main(cfg, res["metrics"], p_pump_per_core=p_pump_per_core)
+            )
 
             trial.set_user_attr(
                 "mcf",
@@ -3343,6 +3689,18 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
                     "nrmse_val": float(res["metrics"]["nrmse_val"]),
                     "nrmse_test": float(res["metrics"]["nrmse_test"]),
                     "ridge_alpha": float(res["metrics"]["ridge_alpha"]),
+                    "effective_output_osnr_full_db": (
+                        float(res["metrics"]["effective_output_osnr_full_db"])
+                        if "effective_output_osnr_full_db" in res["metrics"] else None
+                    ),
+                    "effective_output_osnr_train_db": (
+                        float(res["metrics"]["effective_output_osnr_train_db"])
+                        if "effective_output_osnr_train_db" in res["metrics"] else None
+                    ),
+                    "effective_output_osnr_val_db": (
+                        float(res["metrics"]["effective_output_osnr_val_db"])
+                        if "effective_output_osnr_val_db" in res["metrics"] else None
+                    ),
                     "cfg.mask.mask_size": int(cfg.mask.mask_size),
                     "cfg.mask.gain_in": float(cfg.mask.gain_in),
                     "cfg.reservoir.kappa": float(cfg.reservoir.kappa),
@@ -4140,10 +4498,9 @@ if __name__ == "__main__":
         params["g0"] = tuple(float(x) for x in np.asarray(g0_t).reshape(-1))
         params["psat"] = tuple(float(x) for x in np.asarray(psat_t).reshape(-1))
 
-    temporal_mask_modulation_frequency_ghz = 40  # GHz
+    temporal_modulation_frequency_ghz = params.get("temporal_modulation_frequency_ghz", 0.4)  # GHz
 
-    variant = params.get("variant",
-                         "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = params.get("variant", "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
     if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
         temporal_mask_size = params.get("mask_size", 294)
@@ -4156,11 +4513,11 @@ if __name__ == "__main__":
                           gain_in=params.get("gain_in", 30.96))
 
     reservoir_cfg = ReservoirConfig(
-        fiber_length_m=params.get("fiber_length_m", 0.1),  # 0.1
-        time_step_ps=params.get("time_step_ps", 1.0 / temporal_mask_modulation_frequency_ghz * 1e+3),
+        fiber_length_m=params.get("fiber_length_m", 0.3),  # 0.1
+        time_step_ps=params.get("time_step_ps", 1.0 / temporal_modulation_frequency_ghz * 1e+3),
         step_number_per_dimensionless_distance=20,
         upsampling=1,
-        delay_factor_in_symbols=params.get("delay_factor_in_symbols", 3),
+        delay_factor_in_symbols=params.get("delay_factor_in_symbols", 1),
         delay_additional_in_mask_steps=0,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
@@ -4171,13 +4528,16 @@ if __name__ == "__main__":
         use_gpu=False,
         use_torch=False,
         num_threads=1,
-        display_debug_plots=False,
+        display_debug_plots=True,
         display_debug_info=False,
         save_figs=False,
         max_hours_total=24,
         precision='float64',
         use_dispersion=False,
-        ase_noise_seed=None,  # mask_cfg.seed,
+        ase_noise_seed=params.get("ase_noise_seed", mask_cfg.seed), # включает шум в модели
+        ase_noise_nf_db=params.get("ase_noise_nf_db", 50),
+        ase_noise_optical_bw_hz=params.get("ase_noise_optical_bw_hz", 12.5e9),
+        ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", True), # nf_db=60 dB => OSNR=21 dB,
     )
 
     training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=0, washout=500,
@@ -4215,12 +4575,25 @@ if __name__ == "__main__":
     #     )
     #
     # # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
-    # res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+    res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+
+    # исследование параметра регуляризации
+    # sweep = ridge_alpha_sweep_diagnostics(
+    #     res,
+    #     title="Current main params",
+    # )
     #
-    # # исследование параметра регуляризации
-    # ridge_alpha_sweep_diagnostics(res, title="Current main params")
-    #
-    # print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+    # ridge_alpha_selection_compare_diagnostics(
+    #     res,
+    #     alphas=sweep["alpha_grid"],
+    #     title="Current main params",
+    #     selection_rule="1se_largest",
+    #     normalize_selection_scores=False,
+    # )
+
+    if base_cfg.reservoir.ase_noise_seed is not None and base_cfg.reservoir.ase_noise_compute_effective_osnr:
+        print("effective_output_osnr_test_db =", res["metrics"]["effective_output_osnr_test_db"])
+    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # =============== Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===================
 
@@ -4287,67 +4660,67 @@ if __name__ == "__main__":
     #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True, "sig": 5},
     # }
 
-    param_space = {
-        "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
-        "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
-        # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
-        "ppump": [
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
-            {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 10
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 11
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 12
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 13
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 14
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 15
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 16
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 17
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 18
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 19
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 20
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 21
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 22
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 23
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 24
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 25
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 26
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 27
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 28
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 29
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 30
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 31
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 32
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 33
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 34
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
-            # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
-        ],
-        "fiber_length_m": {"low": 0.01, "high": 2, "log": False, "sig": 3},
-        "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
-        "mask_size": 1, #{"int": True, "low": 5, "high": 350, "step": 1},
-        "delay_factor_in_symbols": {"int": True, "low": 1, "high": 250},
-        "time_step_ps": reservoir_cfg.time_step_ps,
-        # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
-    }
-
-    base_cfg.training.train_frac = 0.7
-    base_cfg.training.val_frac = 0.3
-    res = run_experiments(
-        base_cfg,
-        n_trials_opt=1000000,  # сколько попробовать конфигураций
-        param_space=param_space,
-        force_rerun=False,  # используй кэш, если ключ совпал
-        save_cache=False,
-    )
-    print("Лучший результат Optuna:\n", res)
+    # param_space = {
+    #     "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
+    #     "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
+    #     # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
+    #     "ppump": [
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
+    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 10
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 11
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 12
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 13
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 14
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 15
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 16
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 17
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 18
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 19
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 20
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 21
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 22
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 23
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 24
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 25
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 26
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 27
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 28
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 29
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 30
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 31
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 32
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 33
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 34
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
+    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
+    #     ],
+    #     "fiber_length_m": {"low": 0.01, "high": 0.5, "log": False, "sig": 3},
+    #     "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
+    #     "mask_size": 1, #{"int": True, "low": 5, "high": 350, "step": 1},
+    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 1},
+    #     "time_step_ps": reservoir_cfg.time_step_ps,
+    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+    # }
+    #
+    # base_cfg.training.train_frac = 0.6
+    # base_cfg.training.val_frac = 0.2
+    # res = run_experiments(
+    #     base_cfg,
+    #     n_trials_opt=1000000,  # сколько попробовать конфигураций
+    #     param_space=param_space,
+    #     force_rerun=False,  # используй кэш, если ключ совпал
+    #     save_cache=False,
+    # )
+    # print("Лучший результат Optuna:\n", res)
 
     # ==================== Зависимость NMRSE от коэффициента связи при наличии временной маски =========================
 
