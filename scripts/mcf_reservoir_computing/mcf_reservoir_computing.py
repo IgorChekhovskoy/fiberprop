@@ -444,16 +444,58 @@ def mcf_nn_reservoir_computing(
     # ─── входные данные ──────────────────────────────────────────
     if data_in is None:
         raise ValueError('Массив data_in размера (C×M) должен быть задан')
-    eq_size, M = data_in.shape
 
-    dtype = np.complex64 if precision == "float32" else np.complex128
+    data_in = np.asarray(data_in)
+    if data_in.ndim != 2:
+        raise ValueError("data_in должен иметь форму (C, M)")
+
+    eq_size, M = data_in.shape
+    if eq_size <= 0 or M <= 0:
+        raise ValueError("data_in должен иметь положительную форму (C, M)")
 
     if window_size <= 0 or window_size > M:
         raise ValueError("window_size должен быть >= 1")
 
-    data_in_mod = data_in
+    if upsampling is None or int(upsampling) < 1:
+        raise ValueError("upsampling должен быть целым числом >= 1")
+    upsampling = int(upsampling)
+
+    dtype = np.complex64 if precision == "float32" else np.complex128
+    if not np.iscomplexobj(data_in):
+        data_in = data_in.astype(dtype, copy=False)
+
+    data_in_mod = np.asarray(data_in, dtype=dtype)
+
+    if not use_dispersion and upsampling != 1:
+        if display_debug_info:
+            print("use_dispersion=False: upsampling игнорируется, принудительно устанавливаю upsampling=1")
+        upsampling = 1
+
+    def _normalize_per_core_param(x, name: str):
+        arr = np.asarray(x, dtype=float).ravel()
+
+        if arr.size == 0:
+            return np.zeros(eq_size, dtype=float)
+
+        if arr.size == 1:
+            return np.full(eq_size, float(arr[0]), dtype=float)
+
+        if arr.size != eq_size:
+            raise ValueError(f"{name} должен иметь длину 1 или {eq_size}, получено {arr.size}")
+
+        return arr.astype(float, copy=False)
+
+    g0_array = _normalize_per_core_param(g0_array, "g0_array")
+    psat_array = _normalize_per_core_param(psat_array, "psat_array")
 
     core_configuration = CoreConfig.hexagonal
+    expected_core_count = get_core_count(core_configuration, layer_count)
+    if eq_size != expected_core_count:
+        raise ValueError(
+            f"data_in.shape[0] = {eq_size}, но для core_configuration={core_configuration} и "
+            f"layer_count={layer_count} ожидается {expected_core_count} сердцевин"
+        )
+
     light = Light(lambda0=1.55)  # µm
 
     # ─── волокно и линейка ──────────────────────────────────────
@@ -492,6 +534,11 @@ def mcf_nn_reservoir_computing(
             fiber, light, eps=2e-6, display_debug_plots=display_debug_plots, save_debug_plot_path=save_scheme_path
         )
         np.save(p, np.asarray(coupling_matrix))
+
+    if coupling_matrix.shape != (eq_size, eq_size):
+        raise ValueError(
+            f"coupling_matrix должен иметь форму {(eq_size, eq_size)}, получено {coupling_matrix.shape}"
+        )
 
     # coupling_matrix = np.zeros((core_count, core_count))
 
@@ -545,7 +592,7 @@ def mcf_nn_reservoir_computing(
     fiber_length_dimensionless = fiber_length_m / length_scale
     n_z = max(int(round(step_number_per_dimensionless_distance * fiber_length_dimensionless)), 1)
     window_duration_ps = window_size * time_step_ps
-    psat_array_w = np.asarray(psat_array)
+    psat_array_w = np.asarray(psat_array, dtype=float)
     esat_array = psat_array_w * window_duration_ps  # [pJ]
     mean_power_per_core_w = np.mean(np.abs(data_in_mod) ** 2, axis=1).astype(float, copy=False)
     energy_per_window = mean_power_per_core_w * window_duration_ps
@@ -619,9 +666,11 @@ def mcf_nn_reservoir_computing(
             if display_debug_info:
                 print("batch_index =", batch_index)
 
+            s = batch_index * window_size
+            e = min(s + window_size, M)
+
             if batch_index > 0:
-                s = batch_index * window_size
-                e = min(s + window_size, M)
+
                 seg = data_in_mod[:, s:e]
                 if seg.shape[1] < window_size:
                     tmp = np.zeros((eq_size, window_size), dtype=dtype)
@@ -629,10 +678,12 @@ def mcf_nn_reservoir_computing(
                     seg = tmp
                 solver.numerical_solution[0] = feedback_coeff * fb_buf + seg
 
+            dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
+
             if ase_noise_seed is not None:
-                sig_power = float(np.mean(np.abs(solver.numerical_solution[0]) ** 2))
+
                 noise = generate_ase_noise(
-                    size=solver.numerical_solution[0].shape,
+                    size=solver.numerical_solution[-1].shape,
                     dt_ps=time_step_ps,
                     lambda0_um=light.lambda0,
                     g0_array=g0_array,
@@ -644,11 +695,12 @@ def mcf_nn_reservoir_computing(
                     dtype=dtype,
                 )
 
-                ase_signal_power_sum += sig_power
-                ase_noise_power_sum += float(np.mean(np.abs(noise) ** 2))
-                solver.numerical_solution[0] = solver.numerical_solution[0] + noise
+                valid_len = e - s
+                if valid_len > 0:
+                    ase_signal_power_sum += float(np.sum(np.abs(solver.numerical_solution[-1][:, :valid_len]) ** 2))
+                    ase_noise_power_sum += float(np.sum(np.abs(noise[:, :valid_len]) ** 2))
 
-            dt_b = solver.run_numerical_simulation(draw_interval=10, save_gif=save_gif, yscale="linear")
+                solver.numerical_solution[-1] = solver.numerical_solution[-1] + noise
 
             if (batch_index == 0) and (max_hours_total is not None):
                 est_total_sec = dt_b * n_batches
@@ -665,8 +717,7 @@ def mcf_nn_reservoir_computing(
                     )
 
             fb_buf = solver.numerical_solution[-1]
-            s = batch_index * window_size
-            e = min(s + window_size, M)
+
             data_out_stream[:, s:e] = fb_buf[:, :e - s] * np.exp(
                 1j * phase_fiber)  # добавляем набег фазы самого поля E = A * F * exp(i*beta*z)
 
@@ -811,6 +862,7 @@ def mcf_nn_reservoir_computing(
         main_start = int(offset_size)  # начало «полезной» области
         main_len = int(M * upsampling)  # длина «полезной» области
         main_end = main_start + main_len
+        output_slice = slice(offset_size, offset_size + data_in_mod.shape[1] * upsampling, upsampling)
         _prev_int_main = None  # интенсивности |U|^2 из пред. итерации (C, main_len)
         _prev_max_nrmse = 1.0
         _last_max_nrmse = 1.0
@@ -829,10 +881,16 @@ def mcf_nn_reservoir_computing(
             print("\nC =", coupling_coefficient, ", L_coupling =", L_coupling, ", layer_radii_array =",
                   layer_radii_array[-1], ", iteration", iteration_index, "of", iteration_count)
 
+            dt_b = solver.run_numerical_simulation(
+                # draw_modulus=display_debug_info,
+                draw_interval=10,
+                save_gif=save_gif,
+                yscale="linear"
+            )
+
             if ase_noise_seed is not None:
-                sig_power = float(np.mean(np.abs(solver.numerical_solution[0]) ** 2))
                 noise = generate_ase_noise(
-                    size=solver.numerical_solution[0].shape,
+                    size=solver.numerical_solution[-1].shape,
                     dt_ps=time_step_ps / upsampling,
                     lambda0_um=light.lambda0,
                     g0_array=g0_array,
@@ -844,16 +902,9 @@ def mcf_nn_reservoir_computing(
                     dtype=dtype,
                 )
 
-                ase_signal_power_sum += sig_power
-                ase_noise_power_sum += float(np.mean(np.abs(noise) ** 2))
-                solver.numerical_solution[0] = solver.numerical_solution[0] + noise
-
-            dt_b = solver.run_numerical_simulation(
-                # draw_modulus=display_debug_info,
-                draw_interval=10,
-                save_gif=save_gif,
-                yscale="linear"
-            )
+                ase_signal_power_sum += float(np.sum(np.abs(solver.numerical_solution[-1][:, output_slice]) ** 2))
+                ase_noise_power_sum += float(np.sum(np.abs(noise[:, output_slice]) ** 2))
+                solver.numerical_solution[-1] = solver.numerical_solution[-1] + noise
 
             # — оценка общего времени на итерации 1 (после прогрева) —
             if (iteration_index == 0) and (max_hours_total is not None):
@@ -4535,9 +4586,9 @@ if __name__ == "__main__":
         precision='float64',
         use_dispersion=False,
         ase_noise_seed=params.get("ase_noise_seed", mask_cfg.seed), # включает шум в модели
-        ase_noise_nf_db=params.get("ase_noise_nf_db", 50),
+        ase_noise_nf_db=params.get("ase_noise_nf_db", 0),
         ase_noise_optical_bw_hz=params.get("ase_noise_optical_bw_hz", 12.5e9),
-        ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", True), # nf_db=60 dB => OSNR=21 dB,
+        ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
     )
 
     training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=0, washout=500,
@@ -4578,10 +4629,10 @@ if __name__ == "__main__":
     res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
 
     # исследование параметра регуляризации
-    # sweep = ridge_alpha_sweep_diagnostics(
-    #     res,
-    #     title="Current main params",
-    # )
+    sweep = ridge_alpha_sweep_diagnostics(
+        res,
+        title="Current main params",
+    )
     #
     # ridge_alpha_selection_compare_diagnostics(
     #     res,
