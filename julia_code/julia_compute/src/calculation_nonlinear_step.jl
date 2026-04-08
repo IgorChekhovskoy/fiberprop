@@ -12,13 +12,13 @@ end
 # in-place обновление psi (n, M).
 # *параллелизм по времени
 # """
-# function nonlinear_step!(psi::AbstractMatrix{ComplexF64},
-#                          gamma_h::Array{Float64, 1},
-#                          g0_h::Array{Float64, 1},
-#                          exp_g0h::Array{Float64, 1},
-#                          exp_2g0h::Array{Float64, 1},
-#                          E_sat::Array{Float64, 1}, 
-#                          tau::Float64)
+# function parallel_nonlinear_step!(psi::AbstractMatrix{ComplexF64},
+#                                   gamma_h::Array{Float64, 1},
+#                                   g0_h::Array{Float64, 1},
+#                                   exp_g0h::Array{Float64, 1},
+#                                   exp_2g0h::Array{Float64, 1},
+#                                   E_sat::Array{Float64, 1}, 
+#                                   tau::Float64)
 #     n, M = size(psi)
     
 #     no_gain = findall(iszero, g0_h)
@@ -70,6 +70,54 @@ function nonlinear_step!(psi::AbstractMatrix{ComplexF64},
                          exp_2g0h::Array{Float64, 1},
                          E_sat::Array{Float64, 1}, 
                          tau::Float64)
+
+    # Индексы сердцевин без усиления (g0_h == 0)
+    no_gain = findall(iszero, g0_h)
+    for i in no_gain
+        gamh = gamma_h[i]
+        psi[i, :] .*= exp.(1im .* gamh .* get_power.(view(psi, i, :)))
+    end
+
+    # Индексы сердцевин с усилением (g0_h != 0)
+    gain = findall(!iszero, g0_h)
+    for i in gain
+        ek = sum(get_power, view(psi, i, :)) * tau
+        esat = E_sat[i]
+        g0hk = g0_h[i]
+        eg1 = exp_g0h[i]
+        eg2 = exp_2g0h[i]
+        gamh = gamma_h[i]
+
+        pk = get_power.(view(psi, i, :))
+        phik = angle.(view(psi, i, :))
+
+        new_ek = sqrt((ek^2 + 2 * ek * esat) * eg2 + esat^2) - esat
+
+        c_k = (-gamh * (ek + esat - esat * log(ek + 2*esat)) / (g0hk * ek)) .* pk .+ phik
+
+        new_pk = (eg1 * sqrt((ek + 2*esat) / ek) * sqrt(new_ek / (new_ek + 2*esat))) .* pk
+
+        new_phik = (gamh * (new_ek + esat - esat * log(new_ek + 2*esat)) / (g0hk * ek)) .* pk .+ c_k
+
+        psi[i, :] = sqrt.(new_pk) .* exp.(1im .* new_phik)
+    end
+
+    return nothing
+end
+
+
+"""
+in-place обновление psi (n, M).
+Параллельная реализация тратит часть ресурсов на создание потоков
+*параллелизм по сердцевинам
+"""
+function parallel_nonlinear_step!(psi::AbstractMatrix{ComplexF64},
+                                  gamma_h::Array{Float64, 1},
+                                  g0_h::Array{Float64, 1},
+                                  exp_g0h::Array{Float64, 1},
+                                  exp_2g0h::Array{Float64, 1},
+                                  E_sat::Array{Float64, 1}, 
+                                  tau::Float64)
 
     # Индексы сердцевин без усиления (g0_h == 0)
     no_gain = findall(iszero, g0_h)

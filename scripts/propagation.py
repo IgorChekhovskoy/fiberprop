@@ -395,13 +395,31 @@ def init_dicts(my_path):
                     'path': copy.deepcopy(my_path)}
     return [params_dict1, params_dict2, params_dict3, params_dict4, params_dict5]
 
+import os
+import sys
+import importlib
+# from julia_compute import Julia
+def restart_julia_session(num_threads):
+    # Устанавливаем переменную окружения перед запуском Julia
+    os.environ["JULIA_NUM_THREADS"] = str(num_threads)
+    # Перезапускаем JuliaCall (завершаем старый процесс и создаём новый)
+    if "julia_compute" in sys.modules:
+        print("ananab?")
+        importlib.reload(sys.modules["julia_compute"])
+        importlib.reload(sys.modules["juliacall"])
+        importlib.reload(sys.modules["juliapkg"])
+    # # Создаём новый Julia-процесс
+    # my_jl = Julia(compiled_modules=False)  # compiled_modules=False для надёжности
+    # # Импортируем ваш модуль (допустим, он называется MyJuliaModule)
+    # mod = my_jl.seval("using MyJuliaModule; MyJuliaModule")
+
 def test_run(my_path):
     sp_step = 5e-4
     params_dict = {'spatial_step': sp_step, 'dn': 0.0,
                    'dn_step': 0.005, 'J_coef': 1e-4,
                    'beta2_coef': 0.1, 'gamma_coef': 5e-3,
                    'path': copy.deepcopy(my_path),
-                   'calc_method': "ssfm_order2_dnd_short"}
+                   'calc_method': "ssfm_order2_dnd_short_julia"}
                    # "ssfm_order2_ndn_by_julia", "ssfm_order2_ndn", 
                    # "ssfm_order2_dnd_short_julia", "ssfm_order2_dnd_short"
     params_dict['path'] = params_dict['path'] + f"\\test_case"
@@ -426,6 +444,8 @@ if __name__ == "__main__":
                 val = dict_info[key]
                 file.write(key + ":\t\t\t" + str(val) + "\n")
     dir_path = os.path.dirname(os.path.abspath(__file__)) + "\\propagation_results"
+
+    restart_julia_session(8)
 
     test_run(dir_path)
 

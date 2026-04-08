@@ -19,6 +19,7 @@ function make_ndn_iteration_dcalc(initial_psi::Array{ComplexF64, 2},
                                   self_coupling::Vector{Float64})::Array{ComplexF64, 2}
     psi = initial_psi  # переданный объект изменяется в результате нелинейного шага
     n, M = size(psi)
+    plans = get_plans(n, M)
 
     omega = 2π * fftfreq(M, 1.0/com.tau)
     E_sat = eq.E_sat
@@ -32,14 +33,22 @@ function make_ndn_iteration_dcalc(initial_psi::Array{ComplexF64, 2},
                            linear_coeffs_array, self_coupling,
                            com.h, omega)
 
+    if Threads.nthreads() == 1
+        N_step = nonlinear_step!
+        L_step = linear_step!
+    else
+        N_step = parallel_nonlinear_step!
+        L_step = parallel_linear_step!
+    end
+
     # Половина нелинейного шага
-    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+    N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
 
     # Линейный шаг
-    psi = linear_step(psi, D)
+    L_step(psi, D, plans)
 
     # Вторая половина нелинейного шага
-    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+    N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
 
     # Добавление шума
     if eq.noise_amplitude != 0.0
@@ -67,6 +76,7 @@ function make_ndn_iteration(initial_psi::Array{ComplexF64, 2},
                             D::Array{ComplexF64})::Array{ComplexF64, 2}
     psi = initial_psi  # переданный объект изменяется в результате первого нелинейного шага полушага
     n, M = size(psi)
+    plans = get_plans(n, M)
 
     E_sat = eq.E_sat
     gamma_h = 0.5*com.h * eq.gamma
@@ -74,14 +84,22 @@ function make_ndn_iteration(initial_psi::Array{ComplexF64, 2},
     exp_g0h = exp.(g0_h)
     exp_2g0h = exp.(2.0 .* g0_h)
     
+    if Threads.nthreads() == 1
+        N_step = nonlinear_step!
+        L_step = linear_step!
+    else
+        N_step = parallel_nonlinear_step!
+        L_step = parallel_linear_step!
+    end
+
     # Половина нелинейного шага
-    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+    N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
 
     # Линейный шаг
-    psi = linear_step(psi, D)
+    L_step(psi, D, plans)
 
     # Вторая половина нелинейного шага
-    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
+    N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
 
     # Добавление шума
     if eq.noise_amplitude != 0.0
@@ -97,6 +115,7 @@ end
 
 """
 Численное моделирование без расчёта матриц D и D_half (симметричное расщепление D-N-D с учётом усиления и шума).
+С кэшированием плана FFT
 *глубокое копирование массивов происходит при передаче julia управления памятью
 - initial_psi: начальное поле, комплексный массив размера (n, M)
 - D: массив (n, n, M) или (n, n) экспонента матрицы для линейного шага
@@ -110,84 +129,41 @@ function ssfm_order2_dnd_short_noisefree(initial_psi::Array{ComplexF64, 2},
                                          D::Array{ComplexF64},
                                          D_half::Array{ComplexF64}, 
                                          enable_pb::Bool)::Array{ComplexF64, 2}
-    psi = initial_psi
+    psi = deepcopy(initial_psi)
+    n, M = size(psi)
+    plans = get_plans(n, M)
 
     E_sat = eq.E_sat
     gamma_h = com.h * eq.gamma
     g0_h = com.h * eq.g_0
     exp_g0h = exp.(g0_h)
     exp_2g0h = exp.(2.0 .* g0_h)
+    
+    if Threads.nthreads() == 1
+        N_step = nonlinear_step!
+        L_step = linear_step!
+    else
+        println(Threads.nthreads(), " threads are using...")
+        N_step = parallel_nonlinear_step!
+        L_step = parallel_linear_step!
+    end
 
     # Линейный полушаг
-    psi = linear_step(psi, D_half)
-
+    L_step(psi, D_half, plans)
     # Запуск цикла шагов с объединениями
     p = Progress(com.N-1, enabled=enable_pb, showspeed=true, desc="Computing short d-n-d scheme...")
     for _ in 1:com.N-1
         # Нелинейный шаг
-        nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
-
+        N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
         # Линейный шаг
-        psi = linear_step(psi, D)
-
+        L_step(psi, D, plans)
         # Обновление progress bar
         next!(p)
     end
     # Нелинейный шаг
-    nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
-
+    N_step(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
     # Линейный полушаг
-    psi = linear_step(psi, D_half)
+    L_step(psi, D_half, plans)
 
     return psi
 end
-
-# """
-# Численное моделирование без расчёта матриц D и D_half (симметричное расщепление D-N-D с учётом усиления и шума).
-# С кэшированием плана FFT
-# *глубокое копирование массивов происходит при передаче julia управления памятью
-# - initial_psi: начальное поле, комплексный массив размера (n, M)
-# - D: массив (n, n, M) или (n, n) экспонента матрицы для линейного шага
-# - D_half: массив (n, n, M) или (n, n) экспонента матрицы для линейного полушага
-
-# Возвращает решение в конечной точке.
-# """
-# function ssfm_order2_dnd_short_noisefree(initial_psi::Array{ComplexF64, 2},
-#                                          eq::EquationParameters,
-#                                          com::ComputationalParameters,
-#                                          D::Array{ComplexF64},
-#                                          D_half::Array{ComplexF64}, 
-#                                          enable_pb::Bool)::Array{ComplexF64, 2}
-#     psi = deepcopy(initial_psi)
-#     n, M = size(psi)
-#     plans = get_plans(n, M)
-
-#     E_sat = eq.E_sat
-#     gamma_h = com.h * eq.gamma
-#     g0_h = com.h * eq.g_0
-#     exp_g0h = exp.(g0_h)
-#     exp_2g0h = exp.(2.0 .* g0_h)
-
-#     # Линейный полушаг
-#     linear_step!(psi, D_half, plans)
-
-#     # Запуск цикла шагов с объединениями
-#     p = Progress(com.N-1, enabled=enable_pb, showspeed=true, desc="Computing short d-n-d scheme...")
-#     for _ in 1:com.N-1
-#         # Нелинейный шаг
-#         nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
-
-#         # Линейный шаг
-#         linear_step!(psi, D, plans)
-
-#         # Обновление progress bar
-#         next!(p)
-#     end
-#     # Нелинейный шаг
-#     nonlinear_step!(psi, gamma_h, g0_h, exp_g0h, exp_2g0h, E_sat, com.tau)
-
-#     # Линейный полушаг
-#     linear_step!(psi, D_half, plans)
-
-#     return psi
-# end
