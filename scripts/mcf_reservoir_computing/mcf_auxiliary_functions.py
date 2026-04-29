@@ -5,14 +5,6 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import json, hashlib
 
-from fiberprop.fiber import CoreConfig
-from fiberprop.fiber_geometry import get_core_count
-
-
-MM = 1 / 25.4
-COL1, COL15, COL2 = 89 * MM, 136 * MM, 183 * MM  # Nature: 1, 1.5, 2 колонки
-
-
 CACHE_DIR = Path("mcf_rc_cache")
 
 
@@ -1542,3 +1534,1062 @@ def ridge_alpha_sweep_diagnostics(
         block_p90_rtol=float(block_p90_rtol),
         block_max_rtol=float(block_max_rtol),
     )
+
+
+def ridge_alpha_selection_compare_diagnostics(
+    result: dict,
+    *,
+    alphas: np.ndarray | list[float] | tuple[float, ...] | None = None,
+    alpha_min: float | None = None,
+    alpha_max: float | None = None,
+    n_alpha: int = 61,
+    add_bias: bool = True,
+    show_plots: bool = True,
+    print_summary: bool = True,
+    title: str = "Ridge alpha selection comparison",
+    selection_rule: str = "min",  # "min" | "1se_largest"
+    alpha_label_precision: int = 3,
+    auto_lo_factor_vs_smax2: float = 1e-12,
+    auto_hi_factor_vs_smax2: float = 1e3,
+    auto_lo_factor_vs_sminpos2: float = 1e-6,
+    auto_min_decades: float = 12.0,
+    old_val_blocks: int = 8,
+    old_tail_blocks: int = 8,
+    old_tail_frac: float = 0.25,
+    rolling_folds: int = 6,
+    rolling_min_train_blocks: int = 2,
+    buffered_folds: int = 6,
+    buffered_buffer_size: int | None = None,
+    normalize_selection_scores: bool = False,
+    selection_score_clip_quantile: float = 0.98,
+) -> dict:
+    """
+    Сравнение разных способов выбора alpha для ridge-readout на уже готовом result.
+
+    Ожидаются поля в result:
+        X_train, y_train, X_val, y_val, X_test, y_test
+
+    Сравниваются методы:
+
+    1) old_val_blocks_mean
+       Внешний VAL режется на блоки, alpha выбирается по old-style критерию:
+       worst-case block score + plateau_0.2 + cond cap.
+
+    2) old_train_tail_blocks_mean
+       От TRAIN отрезается хвост, он режется на блоки, alpha выбирается тем же
+       old-style критерием, но уже на TRAIN tail.
+
+    3) rolling_origin_cv
+       Внутри TRAIN строятся expanding-window folds.
+
+    4) m_buffered_cv
+       Внутри TRAIN строятся sequential folds; вокруг inner-val fold выкидывается
+       buffer размера m.
+
+    5) gcv
+       Train-only GCV, без inner-val и без использования outer VAL.
+
+    Схемы разбиения:
+
+    1) old_val_blocks_mean
+       OUTER: [ TRAIN ][ VAL ][ TEST ]
+       SELECT alpha:
+         fit on TRAIN
+         VAL режется на последовательные блоки
+         по каждому блоку считается ошибка
+         далее берётся worst-case score:
+             sqrt(max block-MSE / global Var(VAL))
+         после этого:
+             alpha = largest alpha within 20% plateau + cond cap
+       VAL используется для выбора alpha: ДА
+       TEST независим: ДА
+
+    2) old_train_tail_blocks_mean
+       OUTER: [ TRAIN ][ VAL ][ TEST ]
+       INNER inside TRAIN:
+         [ TRAIN_HEAD ][ tail block 1 ][ tail block 2 ] ... [ tail block B ]
+       SELECT alpha:
+         fit on TRAIN_HEAD
+         ошибки считаются по tail-блокам
+         далее тот же old-style worst-case criterion
+       VAL используется для выбора alpha: НЕТ
+       VAL независим: ДА
+       TEST независим: ДА
+
+    3) rolling_origin_cv
+       OUTER: [ TRAIN ][ VAL ][ TEST ]
+       INNER inside TRAIN:
+         fold 1: [tr][va]
+         fold 2: [tr tr][va]
+         fold 3: [tr tr tr][va]
+         ...
+       SELECT alpha:
+         alpha выбирается по mean +/- SE по inner folds
+       VAL используется для выбора alpha: НЕТ
+       VAL независим: ДА
+       TEST независим: ДА
+
+    4) m_buffered_cv
+       OUTER: [ TRAIN ][ VAL ][ TEST ]
+       INNER inside TRAIN:
+         fold j: [ train_left ][ buffer m ][ val_j ][ buffer m ][ train_right ]
+       SELECT alpha:
+         train строится из train_left + train_right
+         buffer вокруг val_j выкидывается
+         alpha выбирается по mean +/- SE по inner folds
+       VAL используется для выбора alpha: НЕТ
+       VAL независим: ДА
+       TEST независим: ДА
+
+    5) gcv
+       OUTER: [ TRAIN ][ VAL ][ TEST ]
+       SELECT alpha:
+         используется только TRAIN
+         inner val нет
+         outer VAL не участвует в выборе alpha
+       VAL используется для выбора alpha: НЕТ
+       VAL независим: ДА
+       TEST независим: ДА
+
+    Важно:
+    - Для inner-CV нормировка признаков делается заново на train-части каждого fold.
+      Это корректно даже если X_train в result уже был стандартизован по outer train:
+      повторная стандартизация внутри fold эквивалентна стандартизации исходных
+      признаков по статистикам именно этого fold-train.
+    - Для финальной оценки после выбора alpha модель во всех методах переобучается
+      на полном outer TRAIN.
+    - Для метода old_val_blocks_mean outer VAL НЕ независим, потому что участвовал
+      в выборе alpha.
+
+    selection_rule:
+      "min" -> alpha = argmin(mean selection score)
+      "1se_largest" -> самый большой alpha, у которого
+                       mean <= min_mean + SE_at_min
+      (для GCV, где SE нет, правило вырождается в "min")
+
+    normalize_selection_scores:
+      False -> на верхнем графике показываются сырые selection scores.
+      True  -> каждый score делится на свой минимум по alpha.
+    """
+    required = ("X_train", "y_train", "X_val", "y_val", "X_test", "y_test")
+    missing = [k for k in required if k not in result]
+    if missing:
+        raise KeyError(
+            f"ridge_alpha_selection_compare_diagnostics: в result нет ключей {missing}"
+        )
+
+    Xtr = np.asarray(result["X_train"], dtype=np.float64)
+    ytr = np.asarray(result["y_train"], dtype=np.float64)
+    Xva = np.asarray(result["X_val"], dtype=np.float64)
+    yva = np.asarray(result["y_val"], dtype=np.float64)
+    Xte = np.asarray(result["X_test"], dtype=np.float64)
+    yte = np.asarray(result["y_test"], dtype=np.float64)
+
+    if Xtr.ndim != 2 or ytr.ndim != 2:
+        raise ValueError("Ожидаются X_train формы (N,F) и y_train формы (N,T).")
+    if Xtr.shape[0] != ytr.shape[0]:
+        raise ValueError("X_train и y_train должны иметь одинаковое число строк.")
+    if Xva.ndim != 2 or yva.ndim != 2 or Xva.shape[0] != yva.shape[0]:
+        raise ValueError("Ожидаются X_val/y_val корректной формы.")
+    if Xte.ndim != 2 or yte.ndim != 2 or Xte.shape[0] != yte.shape[0]:
+        raise ValueError("Ожидаются X_test/y_test корректной формы.")
+
+    n_tr = int(Xtr.shape[0])
+    n_va = int(Xva.shape[0])
+    n_te = int(Xte.shape[0])
+    f_tr = int(Xtr.shape[1])
+
+    eps = np.finfo(np.float64).tiny
+
+    def _safe_nrmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+        if y_true.size == 0 or y_pred.size == 0:
+            return float("nan")
+        n = min(int(y_true.shape[0]), int(y_pred.shape[0]))
+        if n < 2:
+            return float("nan")
+        return float(nrmse(y_true[:n], y_pred[:n]))
+
+    def _fmt_alpha(x: float | None) -> str:
+        if x is None or not np.isfinite(x) or x <= 0.0:
+            return "—"
+        return f"{x:.{int(alpha_label_precision)}g}"
+
+    def _block_slices(n: int, k: int, min_size: int = 2, offset: int = 0) -> list[slice]:
+        n = int(n)
+        k = int(k)
+        offset = int(offset)
+        if n <= 0:
+            return []
+        if k <= 1:
+            return [slice(offset, offset + n)] if n >= min_size else []
+        k = max(2, min(k, n))
+        edges = np.linspace(0, n, num=k + 1, dtype=int)
+        out = []
+        for i in range(k):
+            a = int(edges[i])
+            b = int(edges[i + 1])
+            if b - a >= min_size:
+                out.append(slice(offset + a, offset + b))
+        return out
+
+    def _standardize_from_train(
+        X_train_fold: np.ndarray,
+        *X_eval_list: np.ndarray,
+    ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
+        mu = np.mean(X_train_fold, axis=0)
+        sigma = np.std(X_train_fold, axis=0)
+        sigma[sigma < 1e-12] = 1.0
+        X_train_std = (X_train_fold - mu) / sigma
+        X_eval_std = [(Xe - mu) / sigma for Xe in X_eval_list]
+        return X_train_std, X_eval_std, mu, sigma
+
+    def _svd_pack(X_train_fold: np.ndarray, y_train_fold: np.ndarray) -> dict:
+        X_train_fold = np.asarray(X_train_fold, dtype=np.float64)
+        y_train_fold = np.asarray(y_train_fold, dtype=np.float64)
+        if add_bias:
+            Xb = np.hstack([X_train_fold, np.ones((X_train_fold.shape[0], 1), dtype=np.float64)])
+        else:
+            Xb = X_train_fold
+        U, s, Vt = np.linalg.svd(Xb, full_matrices=False)
+        s = np.asarray(s, dtype=np.float64)
+        return {
+            "X": X_train_fold,
+            "y": y_train_fold,
+            "U": U,
+            "s": s,
+            "s2": s * s,
+            "Vt": Vt,
+            "Ut_y": U.T @ y_train_fold,
+            "n": int(X_train_fold.shape[0]),
+            "f": int(X_train_fold.shape[1]),
+        }
+
+    def _fit_weights_from_pack(pack: dict, alpha: float) -> np.ndarray:
+        alpha = float(alpha)
+        filt = (pack["s"] / (pack["s2"] + alpha))[:, None]
+        return pack["Vt"].T @ (filt * pack["Ut_y"])
+
+    def _predict(X: np.ndarray, W: np.ndarray) -> np.ndarray:
+        return apply_readout(X, W, add_bias=add_bias)
+
+    def _cond_ridge_from_pack(pack: dict, alpha: float) -> float:
+        s2 = pack["s2"]
+        if s2.size == 0:
+            return float("nan")
+        s_max2 = float(s2[0])
+        s2_pos = s2[s2 > 0.0]
+        s_minpos2 = float(s2_pos.min()) if s2_pos.size else 0.0
+        return float((s_max2 + float(alpha)) / max(s_minpos2 + float(alpha), eps))
+
+    def _df_from_pack(pack: dict, alpha: float) -> float:
+        return float(np.sum(pack["s2"] / (pack["s2"] + float(alpha))))
+
+    def _gcv_from_pack(pack: dict, alpha: float) -> float:
+        W = _fit_weights_from_pack(pack, alpha)
+        y_hat = _predict(pack["X"], W)
+        resid = np.asarray(y_hat - pack["y"], dtype=np.float64)
+        mse = float(np.mean(resid * resid))
+        df = _df_from_pack(pack, alpha)
+        denom = 1.0 - df / max(float(pack["n"]), 1.0)
+        denom = float(np.clip(denom, 1e-12, 1.0))
+        return mse / (denom * denom)
+
+    def _auto_alpha_grid(pack: dict) -> np.ndarray:
+        s2 = pack["s2"]
+        if s2.size == 0:
+            lo = 1e-12
+            hi = 1e3
+        else:
+            s_max2 = float(s2[0])
+            s2_pos = s2[s2 > 0.0]
+            s_minpos2 = float(s2_pos.min()) if s2_pos.size else 0.0
+            lo1 = float(s_max2) * float(auto_lo_factor_vs_smax2)
+            lo2 = float(s_minpos2) * float(auto_lo_factor_vs_sminpos2) if s_minpos2 > 0.0 else 0.0
+            lo = max(lo1, lo2, eps)
+            hi = float(s_max2) * float(auto_hi_factor_vs_smax2)
+            if hi <= lo:
+                hi = lo * 1e6
+            decades = float(np.log10(hi) - np.log10(lo))
+            if decades < float(auto_min_decades):
+                hi = lo * (10.0 ** float(auto_min_decades))
+        grid = np.logspace(np.log10(lo), np.log10(hi), int(max(2, n_alpha)))
+        return np.unique(grid.astype(np.float64))
+
+    def _select_alpha(alpha_grid_loc: np.ndarray, score_mean: np.ndarray, score_se: np.ndarray) -> float | None:
+        m = np.isfinite(score_mean)
+        if not np.any(m):
+            return None
+        valid_idx = np.arange(score_mean.size)[m]
+        idx_min_local = int(np.argmin(score_mean[m]))
+        idx_min = int(valid_idx[idx_min_local])
+
+        if str(selection_rule).lower() == "min":
+            return float(alpha_grid_loc[idx_min])
+
+        if str(selection_rule).lower() == "1se_largest":
+            se_ref = float(score_se[idx_min]) if np.isfinite(score_se[idx_min]) else 0.0
+            thr = float(score_mean[idx_min] + se_ref)
+            ok = m & (score_mean <= thr)
+            if not np.any(ok):
+                return float(alpha_grid_loc[idx_min])
+            return float(np.max(alpha_grid_loc[ok]))
+
+        raise ValueError("selection_rule must be 'min' or '1se_largest'")
+
+    def _mean_se_from_score_matrix(score_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        score_matrix = np.asarray(score_matrix, dtype=np.float64)
+        mean = np.full(score_matrix.shape[0], np.nan, dtype=np.float64)
+        se = np.full(score_matrix.shape[0], np.nan, dtype=np.float64)
+        for i in range(score_matrix.shape[0]):
+            row = score_matrix[i]
+            row = row[np.isfinite(row)]
+            if row.size == 0:
+                continue
+            mean[i] = float(np.mean(row))
+            se[i] = float(np.std(row, ddof=1) / np.sqrt(row.size)) if row.size >= 2 else 0.0
+        return mean, se
+
+    def _band_from_score_matrix(score_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        score_matrix = np.asarray(score_matrix, dtype=np.float64)
+        lo = np.full(score_matrix.shape[0], np.nan, dtype=np.float64)
+        hi = np.full(score_matrix.shape[0], np.nan, dtype=np.float64)
+        for i in range(score_matrix.shape[0]):
+            row = score_matrix[i]
+            row = row[np.isfinite(row)]
+            if row.size == 0:
+                continue
+            lo[i] = float(np.min(row))
+            hi[i] = float(np.max(row))
+        return lo, hi
+
+    def _outer_curves(alpha_grid_loc: np.ndarray, outer_pack: dict) -> dict:
+        n_a = int(alpha_grid_loc.size)
+        e_tr = np.full(n_a, np.nan, dtype=np.float64)
+        e_va = np.full(n_a, np.nan, dtype=np.float64)
+        e_te = np.full(n_a, np.nan, dtype=np.float64)
+        cond_r = np.full(n_a, np.nan, dtype=np.float64)
+        df_r = np.full(n_a, np.nan, dtype=np.float64)
+        wnorm = np.full(n_a, np.nan, dtype=np.float64)
+
+        for i, alpha in enumerate(alpha_grid_loc):
+            W = _fit_weights_from_pack(outer_pack, float(alpha))
+            e_tr[i] = _safe_nrmse(ytr, _predict(Xtr, W))
+            e_va[i] = _safe_nrmse(yva, _predict(Xva, W))
+            e_te[i] = _safe_nrmse(yte, _predict(Xte, W))
+            cond_r[i] = _cond_ridge_from_pack(outer_pack, float(alpha))
+            df_r[i] = _df_from_pack(outer_pack, float(alpha))
+            wnorm[i] = float(np.linalg.norm(W))
+
+        return {
+            "nrmse_train": e_tr,
+            "nrmse_val": e_va,
+            "nrmse_test": e_te,
+            "cond_ridge": cond_r,
+            "df": df_r,
+            "w_norm_f": wnorm,
+        }
+
+    def _selected_outer_metrics(alpha_grid_loc: np.ndarray, outer_curves_loc: dict, alpha_sel: float | None) -> dict:
+        if alpha_sel is None or not np.isfinite(alpha_sel):
+            return {
+                "outer_train_nrmse": float("nan"),
+                "outer_val_nrmse": float("nan"),
+                "outer_test_nrmse": float("nan"),
+                "outer_cond_ridge": float("nan"),
+                "outer_df": float("nan"),
+            }
+        idx = int(np.argmin(np.abs(alpha_grid_loc - float(alpha_sel))))
+        return {
+            "outer_train_nrmse": float(outer_curves_loc["nrmse_train"][idx]),
+            "outer_val_nrmse": float(outer_curves_loc["nrmse_val"][idx]),
+            "outer_test_nrmse": float(outer_curves_loc["nrmse_test"][idx]),
+            "outer_cond_ridge": float(outer_curves_loc["cond_ridge"][idx]),
+            "outer_df": float(outer_curves_loc["df"][idx]),
+        }
+
+    def _global_var(y: np.ndarray) -> float:
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        if y.size < 2:
+            return float("nan")
+        v = float(np.var(y))
+        return v if np.isfinite(v) and v > 0.0 else float("nan")
+
+    def _worst_block_score_from_pred(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        blocks: list[slice],
+        var_global: float,
+    ) -> float:
+        y_true = np.asarray(y_true, dtype=np.float64)
+        y_pred = np.asarray(y_pred, dtype=np.float64)
+        n = min(int(y_true.shape[0]), int(y_pred.shape[0]))
+        if n < 2 or not np.isfinite(var_global) or var_global <= 0.0:
+            return float("nan")
+        y_true = y_true[:n]
+        y_pred = y_pred[:n]
+        max_mse = -np.inf
+        for sl in blocks:
+            a0 = int(sl.start or 0)
+            b0 = int(sl.stop or 0)
+            a0 = max(0, min(a0, n))
+            b0 = max(0, min(b0, n))
+            if b0 - a0 < 2:
+                continue
+            d = y_true[a0:b0] - y_pred[a0:b0]
+            mse_b = float(np.mean(d * d))
+            max_mse = max(max_mse, mse_b)
+        if not np.isfinite(max_mse) or max_mse < 0.0:
+            return float("nan")
+        return float(np.sqrt(max_mse / var_global))
+
+    def _alpha_needed_for_max_cond(pack: dict, target_cond: float = 1e5) -> float:
+        s2 = np.asarray(pack["s2"], dtype=np.float64)
+        if s2.size == 0:
+            return 0.0
+        s_max2 = float(s2[0])
+        s2_pos = s2[s2 > 0.0]
+        s_min2 = float(s2_pos.min()) if s2_pos.size else 0.0
+        k = float(target_cond)
+        if not np.isfinite(k) or k <= 1.0 or s_max2 <= 0.0:
+            return 0.0
+        if s_min2 <= 0.0:
+            return float(s_max2 / (k - 1.0))
+        num = s_max2 - k * s_min2
+        if num <= 0.0:
+            return 0.0
+        return float(num / (k - 1.0))
+
+    def _snap_alpha_to_grid(alpha_grid_loc: np.ndarray, alpha_raw: float) -> float:
+        alpha_raw = float(alpha_raw)
+        idx = int(np.searchsorted(alpha_grid_loc, alpha_raw, side="left"))
+        if idx >= alpha_grid_loc.size:
+            idx = int(alpha_grid_loc.size - 1)
+        return float(alpha_grid_loc[idx])
+
+    def _select_old_style_alpha(
+        alpha_grid_loc: np.ndarray,
+        old_score: np.ndarray,
+        pack: dict,
+        *,
+        max_rtol: float = 0.2,
+        max_cond: float = 1e5,
+    ) -> float | None:
+        old_score = np.asarray(old_score, dtype=np.float64)
+        m = np.isfinite(old_score)
+        if not np.any(m):
+            return None
+
+        alpha_cond = _alpha_needed_for_max_cond(pack, target_cond=max_cond)
+
+        e_min = float(np.min(old_score[m]))
+        thr = (1.0 + float(max_rtol)) * e_min
+        ok = m & (old_score <= thr)
+
+        if not np.any(ok):
+            alpha_sel = float(alpha_grid_loc[int(np.nanargmin(old_score))])
+        else:
+            if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+                ok2 = ok & (alpha_grid_loc >= float(alpha_cond))
+                alpha_sel = float(np.max(alpha_grid_loc[ok2])) if np.any(ok2) else float(np.max(alpha_grid_loc[ok]))
+            else:
+                alpha_sel = float(np.max(alpha_grid_loc[ok]))
+
+        if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+            alpha_sel = _snap_alpha_to_grid(alpha_grid_loc, max(alpha_sel, float(alpha_cond)))
+
+        return float(alpha_sel)
+
+    def _evaluate_old_style_method(
+        X_fit: np.ndarray,
+        y_fit: np.ndarray,
+        X_score: np.ndarray,
+        y_score: np.ndarray,
+        n_blocks: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float | None]:
+        score_blocks = _block_slices(int(X_score.shape[0]), int(n_blocks), min_size=2, offset=0)
+        if len(score_blocks) == 0:
+            return (
+                np.full((alpha_grid.size, 0), np.nan, dtype=np.float64),
+                np.full(alpha_grid.size, np.nan, dtype=np.float64),
+                np.full(alpha_grid.size, np.nan, dtype=np.float64),
+                np.full(alpha_grid.size, np.nan, dtype=np.float64),
+                None,
+            )
+
+        X_fit_std, [X_score_std], _, _ = _standardize_from_train(X_fit, X_score)
+        fit_pack = _svd_pack(X_fit_std, y_fit)
+        score_matrix = np.full((alpha_grid.size, len(score_blocks)), np.nan, dtype=np.float64)
+        old_score = np.full(alpha_grid.size, np.nan, dtype=np.float64)
+        var_global_score = _global_var(y_score)
+
+        for i, alpha in enumerate(alpha_grid):
+            W = _fit_weights_from_pack(fit_pack, float(alpha))
+            y_score_hat = _predict(X_score_std, W)
+            for j, sl in enumerate(score_blocks):
+                score_matrix[i, j] = _safe_nrmse(y_score[sl], y_score_hat[sl])
+            old_score[i] = _worst_block_score_from_pred(y_score, y_score_hat, score_blocks, var_global_score)
+
+        band_lo, band_hi = _band_from_score_matrix(score_matrix)
+        alpha_sel = _select_old_style_alpha(alpha_grid, old_score, fit_pack, max_rtol=0.2, max_cond=1e5)
+        return score_matrix, old_score, band_lo, band_hi, alpha_sel
+
+    outer_pack = _svd_pack(Xtr, ytr)
+
+    tail_len = int(round(float(old_tail_frac) * n_tr))
+    tail_len = max(tail_len, int(old_tail_blocks) * 2)
+    tail_len = min(tail_len, max(0, n_tr - 2))
+    head_len = int(n_tr - tail_len)
+
+    head_pack_preview = None
+    if head_len >= 2 and tail_len >= 2:
+        X_head_preview_std, _, _, _ = _standardize_from_train(Xtr[:head_len])
+        head_pack_preview = _svd_pack(X_head_preview_std, ytr[:head_len])
+
+    if alphas is not None:
+        alpha_grid = np.asarray(alphas, dtype=np.float64).reshape(-1)
+        alpha_grid = alpha_grid[np.isfinite(alpha_grid)]
+        alpha_grid = alpha_grid[alpha_grid > 0.0]
+        if alpha_grid.size == 0:
+            raise ValueError("alphas заданы, но после фильтрации не осталось положительных конечных значений.")
+        alpha_grid = np.unique(alpha_grid)
+    else:
+        if alpha_min is not None and alpha_max is not None:
+            a0 = float(alpha_min)
+            a1 = float(alpha_max)
+            if not (np.isfinite(a0) and np.isfinite(a1) and a0 > 0.0 and a1 > 0.0):
+                raise ValueError("alpha_min/alpha_max должны быть конечными и > 0.")
+            if a0 > a1:
+                a0, a1 = a1, a0
+            alpha_grid = np.logspace(np.log10(a0), np.log10(a1), int(max(2, n_alpha))).astype(np.float64)
+            alpha_grid = np.unique(alpha_grid)
+        else:
+            alpha_grid = _auto_alpha_grid(outer_pack)
+            if head_pack_preview is not None:
+                alpha_grid = np.unique(np.concatenate([alpha_grid, _auto_alpha_grid(head_pack_preview)]))
+
+    outer = _outer_curves(alpha_grid, outer_pack)
+
+    methods: dict[str, dict] = {}
+
+    # ------------------------------------------------------------------
+    # 1) old_val_blocks_mean
+    # ------------------------------------------------------------------
+    old_val_scheme = [
+        "OUTER: [ TRAIN ][ VAL ][ TEST ]",
+        "SELECT: fit on TRAIN, score sequential blocks of VAL",
+        "criterion: old-style worst-case block score + plateau_0.2 + cond cap",
+        "VAL used for alpha selection: YES",
+        "TEST independent: YES",
+    ]
+
+    score_matrix, old_score, band_lo, band_hi, alpha_sel = _evaluate_old_style_method(
+        Xtr,
+        ytr,
+        Xva,
+        yva,
+        int(old_val_blocks),
+    )
+
+    methods["old_val_blocks_mean"] = {
+        "short_label": "old-val",
+        "scheme": old_val_scheme,
+        "uses_outer_val_for_selection": True,
+        "score_label": "old-style worst-case block NRMSE on outer VAL",
+        "score_mean": old_score,
+        "score_se": np.full(alpha_grid.size, np.nan),
+        "score_matrix": score_matrix,
+        "score_band_lo": band_lo,
+        "score_band_hi": band_hi,
+        "alpha_selected": alpha_sel,
+        **_selected_outer_metrics(alpha_grid, outer, alpha_sel),
+    }
+
+    # ------------------------------------------------------------------
+    # 2) old_train_tail_blocks_mean
+    # ------------------------------------------------------------------
+    old_tail_scheme = [
+        "OUTER: [ TRAIN ][ VAL ][ TEST ]",
+        "INNER on TRAIN: [ TRAIN_HEAD ][ tail block 1 ] ... [ tail block B ]",
+        "SELECT: fit on TRAIN_HEAD, score sequential tail blocks",
+        "criterion: old-style worst-case block score + plateau_0.2 + cond cap",
+        "VAL used for alpha selection: NO",
+        "VAL independent: YES",
+        "TEST independent: YES",
+    ]
+
+    if head_len >= 2 and tail_len >= 2:
+        X_head = Xtr[:head_len]
+        y_head = ytr[:head_len]
+        X_tail = Xtr[head_len:]
+        y_tail = ytr[head_len:]
+
+        tail_scores, old_tail_score, tail_band_lo, tail_band_hi, alpha_sel_tail = _evaluate_old_style_method(
+            X_head,
+            y_head,
+            X_tail,
+            y_tail,
+            int(old_tail_blocks),
+        )
+
+        methods["old_train_tail_blocks_mean"] = {
+            "short_label": "old-tail",
+            "scheme": old_tail_scheme,
+            "uses_outer_val_for_selection": False,
+            "score_label": "old-style worst-case block NRMSE on TRAIN tail",
+            "score_mean": old_tail_score,
+            "score_se": np.full(alpha_grid.size, np.nan),
+            "score_matrix": tail_scores,
+            "score_band_lo": tail_band_lo,
+            "score_band_hi": tail_band_hi,
+            "alpha_selected": alpha_sel_tail,
+            **_selected_outer_metrics(alpha_grid, outer, alpha_sel_tail),
+        }
+    else:
+        methods["old_train_tail_blocks_mean"] = {
+            "short_label": "old-tail",
+            "scheme": old_tail_scheme,
+            "uses_outer_val_for_selection": False,
+            "score_label": "old-style worst-case block NRMSE on TRAIN tail",
+            "score_mean": np.full(alpha_grid.size, np.nan),
+            "score_se": np.full(alpha_grid.size, np.nan),
+            "score_matrix": np.full((alpha_grid.size, 0), np.nan),
+            "score_band_lo": np.full(alpha_grid.size, np.nan),
+            "score_band_hi": np.full(alpha_grid.size, np.nan),
+            "alpha_selected": None,
+            **_selected_outer_metrics(alpha_grid, outer, None),
+        }
+
+    # ------------------------------------------------------------------
+    # 3) rolling_origin_cv
+    # ------------------------------------------------------------------
+    rolling_scheme = [
+        "OUTER: [ TRAIN ][ VAL ][ TEST ]",
+        "INNER on TRAIN: expanding window folds",
+        "fold j: [ train ... train ][ inner val ]",
+        "VAL used for alpha selection: NO",
+        "VAL independent: YES",
+        "TEST independent: YES",
+    ]
+
+    rolling_scores = np.full((alpha_grid.size, 0), np.nan, dtype=np.float64)
+    alpha_sel_roll = None
+
+    ro_edges = np.linspace(0, n_tr, int(rolling_folds) + 2, dtype=int)
+    ro_folds = []
+
+    for j in range(int(max(1, rolling_min_train_blocks)), len(ro_edges) - 1):
+        tr_sl = slice(0, int(ro_edges[j]))
+        va_sl = slice(int(ro_edges[j]), int(ro_edges[j + 1]))
+        if (tr_sl.stop - tr_sl.start) < 2:
+            continue
+        if (va_sl.stop - va_sl.start) < 2:
+            continue
+
+        Xtr_fold = Xtr[tr_sl]
+        ytr_fold = ytr[tr_sl]
+        Xva_fold = Xtr[va_sl]
+        yva_fold = ytr[va_sl]
+
+        Xtr_fold_std, [Xva_fold_std], _, _ = _standardize_from_train(Xtr_fold, Xva_fold)
+        ro_folds.append({
+            "pack": _svd_pack(Xtr_fold_std, ytr_fold),
+            "X_val": Xva_fold_std,
+            "y_val": yva_fold,
+        })
+
+    if len(ro_folds) > 0:
+        rolling_scores = np.full((alpha_grid.size, len(ro_folds)), np.nan, dtype=np.float64)
+        for i, alpha in enumerate(alpha_grid):
+            for j, fold in enumerate(ro_folds):
+                W = _fit_weights_from_pack(fold["pack"], float(alpha))
+                rolling_scores[i, j] = _safe_nrmse(fold["y_val"], _predict(fold["X_val"], W))
+        mean_score, se_score = _mean_se_from_score_matrix(rolling_scores)
+        roll_band_lo, roll_band_hi = _band_from_score_matrix(rolling_scores)
+        alpha_sel_roll = _select_alpha(alpha_grid, mean_score, se_score)
+    else:
+        mean_score = np.full(alpha_grid.size, np.nan)
+        se_score = np.full(alpha_grid.size, np.nan)
+        roll_band_lo = np.full(alpha_grid.size, np.nan)
+        roll_band_hi = np.full(alpha_grid.size, np.nan)
+
+    methods["rolling_origin_cv"] = {
+        "short_label": "rolling",
+        "scheme": rolling_scheme,
+        "uses_outer_val_for_selection": False,
+        "score_label": "mean inner-fold NRMSE (rolling-origin)",
+        "score_mean": mean_score,
+        "score_se": se_score,
+        "score_matrix": rolling_scores,
+        "score_band_lo": roll_band_lo,
+        "score_band_hi": roll_band_hi,
+        "alpha_selected": alpha_sel_roll,
+        **_selected_outer_metrics(alpha_grid, outer, alpha_sel_roll),
+    }
+
+    # ------------------------------------------------------------------
+    # 4) m_buffered_cv
+    # ------------------------------------------------------------------
+    if buffered_buffer_size is None:
+        taps_default = int(result.get("metrics", {}).get("taps", 1))
+        buffered_buffer_size = max(0, taps_default - 1)
+    m_buf = int(max(0, buffered_buffer_size))
+
+    buffered_scheme = [
+        "OUTER: [ TRAIN ][ VAL ][ TEST ]",
+        "INNER on TRAIN: sequential folds with buffer m around inner VAL",
+        f"buffer size m = {m_buf}",
+        "fold j: [ train_left ][ buffer ][ inner val ][ buffer ][ train_right ]",
+        "VAL used for alpha selection: NO",
+        "VAL independent: YES",
+        "TEST independent: YES",
+    ]
+
+    buffered_scores = np.full((alpha_grid.size, 0), np.nan, dtype=np.float64)
+    alpha_sel_buffer = None
+
+    buf_edges = np.linspace(0, n_tr, int(buffered_folds) + 1, dtype=int)
+    buf_folds = []
+
+    for j in range(len(buf_edges) - 1):
+        va_a = int(buf_edges[j])
+        va_b = int(buf_edges[j + 1])
+        if va_b - va_a < 2:
+            continue
+
+        left_stop = max(0, va_a - m_buf)
+        right_start = min(n_tr, va_b + m_buf)
+
+        X_parts = []
+        y_parts = []
+
+        if left_stop >= 2:
+            X_parts.append(Xtr[:left_stop])
+            y_parts.append(ytr[:left_stop])
+
+        if n_tr - right_start >= 2:
+            X_parts.append(Xtr[right_start:])
+            y_parts.append(ytr[right_start:])
+
+        if not X_parts:
+            continue
+
+        Xtr_fold = np.vstack(X_parts)
+        ytr_fold = np.vstack(y_parts)
+        if Xtr_fold.shape[0] < 2:
+            continue
+
+        Xva_fold = Xtr[va_a:va_b]
+        yva_fold = ytr[va_a:va_b]
+
+        Xtr_fold_std, [Xva_fold_std], _, _ = _standardize_from_train(Xtr_fold, Xva_fold)
+        buf_folds.append({
+            "pack": _svd_pack(Xtr_fold_std, ytr_fold),
+            "X_val": Xva_fold_std,
+            "y_val": yva_fold,
+        })
+
+    if len(buf_folds) > 0:
+        buffered_scores = np.full((alpha_grid.size, len(buf_folds)), np.nan, dtype=np.float64)
+        for i, alpha in enumerate(alpha_grid):
+            for j, fold in enumerate(buf_folds):
+                W = _fit_weights_from_pack(fold["pack"], float(alpha))
+                buffered_scores[i, j] = _safe_nrmse(fold["y_val"], _predict(fold["X_val"], W))
+        mean_score, se_score = _mean_se_from_score_matrix(buffered_scores)
+        buf_band_lo, buf_band_hi = _band_from_score_matrix(buffered_scores)
+        alpha_sel_buffer = _select_alpha(alpha_grid, mean_score, se_score)
+    else:
+        mean_score = np.full(alpha_grid.size, np.nan)
+        se_score = np.full(alpha_grid.size, np.nan)
+        buf_band_lo = np.full(alpha_grid.size, np.nan)
+        buf_band_hi = np.full(alpha_grid.size, np.nan)
+
+    methods["m_buffered_cv"] = {
+        "short_label": "buffered",
+        "scheme": buffered_scheme,
+        "uses_outer_val_for_selection": False,
+        "score_label": "mean inner-fold NRMSE (m-buffered)",
+        "score_mean": mean_score,
+        "score_se": se_score,
+        "score_matrix": buffered_scores,
+        "score_band_lo": buf_band_lo,
+        "score_band_hi": buf_band_hi,
+        "alpha_selected": alpha_sel_buffer,
+        **_selected_outer_metrics(alpha_grid, outer, alpha_sel_buffer),
+    }
+
+    # ------------------------------------------------------------------
+    # 5) gcv
+    # ------------------------------------------------------------------
+    gcv_scheme = [
+        "OUTER: [ TRAIN ][ VAL ][ TEST ]",
+        "SELECT: train-only GCV on full TRAIN",
+        "inner VAL: NO",
+        "outer VAL used for alpha selection: NO",
+        "VAL independent: YES",
+        "TEST independent: YES",
+    ]
+
+    gcv_scores = np.full((alpha_grid.size, 1), np.nan, dtype=np.float64)
+    for i, alpha in enumerate(alpha_grid):
+        gcv_scores[i, 0] = _gcv_from_pack(outer_pack, float(alpha))
+
+    gcv_mean = gcv_scores[:, 0].copy()
+    gcv_se = np.zeros_like(gcv_mean)
+    gcv_band_lo = gcv_mean.copy()
+    gcv_band_hi = gcv_mean.copy()
+    alpha_sel_gcv = _select_alpha(alpha_grid, gcv_mean, gcv_se)
+
+    methods["gcv"] = {
+        "short_label": "GCV",
+        "scheme": gcv_scheme,
+        "uses_outer_val_for_selection": False,
+        "score_label": "GCV on outer TRAIN",
+        "score_mean": gcv_mean,
+        "score_se": gcv_se,
+        "score_matrix": gcv_scores,
+        "score_band_lo": gcv_band_lo,
+        "score_band_hi": gcv_band_hi,
+        "alpha_selected": alpha_sel_gcv,
+        **_selected_outer_metrics(alpha_grid, outer, alpha_sel_gcv),
+    }
+
+    # ------------------------------------------------------------------
+    # Сводка
+    # ------------------------------------------------------------------
+    if print_summary:
+        s2_outer = outer_pack["s2"]
+        s_max2 = float(s2_outer[0]) if s2_outer.size else float("nan")
+        s2_pos = s2_outer[s2_outer > 0.0]
+        s_minpos2 = float(s2_pos.min()) if s2_pos.size else 0.0
+        cond_x = float("inf")
+        if s2_pos.size and s_max2 > 0.0:
+            cond_x = float(np.sqrt(s_max2 / max(s_minpos2, eps)))
+
+        print("=" * 100)
+        print(f"[alpha-compare] outer TRAIN: N={n_tr}, F={f_tr}, add_bias={bool(add_bias)}")
+        print(f"[alpha-compare] outer VAL: N={n_va}")
+        print(f"[alpha-compare] outer TEST: N={n_te}")
+        print(f"[alpha-compare] selection_rule={selection_rule}")
+        print(
+            f"[alpha-compare] alpha grid: [{float(alpha_grid[0]):.3g}, {float(alpha_grid[-1]):.3g}] "
+            f"points={int(alpha_grid.size)}"
+        )
+        print(f"[alpha-compare] cond(X_train(+bias)) ≈ {cond_x:.3g}")
+        print(f"[alpha-compare] s_max^2={s_max2:.3g}, s_min_pos^2={s_minpos2:.3g}")
+        print("-" * 100)
+
+        for name, meta in methods.items():
+            print(f"[{name}]")
+            for line in meta["scheme"]:
+                print(f"  {line}")
+            print(f"  score: {meta['score_label']}")
+            print(f"  alpha_selected = {_fmt_alpha(meta['alpha_selected'])}")
+            print(f"  outer train NRMSE = {meta['outer_train_nrmse']:.6g}")
+            print(f"  outer val NRMSE = {meta['outer_val_nrmse']:.6g}")
+            print(f"  outer test NRMSE = {meta['outer_test_nrmse']:.6g}")
+            print(f"  outer cond_ridge = {meta['outer_cond_ridge']:.6g}")
+            if meta["uses_outer_val_for_selection"]:
+                print("  NOTE: outer VAL here is optimistic, because it was used for alpha selection.")
+            print("-" * 100)
+
+    # ------------------------------------------------------------------
+    # Графики
+    # ------------------------------------------------------------------
+    if show_plots:
+        colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
+        if not colors:
+            colors = ["C0", "C1", "C2", "C3", "C4", "C5", "C6"]
+
+        method_items = list(methods.items())
+        color_map = {name: colors[i % len(colors)] for i, (name, _) in enumerate(method_items)}
+
+        col2 = float(globals().get("COL2", 183.0 / 25.4))
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(col2, col2 * 1.15),
+            constrained_layout=True,
+        )
+        ax1, ax2, ax3 = axes
+
+        def _alpha_lines() -> list[tuple[str, float, dict]]:
+            out = []
+            styles = [
+                dict(linestyle="--", linewidth=1.8),
+                dict(linestyle="-.", linewidth=1.8),
+                dict(linestyle=":", linewidth=2.2),
+                dict(linestyle=(0, (3, 1, 1, 1)), linewidth=1.8),
+                dict(linestyle=(0, (5, 2)), linewidth=1.8),
+            ]
+            j = 0
+            for name, meta in method_items:
+                aval = meta["alpha_selected"]
+                if aval is None or not np.isfinite(aval):
+                    continue
+                st = styles[j % len(styles)].copy()
+                out.append((name, float(aval), st))
+                j += 1
+            return out
+
+        alpha_lines = _alpha_lines()
+
+        finite_for_ylim = []
+        for name, meta in method_items:
+            score_mean = np.asarray(meta["score_mean"], dtype=np.float64)
+            score_se = np.asarray(meta["score_se"], dtype=np.float64)
+            score_band_lo = np.asarray(
+                meta.get("score_band_lo", np.full(alpha_grid.size, np.nan)),
+                dtype=np.float64,
+            )
+            score_band_hi = np.asarray(
+                meta.get("score_band_hi", np.full(alpha_grid.size, np.nan)),
+                dtype=np.float64,
+            )
+
+            m = np.isfinite(score_mean) & (score_mean > 0.0)
+            if not np.any(m):
+                continue
+
+            if normalize_selection_scores:
+                base = float(np.min(score_mean[m]))
+                y = score_mean / base
+
+                use_custom_band = np.any(np.isfinite(score_band_lo)) and np.any(np.isfinite(score_band_hi))
+                if use_custom_band:
+                    y_lo = score_band_lo / base
+                    y_hi = score_band_hi / base
+                else:
+                    y_lo = (score_mean - np.nan_to_num(score_se, nan=0.0)) / base
+                    y_hi = (score_mean + np.nan_to_num(score_se, nan=0.0)) / base
+            else:
+                y = score_mean.copy()
+
+                use_custom_band = np.any(np.isfinite(score_band_lo)) and np.any(np.isfinite(score_band_hi))
+                if use_custom_band:
+                    y_lo = score_band_lo.copy()
+                    y_hi = score_band_hi.copy()
+                else:
+                    y_lo = score_mean - np.nan_to_num(score_se, nan=0.0)
+                    y_hi = score_mean + np.nan_to_num(score_se, nan=0.0)
+
+            y = np.where(np.isfinite(y) & (y > 0.0), y, np.nan)
+            y_lo = np.where(np.isfinite(y_lo) & (y_lo > 0.0), y_lo, np.nan)
+            y_hi = np.where(np.isfinite(y_hi) & (y_hi > 0.0), y_hi, np.nan)
+
+            if np.any(np.isfinite(y_lo)) and np.any(np.isfinite(y_hi)):
+                ax1.fill_between(alpha_grid, y_lo, y_hi, color=color_map[name], alpha=0.18)
+
+            ax1.loglog(
+                alpha_grid,
+                y,
+                marker="o",
+                linewidth=1.6,
+                markersize=3.5,
+                label=f"{meta['short_label']}: {meta['score_label']}",
+                color=color_map[name],
+            )
+
+            yy = y[np.isfinite(y)]
+            if yy.size:
+                finite_for_ylim.extend(yy.tolist())
+
+        for name, aval, st in alpha_lines:
+            ax1.axvline(
+                aval,
+                color=color_map[name],
+                alpha=0.9,
+                **st,
+            )
+
+        if finite_for_ylim:
+            finite_for_ylim = np.asarray(finite_for_ylim, dtype=np.float64)
+            finite_for_ylim = finite_for_ylim[np.isfinite(finite_for_ylim) & (finite_for_ylim > 0.0)]
+            if finite_for_ylim.size:
+                y_min = float(np.min(finite_for_ylim))
+                q_clip = float(selection_score_clip_quantile)
+                q_clip = min(max(q_clip, 0.8), 1.0)
+                y_max = float(np.quantile(finite_for_ylim, q_clip))
+                if y_max <= y_min:
+                    y_max = float(np.max(finite_for_ylim))
+                if y_max > y_min:
+                    ax1.set_ylim(max(y_min * 0.9, eps), y_max * 1.1)
+
+        ax1.set_xlim(float(alpha_grid[0]), float(alpha_grid[-1]))
+        ax1.set_ylabel("selection score" if not normalize_selection_scores else "normalized selection score")
+        ax1.set_title(title, loc="left")
+        ax1.grid(True, which="both", linewidth=0.6)
+        ax1.legend(loc="best", fontsize=9)
+
+        ax2.loglog(alpha_grid, np.maximum(outer["nrmse_train"], eps), marker="o", linewidth=1.6, label="outer train")
+        ax2.loglog(alpha_grid, np.maximum(outer["nrmse_val"], eps), marker="o", linewidth=1.6, label="outer val")
+        ax2.loglog(alpha_grid, np.maximum(outer["nrmse_test"], eps), marker="o", linewidth=1.6, label="outer test")
+
+        for name, aval, st in alpha_lines:
+            ax2.axvline(
+                aval,
+                color=color_map[name],
+                alpha=0.9,
+                **st,
+            )
+
+        ax2.set_xlim(float(alpha_grid[0]), float(alpha_grid[-1]))
+        ax2.set_xlabel(r"ridge regularization $\alpha$")
+        ax2.set_ylabel("outer NRMSE")
+        ax2.set_title("Final refit on full outer TRAIN", loc="left")
+        ax2.grid(True, which="both", linewidth=0.6)
+        ax2.legend(loc="best", fontsize=9)
+
+        valid_names = [name for name, meta in method_items if meta["alpha_selected"] is not None]
+        x_pos = np.arange(len(valid_names), dtype=int)
+        y_train_sel = [methods[name]["outer_train_nrmse"] for name in valid_names]
+        y_val_sel = [methods[name]["outer_val_nrmse"] for name in valid_names]
+        y_test_sel = [methods[name]["outer_test_nrmse"] for name in valid_names]
+
+        if len(valid_names) > 0:
+            ax3.plot(x_pos, y_train_sel, marker="o", linewidth=1.6, label="outer train")
+            ax3.plot(x_pos, y_val_sel, marker="s", linewidth=1.6, label="outer val")
+            ax3.plot(x_pos, y_test_sel, marker="^", linewidth=1.6, label="outer test")
+
+            xticklabels = [
+                f"{methods[name]['short_label']}\nα={_fmt_alpha(methods[name]['alpha_selected'])}"
+                for name in valid_names
+            ]
+            ax3.set_xticks(x_pos)
+            ax3.set_xticklabels(xticklabels, rotation=0, ha="center", fontsize=9)
+            ax3.set_xlim(-0.2, len(valid_names) - 0.8 if len(valid_names) > 1 else 0.2)
+        else:
+            ax3.set_xticks([])
+
+        ax3.set_ylabel("NRMSE")
+        ax3.set_title("Selected alpha -> outer metrics", loc="left")
+        ax3.grid(True, which="both", linewidth=0.6)
+        ax3.legend(loc="best", fontsize=9)
+        ax3.set_xlabel("selection method")
+
+        plt.show()
+
+    return {
+        "alpha_grid": alpha_grid,
+        "selection_rule": selection_rule,
+        "normalize_selection_scores": bool(normalize_selection_scores),
+        "outer_curves": outer,
+        "methods": methods,
+        "outer_split_sizes": {
+            "train": n_tr,
+            "val": n_va,
+            "test": n_te,
+        },
+        "params": {
+            "add_bias": bool(add_bias),
+            "old_val_blocks": int(old_val_blocks),
+            "old_tail_blocks": int(old_tail_blocks),
+            "old_tail_frac": float(old_tail_frac),
+            "rolling_folds": int(rolling_folds),
+            "rolling_min_train_blocks": int(rolling_min_train_blocks),
+            "buffered_folds": int(buffered_folds),
+            "buffered_buffer_size": int(m_buf),
+            "selection_score_clip_quantile": float(selection_score_clip_quantile),
+        },
+    }

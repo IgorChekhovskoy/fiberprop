@@ -1,5 +1,11 @@
 from __future__ import annotations
 import os
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 from copy import deepcopy
 from datetime import datetime
 from typing import Optional, Union
@@ -20,10 +26,40 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 
-from scripts.mcf_reservoir_computing.mcf_auxiliary_functions import calc_p_pump_per_core_from_slm, \
-    calc_g0_psat_from_p_pump_josab, nrmse, sha256_of_json, CACHE_DIR, json_dumps_compact, \
-    learning_curve_for_result_plotly, plot_laser_gain_curve_from_params, MM, COL1, COL15, COL2, apply_readout, \
-    ridge_alpha_sweep_diagnostics, ridge_alpha_selection_compare_diagnostics
+from scripts.mcf_reservoir_computing.mcf_auxiliary_functions import (
+    calc_p_pump_per_core_from_slm,
+    calc_g0_psat_from_p_pump_josab,
+    nrmse,
+    sha256_of_json,
+    CACHE_DIR,
+    json_dumps_compact,
+    learning_curve_for_result_plotly,
+    plot_laser_gain_curve_from_params,
+    apply_readout,
+    ridge_alpha_sweep_diagnostics,
+    ridge_alpha_selection_compare_diagnostics
+)
+
+from scripts.mcf_reservoir_computing.mcf_plot_functions import (
+    debug_plot_input_overview,
+    debug_plot_mg_attractor,
+    debug_plot_readout_train_val_test,
+    debug_plot_post_training_comparison,
+    plot_combined_csv_results,
+    plot_fit_predict_scatter,
+    update_plots_and_save,
+)
+
+try:
+    from scripts.mcf_reservoir_computing.mcf_optimized_regimes import (
+        single_params as LOCAL_SINGLE_PARAMS,
+        optuna_base_params as LOCAL_OPTUNA_BASE_PARAMS,
+        optuna_param_space as LOCAL_OPTUNA_PARAM_SPACE,
+    )
+except ImportError:
+    LOCAL_SINGLE_PARAMS = {}
+    LOCAL_OPTUNA_BASE_PARAMS = {}
+    LOCAL_OPTUNA_PARAM_SPACE = None
 
 STYLE_PATH = Path(__file__).with_name("styles") / "mcf.mplstyle"
 plt.style.use(str(STYLE_PATH))
@@ -233,7 +269,7 @@ def generate_ase_noise(
         lambda0_um: float,
         g0_array: tuple[float, ...] | np.ndarray,
         fiber_length_m: float,
-        nf_db: float = 5.0,
+        nf_db: float | None = 5.0,
         optical_bw_hz: float = 12.5e9,
         n_polarizations: int = 1,
         seed: int | None = None,
@@ -257,9 +293,17 @@ def generate_ase_noise(
         P_noise = S_ASE * B_eff,   B_eff = min(optical_bw_hz, 1/dt),
     и генерируем комплексный гауссов шум так, что E|n|^2 = P_noise.
 
+    Логика включения/выключения шума:
+        - nf_db is None -> шума нет;
+        - если nf_db меньше минимально допустимого значения, соответствующего n_sp = 1,
+          выбрасывается warning и возвращается нулевой шум;
+        - иначе ASE считается как обычно.
+
     Для воспроизводимости используется SeedSequence([seed, step_index]): фиксированный seed ⇒ разные шумы на разных
     оборотах (step_index), но полностью повторяемые при повторном запуске.
     """
+    import warnings
+
     # --- проверки ---
     dt_s = float(dt_ps) * 1e-12
     if dt_s <= 0.0:
@@ -270,6 +314,9 @@ def generate_ase_noise(
         return np.zeros((max(C, 0), max(T, 0)), dtype=dtype)
 
     if float(optical_bw_hz) <= 0.0:
+        return np.zeros((C, T), dtype=dtype)
+
+    if nf_db is None:
         return np.zeros((C, T), dtype=dtype)
 
     # --- константы ---
@@ -291,16 +338,36 @@ def generate_ase_noise(
     G = np.exp(np.maximum(g0, 0.0) * float(fiber_length_m))
     Gm1 = np.maximum(G - 1.0, 0.0)
 
+    gain_mask = Gm1 > 0.0
+    if not np.any(gain_mask):
+        return np.zeros((C, T), dtype=dtype)
+
+    # --- минимально допустимый nf_db из условия n_sp = 1 ---
+    # NF_lin_min = (2 * 1 * (G - 1) + 1) / G = 2 - 1/G
+    nf_lin_min = 2.0 - 1.0 / G[gain_mask]
+    nf_db_min_per_core = 10.0 * np.log10(nf_lin_min)
+    nf_db_min = float(np.max(nf_db_min_per_core))
+
+    nf_db = float(nf_db)
+    if nf_db < nf_db_min:
+        warnings.warn(
+            "ASE noise disabled: requested nf_db={:.6g} dB is below the minimum allowed value "
+            "{:.6g} dB for the current gain; set nf_db >= {:.6g} dB to enable noise.".format(
+                nf_db, nf_db_min, nf_db_min
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return np.zeros((C, T), dtype=dtype)
+
     # --- n_sp и PSD ASE ---
-    nf_lin = 10.0 ** (float(nf_db) / 10.0)
+    nf_lin = 10.0 ** (nf_db / 10.0)
 
     n_sp = np.zeros_like(G, dtype=float)
-    gain_mask = Gm1 > 0.0
-    if np.any(gain_mask):
-        n_sp[gain_mask] = (nf_lin * G[gain_mask] - 1.0) / (2.0 * Gm1[gain_mask])
+    n_sp[gain_mask] = (nf_lin * G[gain_mask] - 1.0) / (2.0 * Gm1[gain_mask])
 
-        # Физический минимум n_sp = 1 (полная инверсия).
-        n_sp[gain_mask] = np.maximum(n_sp[gain_mask], 1.0)
+    # На случай численной погрешности у самой границы.
+    n_sp[gain_mask] = np.maximum(n_sp[gain_mask], 1.0)
 
     nu_hz = c / (float(lambda0_um) * 1e-6)
     s_ase_w_per_hz = float(n_polarizations) * n_sp * h * nu_hz * Gm1  # (C,)
@@ -1064,6 +1131,7 @@ def train_ridge(
         *,
         X_val: Optional[np.ndarray] = None,
         y_val: Optional[np.ndarray] = None,
+        alpha_selection_rule: str = "val_max_plateau_0.2",
 ):
     if add_bias:
         Xb = np.hstack([X, np.ones((X.shape[0], 1))])
@@ -1093,9 +1161,13 @@ def train_ridge(
     s_min2 = s_min * s_min
 
     # -------------------------------------------------------------------------
-    # Auto alpha selection: val_max_plateau_0.2 (block-wise worst-case) + cond cap.
+    # Auto alpha selection: selectable rule.
     #
-    # Summary:
+    # Available rules:
+    #   - "val_max_plateau_0.2"  : old/default rule.
+    #   - "val_1se_mean"         : block-wise validation mean +/- SE rule.
+    #
+    # Summary for "val_max_plateau_0.2":
     #   - Split val into sequential blocks (time order preserved).
     #   - For each alpha: compute block-wise MSE, take max over blocks, then take sqrt and normalize:
     #         e_max(alpha) = sqrt( max_b MSE_b(alpha) / Var_global(val) )
@@ -1104,7 +1176,24 @@ def train_ridge(
     #         e_max(alpha) <= (1 + max_rtol) * min_alpha e_max(alpha)
     #     ("right edge of plateau" for stability).
     #   - Enforce numerical stability by requiring cond_ridge(alpha) <= max_cond when possible,
-    #     and finally alpha = max(alpha, alpha_needed_for_max_cond).
+    #     but keep the final value inside the shared alpha corridor when possible.
+    #
+    # Summary for "val_1se_mean":
+    #   - Split val into sequential blocks (time order preserved).
+    #   - For each alpha: compute block-wise NRMSE with global validation sigma.
+    #   - Compute mean and standard error over validation blocks:
+    #         mean(alpha), se(alpha).
+    #   - Select the largest alpha satisfying:
+    #         mean(alpha) <= min_alpha mean(alpha) + se(alpha_min)
+    #     ("one standard error" rule: more regularized model within 1SE of the best mean val score).
+    #   - alpha_cond is used only to protect the lower edge of the search corridor.
+    #
+    # Shared safety corridor for both auto rules:
+    #   - Do not search in the degenerate region alpha comparable to or larger than s_max^2.
+    #   - Do not search too close to zero when the design matrix is ill-conditioned.
+    #   - Default corridor:
+    #         max(1e-8 * s_max^2, alpha_cond) <= alpha <= 1e-2 * s_max^2
+    #     with conflict handling if alpha_cond is larger than the upper cap.
     #
     # References (high-level motivation):
     #   - Blocked CV for dependent (temporal/spatial) data:
@@ -1112,9 +1201,6 @@ def train_ridge(
     #       Bergmeir, Hyndman, Koo 2018 (time-series CV): https://robjhyndman.com/papers/cv-wp.pdf
     #   - Train-only ridge parameter selection (fallback without val): GCV
     #       Golub, Heath, Wahba 1979: https://pages.stat.wisc.edu/~wahba/ftp1/oldie/golub.heath.wahba.pdf
-    #   - Worst-case / stability-aware hyperparameter selection (general context):
-    #       Pfohl et al. 2022 (worst-case model selection): https://pmc.ncbi.nlm.nih.gov/articles/PMC8885701/
-    #       Cory-Wright & Gómez 2025 (stability-regularized CV): https://optimization-online.org/wp-content/uploads/2025/05/Stability_Adjusted_Cross_Validation_for_NeurIPS_2025.pdf
     # -------------------------------------------------------------------------
 
     max_cond = 1e5
@@ -1124,12 +1210,43 @@ def train_ridge(
     auto_min_decades = 12.0
     auto_lo_factor_vs_smax2 = 1e-12
     auto_hi_factor_vs_smax2 = 1e3
+    alpha_min_factor_vs_smax2 = 1e-8
+    alpha_max_factor_vs_smax2 = 1e-2
+
+    alpha_selection_rule = str(alpha_selection_rule).strip().lower()
+    if alpha_selection_rule in ("old", "default", "val_max_plateau", "val_max_plateau_0.2"):
+        alpha_selection_rule = "val_max_plateau_0.2"
+    elif alpha_selection_rule in ("1se", "val_1se", "val_1se_mean"):
+        alpha_selection_rule = "val_1se_mean"
+    else:
+        raise ValueError(
+            "alpha_selection_rule must be one of "
+            "{'val_max_plateau_0.2', 'val_1se_mean'}"
+        )
 
     alpha_is_auto = False
     if alpha is None:
         alpha_is_auto = True
     elif isinstance(alpha, str):
-        alpha_is_auto = (alpha.strip().lower() == "auto")
+        alpha_rule = alpha.strip().lower()
+        if alpha_rule in ("auto", ""):
+            alpha_is_auto = True
+        elif alpha_rule in ("old", "default", "val_max_plateau", "val_max_plateau_0.2"):
+            alpha_is_auto = True
+            alpha_selection_rule = "val_max_plateau_0.2"
+        elif alpha_rule in ("1se", "val_1se", "val_1se_mean"):
+            alpha_is_auto = True
+            alpha_selection_rule = "val_1se_mean"
+        else:
+            try:
+                alpha = float(alpha_rule)
+                alpha_is_auto = (not np.isfinite(alpha)) or (alpha <= 0.0)
+            except Exception:
+                raise ValueError(
+                    "alpha as str must be one of "
+                    "{'auto', 'val_max_plateau_0.2', 'val_1se_mean'} "
+                    "or a string convertible to float"
+                )
     else:
         try:
             a0 = float(alpha)
@@ -1172,6 +1289,30 @@ def train_ridge(
 
     alpha_cond = _alpha_needed_for_max_cond(max_cond)
 
+    def _alpha_auto_upper() -> float:
+        if s_max2 <= 0.0:
+            return float("inf")
+
+        return float(s_max2) * float(alpha_max_factor_vs_smax2)
+
+    def _alpha_auto_lower() -> float:
+        if s_max2 <= 0.0:
+            return np.finfo(np.float64).tiny
+
+        lower = float(s_max2) * float(alpha_min_factor_vs_smax2)
+
+        if np.isfinite(alpha_cond) and alpha_cond > 0.0:
+            lower = max(lower, float(alpha_cond))
+
+        upper = _alpha_auto_upper()
+        if np.isfinite(upper):
+            lower = min(lower, float(upper))
+
+        return max(lower, np.finfo(np.float64).tiny)
+
+    alpha_auto_upper = _alpha_auto_upper()
+    alpha_auto_lower = _alpha_auto_lower()
+
     def _compute_W_for_alpha(a: float) -> np.ndarray:
         a = float(a)
         denom = s2 + a
@@ -1191,9 +1332,14 @@ def train_ridge(
         else:
             lo, hi = 1e-12, 1e3
 
-        if np.isfinite(alpha_cond) and alpha_cond > 0.0:
-            lo = min(lo, float(alpha_cond))
-            hi = max(hi, float(alpha_cond))
+        if np.isfinite(alpha_auto_lower):
+            lo = max(lo, float(alpha_auto_lower))
+
+        if np.isfinite(alpha_auto_upper):
+            hi = min(hi, float(alpha_auto_upper))
+
+        if hi < lo:
+            hi = lo
 
         grid = np.logspace(np.log10(lo), np.log10(hi), int(max(2, n_alpha))).astype(np.float64)
         return np.unique(grid)
@@ -1260,7 +1406,56 @@ def train_ridge(
         # requested aggregation: max over block MSE, then sqrt
         return float(np.sqrt(max_mse / var_global))
 
+    def _val_block_mean_se(a: float, blocks: list[slice]) -> tuple[float, float]:
+        W_loc = _compute_W_for_alpha(a)
+        y_hat = apply_readout(X_val, W_loc, add_bias=add_bias)
+
+        y_true = np.asarray(y_val, dtype=np.float64)
+        y_pred = np.asarray(y_hat, dtype=np.float64)
+
+        n = min(int(y_true.shape[0]), int(y_pred.shape[0]))
+        if n < 2:
+            return float("nan"), float("nan")
+
+        y_true = y_true[:n]
+        y_pred = y_pred[:n]
+
+        sigma = float(np.std(y_true.reshape(-1)))
+        if not np.isfinite(sigma) or sigma < 1e-12:
+            return float("nan"), float("nan")
+
+        scores = []
+        for sl in blocks:
+            a0, b0 = int(sl.start or 0), int(sl.stop or 0)
+            a0 = max(0, min(a0, n))
+            b0 = max(0, min(b0, n))
+            if b0 - a0 < 2:
+                continue
+
+            d = y_true[a0:b0] - y_pred[a0:b0]
+            rmse_b = float(np.sqrt(np.mean(d * d)))
+            scores.append(rmse_b / sigma)
+
+        if not scores:
+            return float("nan"), float("nan")
+
+        scores = np.asarray(scores, dtype=np.float64)
+        m = np.isfinite(scores)
+        if not np.any(m):
+            return float("nan"), float("nan")
+
+        scores = scores[m]
+        mean_score = float(np.mean(scores))
+        if scores.size >= 2:
+            se_score = float(np.std(scores, ddof=1) / np.sqrt(scores.size))
+        else:
+            se_score = float("nan")
+
+        return mean_score, se_score
+
     # ---- choose alpha ----
+    alpha_selection_rule_used = "fixed"
+
     if alpha_is_auto:
         use_val = (
             X_val is not None and y_val is not None and
@@ -1271,7 +1466,7 @@ def train_ridge(
 
         grid = _alpha_grid_auto()
 
-        if use_val:
+        if use_val and alpha_selection_rule == "val_max_plateau_0.2":
             blocks = _block_slices(int(X_val.shape[0]), int(val_blocks))
 
             yv = np.asarray(y_val, dtype=np.float64).reshape(-1)
@@ -1284,7 +1479,8 @@ def train_ridge(
             m = np.isfinite(emax)
 
             if not np.any(m):
-                alpha = float(alpha_cond) if np.isfinite(alpha_cond) and alpha_cond > 0.0 else float(grid[0])
+                alpha = float(grid[0])
+                alpha_selection_rule_used = "old_grid_fallback"
             else:
                 e_min = float(np.min(emax[m]))
                 thr = (1.0 + float(max_rtol)) * e_min
@@ -1292,32 +1488,93 @@ def train_ridge(
 
                 if not np.any(ok):
                     alpha = float(grid[int(np.nanargmin(emax))])
+                    alpha_selection_rule_used = "old_val_max_min_fallback"
                 else:
-                    # prefer alphas that already satisfy the cond cap (alpha >= alpha_cond), if any in plateau
-                    if np.isfinite(alpha_cond) and alpha_cond > 0.0:
-                        ok2 = ok & (grid >= float(alpha_cond))
-                        alpha = float(np.max(grid[ok2])) if np.any(ok2) else float(np.max(grid[ok]))
-                    else:
-                        alpha = float(np.max(grid[ok]))
+                    alpha = float(np.max(grid[ok]))
+                    alpha_selection_rule_used = "val_max_plateau_0.2"
+
+            if alpha < float(alpha_auto_lower):
+                alpha = float(alpha_auto_lower)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_floor"
+
+            if np.isfinite(alpha_auto_upper) and alpha > float(alpha_auto_upper):
+                alpha = float(alpha_auto_upper)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_cap"
+
+        elif use_val and alpha_selection_rule == "val_1se_mean":
+            blocks = _block_slices(int(X_val.shape[0]), int(val_blocks))
+            val_mean = []
+            val_se = []
+
+            for a in grid:
+                mu_a, se_a = _val_block_mean_se(float(a), blocks)
+                val_mean.append(mu_a)
+                val_se.append(se_a)
+
+            val_mean = np.asarray(val_mean, dtype=np.float64)
+            val_se = np.asarray(val_se, dtype=np.float64)
+
+            m = np.isfinite(val_mean) & np.isfinite(val_se)
+
+            if not np.any(m):
+                gcv = np.array([_gcv_score(a) for a in grid], dtype=np.float64)
+                m_gcv = np.isfinite(gcv)
+                if np.any(m_gcv):
+                    alpha = float(grid[int(np.arange(grid.size)[m_gcv][np.argmin(gcv[m_gcv])])])
+                    alpha_selection_rule_used = "gcv_fallback"
+                else:
+                    alpha = float(grid[0])
+                    alpha_selection_rule_used = "grid_min_fallback"
+            else:
+                idx_min = int(np.argmin(val_mean[m]))
+                idx_min = int(np.arange(val_mean.size)[m][idx_min])
+
+                threshold = float(val_mean[idx_min] + val_se[idx_min])
+                ok = m & (val_mean <= threshold)
+
+                if np.any(ok):
+                    alpha = float(np.max(grid[ok]))
+                    alpha_selection_rule_used = "val_1se_mean"
+                else:
+                    alpha = float(grid[idx_min])
+                    alpha_selection_rule_used = "val_mean_min_fallback"
+
+            if alpha < float(alpha_auto_lower):
+                alpha = float(alpha_auto_lower)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_floor"
+
+            if np.isfinite(alpha_auto_upper) and alpha > float(alpha_auto_upper):
+                alpha = float(alpha_auto_upper)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_cap"
+
         else:
             # fallback: train-only GCV (no val supplied)
             gcv = np.array([_gcv_score(a) for a in grid], dtype=np.float64)
             m = np.isfinite(gcv)
             if np.any(m):
-                alpha = float(grid[int(np.nanargmin(gcv))])
+                alpha = float(grid[int(np.arange(grid.size)[m][np.argmin(gcv[m])])])
+                alpha_selection_rule_used = "gcv"
             else:
-                alpha = float(alpha_cond) if np.isfinite(alpha_cond) and alpha_cond > 0.0 else float(grid[0])
+                alpha = float(grid[0])
+                alpha_selection_rule_used = "grid_fallback"
+
+            if alpha < float(alpha_auto_lower):
+                alpha = float(alpha_auto_lower)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_floor"
+
+            if np.isfinite(alpha_auto_upper) and alpha > float(alpha_auto_upper):
+                alpha = float(alpha_auto_upper)
+                alpha_selection_rule_used = f"{alpha_selection_rule_used}_alpha_cap"
     else:
         alpha = float(alpha)
         if not np.isfinite(alpha) or alpha < 0.0:
             alpha = 0.0
 
-    # final stability clamp by cond cap
-    if np.isfinite(alpha_cond) and alpha_cond > 0.0:
-        alpha = float(max(alpha, alpha_cond))
-
     cond_ridge = _cond_ridge(alpha)
-    # print(f"[train_ridge] alpha={alpha:.6g}  cond_ridge={cond_ridge:.6g}")
+    # print(
+    #     f"[train_ridge] alpha={alpha:.6g}  cond_ridge={cond_ridge:.6g}  "
+    #     f"alpha_rule={alpha_selection_rule_used}"
+    # )
 
     # -------------------------------------------------------------------------
     # Конец блока подбора alpha
@@ -1336,6 +1593,7 @@ def train_ridge(
 # =========================
 
 MaskVariant = Literal["temporal_same_all_cores", "temporal_unique_per_core", "spatial_only"]
+TaskName = Literal["mackey_glass", "narma10"]
 
 
 # "temporal_same_all_cores"     → одна и та же временная маска для всех ядер
@@ -1362,6 +1620,18 @@ class MGConfig:
     initial_condition: float = 1.2
     dt: float = 1.0
     warmup: int = 300
+
+
+@dataclass
+class NARMA10Config:
+    """
+    Конфиг генерации задачи NARMA10.
+    """
+    t_size: int
+    warmup: int = 100
+    seed: Optional[int] = 42
+    u_low: float = 0.0
+    u_high: float = 0.5
 
 
 @dataclass
@@ -1452,7 +1722,8 @@ class TrainingConfig:
 @dataclass
 class ExperimentConfig:
     core_count: int
-    mg: MGConfig
+    task_name: TaskName
+    task_cfg: Union[MGConfig, NARMA10Config]
     mask: MaskConfig
     reservoir: ReservoirConfig
     training: TrainingConfig
@@ -1462,101 +1733,6 @@ class ExperimentConfig:
 # =========================
 # Графики
 # =========================
-
-def _plot_temporal_masks(ax, masks: np.ndarray, mask_kind: str):
-    """Heatmap временных масок: ось X — индекс внутри символа, ось Y — ядро."""
-    C, M = masks.shape
-    im = ax.imshow(masks, aspect="auto", interpolation="nearest",
-                   extent=[0, M, C, 0], cmap="coolwarm")
-    ax.set_title(f"Temporal masks (size={M})", loc="left")
-    ax.set_xlabel("mask element index")
-    ax.set_ylabel("core index")
-    return im
-
-
-def _plot_spatial_weights(ax, weights: np.ndarray, title: str = "Spatial weights by cores"):
-    """Bar-чарт по ядрам."""
-    C = weights.shape[0]
-    ax.bar(np.arange(C), weights, width=0.7)
-    ax.set_title(title, loc="left")
-    ax.set_xlabel("core index")
-    ax.set_ylabel("weight")
-
-
-def _reconstruct_masks_or_weights(core_count: int,
-                                  variant: str,
-                                  mask_size: int,
-                                  mask_kind: str,
-                                  seed: int | None) -> dict:
-    """
-    Возвращает один из словарей:
-      • {'type':'temporal', 'masks': (C,M)}        — для temporal_* (без каких-либо 'weights')
-      • {'type':'spatial',  'weights': (C,)}       — для spatial_only
-
-    Для spatial_only в идеальном (lossless) случае нормируем weights так, чтобы sum(weights**2) = 1.
-    Тогда суммарная мощность входа не зависит от core_count, а gain_in задаёт общий масштаб поля.
-    """
-    rng = np.random.default_rng(seed)
-
-    if variant == "temporal_unique_per_core":
-        masks = np.empty((core_count, mask_size), dtype=float)
-        for c in range(core_count):
-            masks[c] = create_mask(mask_size, rng, kind=mask_kind)
-        # НИКАКИХ spatial weights для temporal-режимов
-        return {"type": "temporal", "masks": masks}
-
-    if variant == "temporal_same_all_cores":
-        mask = create_mask(mask_size, rng, kind=mask_kind)
-        masks = np.tile(mask, (core_count, 1))
-        # НИКАКИХ spatial weights для temporal-режимов
-        return {"type": "temporal", "masks": masks}
-
-    if variant == "spatial_only":
-        # В spatial_only подаём постоянные веса на ядра (коэффициенты по полю).
-        # Идеальный SLM: сохраняем суммарную мощность -> нормировка по L2.
-        weights = rng.uniform(0.0, 1.0, size=core_count)
-        w_norm = float(np.linalg.norm(weights))
-        if w_norm > 0.0:
-            weights = weights / w_norm
-        else:
-            weights = np.zeros(core_count, dtype=float)
-            weights[0] = 1.0
-        return {"type": "spatial", "weights": weights}
-
-    raise ValueError(f"Unknown variant: {variant}")
-
-
-def _default_fig_path(basename: str) -> Path:
-    fmt = str(plt.rcParams.get("savefig.format", "png")).lower()
-    out_dir = Path(__file__).parent  # сохраняем рядом со скриптом
-    out_dir.mkdir(parents=True, exist_ok=True)
-    p = out_dir / f"{basename}.{fmt}"
-    if p.exists():
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        p = out_dir / f"{basename}_{ts}.{fmt}"
-    return p
-
-
-def _maybe_savefig(fig,
-                   basename: str,
-                   explicit_path: Optional[Union[str, Path]] = None,
-                   enabled: Optional[bool] = None) -> Optional[Path]:
-    """
-    explicit_path задан → сохраняем туда (игнорируем enabled).
-    explicit_path не задан → сохраняем в <папка скрипта>/<basename>.<fmt>, только если enabled=True.
-    Параметры сохранения полностью из rcParams (формат, dpi, bbox, прозрачность и т.д.).
-    """
-    try:
-        if explicit_path is not None:
-            fig.savefig(explicit_path)
-            return Path(explicit_path)
-        if enabled:
-            p = _default_fig_path(basename)
-            fig.savefig(p)
-            return p
-    except Exception as e:
-        print(f"[warn] savefig failed: {e}")
-    return None
 
 
 def get_washout_samples(cfg: ExperimentConfig) -> int:
@@ -1582,477 +1758,184 @@ def get_washout_samples(cfg: ExperimentConfig) -> int:
     return int(auto_washout_samples(cfg.reservoir, eps=1e-3, min_loops=1, max_loops=3))
 
 
-def debug_plot_input_overview(cfg, mg_series_used: np.ndarray):
-    """
-    Рисует:
-      1) Полный ряд MG (нормированный так же, как используется в расчёте),
-         с пометками: warmup, shift, washout, train/val/test.
-      2) Маски (по времени) для каждого ядра ИЛИ пространственные веса (bar),
-         в зависимости от варианта.
-    """
-    # --- восстановим полный MG, чтобы показать warmup слева
-    warmup = getattr(cfg.mg, "warmup", 0)
-    x_full = mackey_glass(cfg.mg.t_size + warmup,
-                          tau=cfg.mg.tau, n=cfg.mg.n, beta=cfg.mg.beta, gamma=cfg.mg.gamma,
-                          initial_condition=cfg.mg.initial_condition, dt=cfg.mg.dt)
+def task_debug_meta(task_name: TaskName) -> dict[str, str]:
+    task_name = str(task_name)
 
-    # Нормируем ровно как в коде: по куску после warmup
-    x_used = x_full[warmup:].astype(float)
-    mu, sigma = float(np.mean(x_used)), float(np.std(x_used) + 1e-12)
-    x_full_norm = (x_full - mu) / sigma
+    if task_name == "mackey_glass":
+        return {
+            "task_title": "Mackey-Glass series",
+            "input_label": "Mackey-Glass series",
+            "target_label": "Mackey-Glass target",
+            "y_label": "normalized amplitude",
+            "prediction_title": "Mackey-Glass series: training and prediction",
+        }
 
-    # Проверим согласованность длины
-    S = int(cfg.mg.t_size)
-    assert mg_series_used.shape[0] == S, "mg_series_used длиной не равно t_size"
+    if task_name == "narma10":
+        return {
+            "task_title": "NARMA10",
+            "input_label": "NARMA10 input",
+            "target_label": "NARMA10 target",
+            "y_label": "normalized amplitude",
+            "prediction_title": "NARMA10: training and prediction",
+        }
 
-    # Проверка: mg_series_used должен совпадать с куском полного ряда после warmup (это те же данные).
-    x_used_norm = x_full_norm[int(warmup):int(warmup) + S]
-    diff = float(np.max(np.abs(x_used_norm.reshape(-1) - mg_series_used.reshape(-1)))) if S > 0 else 0.0
-    if diff > 1e-6:
-        print(f"[WARN] debug_plot_input_overview: mg_series_used != x_full_norm[warmup:] (max|diff|={diff:.3e})")
-
-    # --- индексы сегментов на оси полного ряда (в символах)
-    taps = int(getattr(cfg.training, "taps", 1) or 1)
-    taps_drop = max(0, int(taps) - 1)  # столько символов теряем из-за tapped-state (taps-1)
-    shift_syms = int(getattr(cfg.training, "target_shift", 0) or 0)
-
-    # ЕДИНО: washout → в отсчётах → в символы
-    M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
-    w_samples = get_washout_samples(cfg)
-    w_syms = int(np.ceil(int(w_samples) / max(1, int(M_eff))))
-
-    # Эффективный хвост под train/val/test (точно как в run_single_experiment):
-    #   y_aligned = y[(taps-1 + shift):], затем washout в символах
-    align_drop = taps_drop + shift_syms
-    N_eff = max(0, int(S) - int(align_drop) - int(w_syms))
-    train_frac = float(getattr(cfg.training, "train_frac", 0.6))
-    val_frac = float(getattr(cfg.training, "val_frac", 0.2))
-    sl_train, sl_val, sl_test = split_train_val_test(N_eff, train_frac, val_frac)
-    n_train = int(sl_train.stop - sl_train.start)
-    n_val = int(sl_val.stop - sl_val.start)
-    n_test = int(sl_test.stop - sl_test.start)
-
-    # Границы по полной оси (0..S+warmup) в символах
-    i_warmup_L = 0
-    i_warmup_R = int(warmup)
-
-    # tapped-state: первые (taps-1) символов после warmup не участвуют в обучении (из-за формирования лагов)
-    i_taps_L = i_warmup_R
-    i_taps_R = i_taps_L + int(taps_drop)
-
-    # target shift: сдвиг таргета относительно состояния
-    i_shift_L = i_taps_R
-    i_shift_R = i_shift_L + int(shift_syms)
-
-    i_wash_L = i_shift_R
-    i_wash_R = i_wash_L + int(w_syms)
-
-    i_tr_L = i_wash_R
-    i_tr_R = i_tr_L + int(n_train)
-    i_va_L = i_tr_R
-    i_va_R = i_va_L + int(n_val)
-    i_te_L = i_va_R
-    i_te_R = i_te_L + int(n_test)
-
-    # --- рисуем
-    fig = plt.figure(figsize=(COL2, COL2 * 0.62))  # соотношение ~3:2
-    gs = fig.add_gridspec(2, 1, height_ratios=[2.2, 1.6], hspace=0.35)
-
-    # (1) полный MG с разметкой
-    ax1 = fig.add_subplot(gs[0, 0])
-    t_full = np.arange(x_full_norm.shape[0])
-    ax1.plot(t_full, x_full_norm, label="Mackey-Glass series")  # ← подпись линии
-    ax1.set_xlim(t_full[0], t_full[-1])
-    ax1.margins(x=0.0)
-
-    # Явная граница warmup (на случай, если полоса слишком узкая и визуально теряется)
-    if int(warmup) > 0:
-        ax1.axvline(i_warmup_R, color="k", lw=1, alpha=0.25)
-
-    def span_if(a, b, color, label, alpha=0.18):
-        # рисуем даже для интервала шириной 1 символ (раньше было ≥2)
-        a, b = int(a), int(b)
-        if b - a < 1:
-            return False
-        a_plot = max(a, 0)
-        b_plot = min(b, int(t_full[-1]) + 1)
-        if b_plot - a_plot < 1:
-            return False
-        ax1.axvspan(a_plot, b_plot, color=color, alpha=alpha, label=label)
-        return True
-
-    shown = []
-    if span_if(i_warmup_L, i_warmup_R, "#888888", "warmup"):
-        shown.append("warmup")
-    if taps_drop > 0 and span_if(i_taps_L, i_taps_R, "#17becf", f"taps-1={taps_drop}"):
-        shown.append("taps")
-    if span_if(i_shift_L, i_shift_R, "#1f77b4", "target shift"):
-        shown.append("target shift")
-    if w_syms > 0 and span_if(i_wash_L, i_wash_R, "#ff7f0e", "washout"):
-        shown.append("washout")
-    if span_if(i_tr_L, i_tr_R, "#2ca02c", "train"):
-        shown.append("train")
-    if span_if(i_va_L, i_va_R, "#9467bd", "val"):
-        shown.append("val")
-    if span_if(i_te_L, i_te_R, "#d62728", "test"):
-        shown.append("test")
-
-    title_suffix = ("/".join(shown)) if shown else ""
-    ax1.set_title(f"Mackey-Glass series{': ' + title_suffix if title_suffix else ''}", loc="left")
-    ax1.set_xlabel("symbol index")
-    ax1.set_ylabel("normalized amplitude")
-
-    # легенда (линия + зоны)
-    handles, labels = ax1.get_legend_handles_labels()
-    if handles:
-        leg = ax1.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.98, 0.98),
-                         frameon=True)
-        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
-        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
-
-    # (2) маски / пространственные веса
-    masks_info = _reconstruct_masks_or_weights(core_count=cfg.core_count,
-                                               variant=cfg.variant,
-                                               mask_size=cfg.mask.mask_size,
-                                               mask_kind=cfg.mask.mask_kind,
-                                               seed=cfg.mask.seed)
-
-    if masks_info["type"] == "temporal":
-        ax2 = fig.add_subplot(gs[1, 0])
-        im = _plot_temporal_masks(ax2, masks_info["masks"], cfg.mask.mask_kind)
-        cbar = fig.colorbar(im, ax=ax2, fraction=0.46 / 10, pad=0.04)
-        cbar.set_label("mask value")
-    else:
-        ax2 = fig.add_subplot(gs[1, 0])
-        _plot_spatial_weights(ax2, masks_info["weights"], title="Spatial weights by cores")
-
-    _maybe_savefig(fig, f"input_overview_{cfg.variant}_C{cfg.core_count}",
-                   enabled=getattr(cfg.reservoir, "save_figs", False))
-    plt.show()
-
-
-def debug_plot_mg_attractor(cfg,
-                            mg_series_used: np.ndarray,
-                            title: str = "Mackey-Glass attractor (delay embedding)"):
-    """
-    3D-визуализация аттрактора Mackey–Glass по delay-embedding: (x(t), x(t-τ), x(t-2τ)).
-    Сегменты shift/washout/train/val/test рисуются только если их длина ≥ 2.
-    График оформлен под публикации: без сетки/панелей, ortho-проекция, equal-aspect.
-    """
-    from matplotlib.ticker import MaxNLocator
-    import matplotlib.patheffects as pe
-
-    x1d = np.asarray(mg_series_used, dtype=float).ravel()
-    S = x1d.size
-    tau_samples = max(1, int(round(float(cfg.mg.tau) / float(cfg.mg.dt))))
-    off = 2 * tau_samples
-    if S <= off + 1:
-        print(f"debug_plot_mg_attractor: серия короче 2τ (S={S}, 2τ={off}) — пропуск.")
-        return
-
-    # delay-вложение
-    X = x1d[off:]  # x(t)
-    Y = x1d[tau_samples:-tau_samples]  # x(t-τ)
-    Z = x1d[:-off]  # x(t-2τ)
-    L = X.shape[0]
-
-    # границы сегментов в ИНДЕКСАХ mg_series_used (0..S)
-    shift_syms = int(getattr(cfg.training, "target_shift", 0))
-
-    # ЕДИНО: washout в отсчётах → в символы
-    w_samples = get_washout_samples(cfg)
-    M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
-    w_syms = int(np.ceil(w_samples / max(1, int(M_eff))))
-
-    N_eff = S - shift_syms - w_syms
-    n_train = int(N_eff * cfg.training.train_frac) if N_eff > 0 else 0
-    n_val = int(N_eff * cfg.training.val_frac) if N_eff > 0 else 0
-    n_test = max(0, N_eff - n_train - n_val)
-
-    i_shift = (0, max(0, shift_syms))
-    i_wash = (i_shift[1], i_shift[1] + max(0, w_syms))
-    i_tr = (i_wash[1], i_wash[1] + max(0, n_train))
-    i_va = (i_tr[1], i_tr[1] + max(0, n_val))
-    i_te = (i_va[1], min(S, i_va[1] + max(0, n_test)))
-
-    fig = plt.figure(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
-    ax = fig.add_subplot(111, projection="3d")
-
-    ax.set_proj_type('ortho')
-    ax.set_box_aspect((np.ptp(X), np.ptp(Y), np.ptp(Z)))
-    ax.view_init(elev=20, azim=-15)
-    ax.grid(False)
-    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-        axis.pane.fill = False
-        axis.pane.set_edgecolor((0, 0, 0, 0))
-
-    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-        axis.set_major_locator(MaxNLocator(4))
-
-    ax.set_title(title, loc="left")
-    ax.set_xlabel("x(t)")
-    ax.set_ylabel("x(t − τ)")
-    ax.set_zlabel("x(t − 2τ)")
-
-    base_lw = float(plt.rcParams.get("lines.linewidth", 1.0))
-
-    def plot_segment(name, color, bounds, min_len: int = 2):
-        a, b = int(bounds[0]), int(bounds[1])
-        aa, bb = max(a, off), min(b, S)
-        if bb - aa >= min_len:
-            lo = max(0, min(aa - off, L))
-            hi = max(0, min(bb - off, L))
-            if hi - lo >= min_len:
-                (line,) = ax.plot(X[lo:hi], Y[lo:hi], Z[lo:hi], color=color, label=name)
-                line.set_path_effects([
-                    pe.Stroke(linewidth=base_lw * 1.8, foreground='white'),
-                    pe.Normal()
-                ])
-                return True
-        return False
-
-    segments = [
-        ("target shift", "#1f77b4", i_shift),
-        ("washout", "#ff7f0e", i_wash),
-        ("train", "#2ca02c", i_tr),
-        ("val", "#9467bd", i_va),
-        ("test", "#d62728", i_te),
-    ]
-    for name, color, bounds in segments:
-        plot_segment(name, color, bounds)
-
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        uniq = dict(zip(labels, handles))
-        leg = ax.legend(uniq.values(), uniq.keys(),
-                        bbox_to_anchor=(0.02, 0.98), loc="upper left",
-                        frameon=True, title="Segments:")
-        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
-        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
-
-    if getattr(cfg.reservoir, "save_figs", False):
-        p = _default_fig_path(f"mg_attractor_{cfg.variant}_C{cfg.core_count}")
-        try:
-            fig.savefig(p, bbox_inches="tight", pad_inches=0.04)
-        except Exception as e:
-            print(f"[warn] savefig failed: {e}")
-
-    plt.show()
-
-
-def debug_plot_post_training_comparison(cfg,
-                                        y_true: np.ndarray,
-                                        y_pred: np.ndarray,
-                                        title: str = "Comparison: truth vs prediction",
-                                        n_show: int = 2000,
-                                        start: int = 0) -> float:
-    """
-    Рисует сравнение на тесте и возвращает NRMSE по ВСЕМУ переданному сегменту.
-
-    Важно: отображаемое окно (start/n_show) влияет только на картинку, а не на метрику.
-    Это нужно, чтобы NRMSE здесь совпадал с тем, что рисуется/считается по train/val/test в других местах.
-
-    Устойчиво работает при коротких окнах: если точек < 2, вместо линии рисуется маркер,
-    легенда и NRMSE подавляются, а set_xlim не вызывается (чтобы не ловить warning).
-    """
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-
-    N = min(y_true.shape[0], y_pred.shape[0])
-    if N == 0:
-        fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
-        ax.set_title(f"{title}   •   NRMSE=—", loc="left")
-        ax.set_xlabel("symbol index")
-        ax.set_ylabel("MG series value")
-        _maybe_savefig(fig, f"post_training_comparison_{cfg.variant}_C{cfg.core_count}",
-                       enabled=getattr(cfg.reservoir, "save_figs", False))
-        plt.show()
-        return float('nan')
-
-    y_true = y_true[:N]
-    y_pred = y_pred[:N]
-
-    # NRMSE по ПОЛНОМУ сегменту (как в result['metrics']).
-    err = float('nan') if N < 2 else float(nrmse(y_true, y_pred))
-
-    # окно визуализации
-    start = int(max(0, start))
-    end = int(min(N, start + int(max(1, n_show))))
-    x = np.arange(start, end)
-    Lvis = int(end - start)
-
-    # <<< НОВОЕ: если окно < 2, но данных >= 2 — показываем хвост из 2 точек >>>
-    if Lvis < 2 and N >= 2:
-        start, end = max(0, N - 2), N
-        x = np.arange(start, end)
-        Lvis = end - start
-
-    fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
-
-    if Lvis >= 2:
-        ax.plot(x, y_true[start:end], label="ground truth")
-        ax.plot(x, y_pred[start:end], label="prediction")
-        ax.set_xlim(x[0], x[-1])  # безопасно только при >= 2 точках
-    else:
-        # одна точка — аккуратные маркеры, без легенды
-        ax.plot(x, y_true[start:end], ls="none", marker="o", ms=3)
-        ax.plot(x, y_pred[start:end], ls="none", marker="o", ms=3)
-
-    ax.set_title(
-        f"{title}" + (f"   •   NRMSE={err:.4f}" if np.isfinite(err) else "   •   NRMSE=—"),
-        loc="left"
-    )
-    ax.set_xlabel("symbol index")
-    ax.set_ylabel("MG series value")
-    ax.margins(x=0.0)
-
-    # Легенда — только если были линии
-    if Lvis >= 2:
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            leg = ax.legend(loc="upper right", bbox_to_anchor=(0.98, 0.98), frameon=True)
-            leg.get_frame().set_facecolor((1, 1, 1, 0.6))  # полупрозрачный фон
-            leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
-
-    _maybe_savefig(fig, f"post_training_comparison_{cfg.variant}_C{cfg.core_count}",
-                   enabled=getattr(cfg.reservoir, "save_figs", False))
-    plt.show()
-
-    return err
-
-
-def debug_plot_readout_train_val_test(res: dict,
-                                      title: str = "Mackey-Glass series: prediction") -> dict:
-    """
-    Склейка train→val→test: истина и прогноз. Каждая зона и подпись добавляется
-    только если длина сегмента ≥ 2. Метрики для сегментов короче 2 точек → NaN.
-    Легенда с полупрозрачным фоном у кромки.
-    """
-    # --- извлечение (оставляем вашу схему имён) ---
-    W = res["W_out"]
-    Xtr, ytr = res["X_train"], res["y_train"].reshape(-1, 1)
-    Xva, yva = res["X_val"], res["y_val"].reshape(-1, 1)
-    Xte, yte = res["X_test"], res["y_test"].reshape(-1, 1)
-
-    # предсказания
-    ytr_hat = apply_readout(Xtr, W)
-    yva_hat = apply_readout(Xva, W) if Xva.size else np.zeros_like(yva)
-    yte_hat = apply_readout(Xte, W) if Xte.size else np.zeros_like(yte)
-
-    def _nrmse_safe(y, yhat):
-        y = np.asarray(y).ravel();
-        yhat = np.asarray(yhat).ravel()
-        if y.size < 2 or yhat.size < 2:
-            return float('nan')
-        # используем тот же nrmse(), что и result["metrics"]
-        return float(nrmse(y, yhat))
-
-    m = {
-        "nrmse_train": _nrmse_safe(ytr, ytr_hat),
-        "nrmse_val": _nrmse_safe(yva, yva_hat),
-        "nrmse_test": _nrmse_safe(yte, yte_hat),
+    return {
+        "task_title": str(task_name),
+        "input_label": "input series",
+        "target_label": "target series",
+        "y_label": "normalized amplitude",
+        "prediction_title": f"{task_name}: training and prediction",
     }
-
-    # конкатенация
-    y_all = np.concatenate([ytr, yva, yte], axis=0).reshape(-1)
-    yhat_all = np.concatenate([ytr_hat, yva_hat, yte_hat], axis=0).reshape(-1)
-    N = y_all.size
-
-    n_tr = int(ytr.shape[0])
-    n_va = int(yva.shape[0])
-    n_te = int(yte.shape[0])
-
-    b_tr = (0, n_tr)
-    b_va = (n_tr, n_tr + n_va)
-    b_te = (n_tr + n_va, n_tr + n_va + n_te)
-
-    fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.33), constrained_layout=True)
-    x = np.arange(N)
-
-    ax.plot(x, y_all, label="ground truth")
-    ax.plot(x, yhat_all, label="prediction")
-
-    def span_if(bounds, color, label):
-        lo, hi = int(bounds[0]), int(bounds[1])
-        if hi - lo >= 2:
-            ax.axvspan(lo, hi, color=color, alpha=0.18, label=label)
-            return True
-        return False
-
-    def _fmt_nrmse(v: float) -> str:
-        return f"{v:.4f}" if np.isfinite(v) else "—"
-
-    span_if(b_tr, "#2ca02c", f"train  (NRMSE={_fmt_nrmse(m['nrmse_train'])})")
-    span_if(b_va, "#9467bd", f"val    (NRMSE={_fmt_nrmse(m['nrmse_val'])})")
-    span_if(b_te, "#d62728", f"test   (NRMSE={_fmt_nrmse(m['nrmse_test'])})")
-
-    # разделители — только если есть правая граница предыдущего сегмента
-    if n_tr >= 1: ax.axvline(b_tr[1], color="k", lw=1, alpha=0.6)
-    if n_va >= 1: ax.axvline(b_va[1], color="k", lw=1, alpha=0.6)
-
-    ax.set_title(title, loc="left")
-    ax.set_xlabel("symbol index")
-    ax.set_ylabel("MG series value")
-    ax.margins(x=0.0)
-
-    # Легенда
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        leg = ax.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.98, 0.98),
-                        frameon=True)
-        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
-        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
-
-    cfg = res.get("cfg")
-    _maybe_savefig(fig, f"readout_concat_{cfg.variant}_C{cfg.core_count}",
-                   enabled=getattr(cfg.reservoir, "save_figs", False))
-    plt.show()
-
-    return m
-
 
 # =========================
 # Генерация входа (3 варианта)
 # =========================
 
+def narma10(t_size: int,
+            warmup: int = 100,
+            seed: int | None = None,
+            u_low: float = 0.0,
+            u_high: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Генерирует задачу NARMA10.
+
+    Возвращает:
+      u : входная последовательность
+      y : целевая последовательность
+    """
+    total_size = int(t_size) + int(warmup)
+    rng = np.random.default_rng(seed)
+
+    u_full = rng.uniform(u_low, u_high, size=total_size).astype(float)
+    y_full = np.zeros(total_size, dtype=float)
+
+    for t in range(9, total_size - 1):
+        y_full[t + 1] = (
+            0.3 * y_full[t]
+            + 0.05 * y_full[t] * np.sum(y_full[t - 9:t + 1])
+            + 1.5 * u_full[t - 9] * u_full[t]
+            + 0.1
+        )
+
+    u = u_full[warmup:]
+    y = y_full[warmup:]
+    return u, y
+
+
+def generate_task_sequences(task_name: TaskName,
+                            task_cfg: Union[MGConfig, NARMA10Config]
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Возвращает:
+      input_series  - что подаётся в резервуар
+      target_series - что должен предсказывать readout
+    """
+    if task_name == "mackey_glass":
+        if not isinstance(task_cfg, MGConfig):
+            raise TypeError("For task_name='mackey_glass', task_cfg must be MGConfig")
+        x_full = mackey_glass(task_cfg.t_size + task_cfg.warmup,
+                              tau=task_cfg.tau, n=task_cfg.n, beta=task_cfg.beta, gamma=task_cfg.gamma,
+                              initial_condition=task_cfg.initial_condition, dt=task_cfg.dt)
+        x_used = x_full[task_cfg.warmup:]
+        x_used = _normalize_zero_mean_unit_std(x_used)
+        return x_used, x_used
+
+    if task_name == "narma10":
+        if not isinstance(task_cfg, NARMA10Config):
+            raise TypeError("For task_name='narma10', task_cfg must be NARMA10Config")
+        u, y = narma10(t_size=task_cfg.t_size,
+                       warmup=task_cfg.warmup,
+                       seed=task_cfg.seed,
+                       u_low=task_cfg.u_low,
+                       u_high=task_cfg.u_high)
+        u = _normalize_zero_mean_unit_std(u)
+        y = _normalize_zero_mean_unit_std(y)
+        return u, y
+
+    raise ValueError(f"Unknown task_name: {task_name}")
+
+
+def sequence_masked(core_count: int,
+                    sequence: np.ndarray,
+                    mask_size: int,
+                    seed: int | None = None,
+                    gain_in: float = 1.0,
+                    mask_kind: str = "rademacher") -> np.ndarray:
+    """
+    Маскирует произвольную 1D-последовательность и формирует вход (C, S*M).
+    """
+    rng = np.random.default_rng(seed)
+    sequence = np.asarray(sequence, dtype=float).reshape(-1)
+
+    masks = np.empty((core_count, mask_size), dtype=float)
+    for c in range(core_count):
+        if mask_size == 1:
+            masks[c] = 1.0
+        else:
+            masks[c] = create_mask(mask_size, rng, kind=mask_kind)
+
+    out = np.empty((core_count, sequence.size * mask_size), dtype=float)
+    for c in range(core_count):
+        out[c] = np.kron(sequence, masks[c])
+
+    out *= gain_in
+    return out
+
 def _mg_series_from_cfg(cfg: MGConfig) -> np.ndarray:
-    x_full = mackey_glass(cfg.t_size + cfg.warmup,
-                          tau=cfg.tau, n=cfg.n, beta=cfg.beta, gamma=cfg.gamma,
-                          initial_condition=cfg.initial_condition, dt=cfg.dt)
-    x_used = x_full[cfg.warmup:]
-    return _normalize_zero_mean_unit_std(x_used)
+    input_series, _ = generate_task_sequences("mackey_glass", cfg)
+
+    return input_series
 
 
-def generate_input_temporal_unique_per_core(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
-    np.ndarray, np.ndarray]:
-    mg_series = _mg_series_from_cfg(mg_cfg)
-    data_in = mackey_glass_masked(core_count=core_count,
-                                  mackey_glass_symbol_count=mg_cfg.t_size,
-                                  mask_size=mask_cfg.mask_size,
-                                  seed=mask_cfg.seed,
-                                  gain_in=mask_cfg.gain_in,
-                                  warmup=mg_cfg.warmup,
-                                  mask_kind=mask_cfg.mask_kind,
-                                  tau=mg_cfg.tau, n=mg_cfg.n, beta=mg_cfg.beta, gamma=mg_cfg.gamma,
-                                  initial_condition=mg_cfg.initial_condition, dt=mg_cfg.dt)
-    return data_in, mg_series
+def _task_sequences_from_cfg(task_name: TaskName,
+                             task_cfg: Union[MGConfig, NARMA10Config]
+                             ) -> tuple[np.ndarray, np.ndarray]:
+    return generate_task_sequences(task_name, task_cfg)
+
+def generate_input_temporal_unique_per_core(
+        core_count: int,
+        task_cfg: Union[MGConfig, NARMA10Config],
+        mask_cfg: MaskConfig,
+        task_name: TaskName = "mackey_glass"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    input_series, target_series = _task_sequences_from_cfg(task_name, task_cfg)
+
+    data_in = sequence_masked(core_count=core_count,
+                              sequence=input_series,
+                              mask_size=mask_cfg.mask_size,
+                              seed=mask_cfg.seed,
+                              gain_in=mask_cfg.gain_in,
+                              mask_kind=mask_cfg.mask_kind)
+
+    return data_in, input_series, target_series
 
 
-def generate_input_temporal_same_all_cores(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
-    np.ndarray, np.ndarray]:
+def generate_input_temporal_same_all_cores(
+        core_count: int,
+        task_cfg: Union[MGConfig, NARMA10Config],
+        mask_cfg: MaskConfig,
+        task_name: TaskName = "mackey_glass"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(mask_cfg.seed)
-    mg_series = _mg_series_from_cfg(mg_cfg)
+    input_series, target_series = _task_sequences_from_cfg(task_name, task_cfg)
+
     if mask_cfg.mask_size == 1:
-        mask = 1
+        mask = 1.0
     else:
         mask = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind)
-    pattern = np.kron(mg_series, mask) * mask_cfg.gain_in
+
+    pattern = np.kron(input_series, mask) * mask_cfg.gain_in
     data_in = np.tile(pattern, (core_count, 1))
-    return data_in, mg_series
+
+    return data_in, input_series, target_series
 
 
-def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig) -> Tuple[
-    np.ndarray, np.ndarray]:
+def generate_input_spatial_only(
+        core_count: int,
+        task_cfg: Union[MGConfig, NARMA10Config],
+        mask_cfg: MaskConfig,
+        task_name: TaskName = "mackey_glass"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Spatial-only вход: один и тот же временной сигнал подаётся на все ядра, но с разными постоянными весами.
 
@@ -2062,9 +1945,8 @@ def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: Mas
     Для этого weights нормируются так, что sum(weights**2) = 1 (weights — коэффициенты по полю/амплитуде).
     """
     rng = np.random.default_rng(mask_cfg.seed)
-    mg_series = _mg_series_from_cfg(mg_cfg)
+    input_series, target_series = _task_sequences_from_cfg(task_name, task_cfg)
 
-    # Коэффициенты по полю (амплитуде). Оставляю ваш диапазон [0, 1], меняю только нормировку.
     weights = rng.uniform(0.0, 1.0, size=core_count)
     w_norm = float(np.linalg.norm(weights))
     if w_norm > 0.0:
@@ -2073,8 +1955,8 @@ def generate_input_spatial_only(core_count: int, mg_cfg: MGConfig, mask_cfg: Mas
         weights = np.zeros(core_count, dtype=float)
         weights[0] = 1.0
 
-    data_in = (weights[:, None] * mg_series[None, :]) * mask_cfg.gain_in
-    return data_in, mg_series
+    data_in = (weights[:, None] * input_series[None, :]) * mask_cfg.gain_in
+    return data_in, input_series, target_series
 
 
 # =========================
@@ -2145,13 +2027,18 @@ def _quantize_for_hash(obj, path=()) -> Any:
     return obj
 
 
-def _params_for_cache(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig,
-                      reservoir_cfg: ReservoirConfig, variant: MaskVariant) -> Dict[str, Any]:
+def _params_for_cache(core_count: int,
+                      task_name: TaskName,
+                      task_cfg: Union[MGConfig, NARMA10Config],
+                      mask_cfg: MaskConfig,
+                      reservoir_cfg: ReservoirConfig,
+                      variant: MaskVariant) -> Dict[str, Any]:
     d = dict(
-        version="v1.1",
+        version="v1.2",
+        task_name=task_name,
         variant=variant,
         core_count=int(core_count),
-        mg=asdict(mg_cfg),
+        task_cfg=asdict(task_cfg),
         mask=asdict(mask_cfg),
         reservoir={
             **asdict(reservoir_cfg),
@@ -2162,8 +2049,7 @@ def _params_for_cache(core_count: int, mg_cfg: MGConfig, mask_cfg: MaskConfig,
             "use_dispersion": bool(getattr(reservoir_cfg, "use_dispersion", True)),
         },
     )
-    # ВАЖНО: возвращаем «сырой» словарь для записи в артефакты,
-    # а для ключа кэша используем _quantize_for_hash(d) внутри _cache_path().
+
     return d
 
 
@@ -2175,7 +2061,7 @@ def _cache_path(params_dict: Dict[str, Any]) -> Path:
 
 def reconstruct_data_in_from_compact(core_count: int,
                                      variant: str,
-                                     mg_series: np.ndarray,
+                                     input_series: np.ndarray,
                                      mask_cfg: MaskConfig,
                                      *,
                                      mask_time: Optional[np.ndarray] = None,
@@ -2183,7 +2069,7 @@ def reconstruct_data_in_from_compact(core_count: int,
                                      core_weights: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Восстановление data_in по компактному представлению:
-      • mg_series — ряд Маккея–Гласса длиной S (после нормировки и warmup);
+      • input_series — тестовые данные длиной S;
       • для temporal_same_all_cores: mask_time формы (M,);
       • для temporal_unique_per_core: masks_time формы (C,M);
       • для spatial_only: core_weights формы (C,).
@@ -2192,14 +2078,14 @@ def reconstruct_data_in_from_compact(core_count: int,
       • temporal_*  → (C, S*M)
       • spatial_only → (C, S)
     """
-    S = int(mg_series.shape[0])
+    S = int(input_series.shape[0])
     C = int(core_count)
 
     if variant == "temporal_same_all_cores":
         if mask_time is None:
             rng = np.random.default_rng(mask_cfg.seed)
             mask_time = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind)  # (M,)
-        pattern = np.kron(mg_series, mask_time) * float(mask_cfg.gain_in)  # (S*M,)
+        pattern = np.kron(input_series, mask_time) * float(mask_cfg.gain_in)  # (S*M,)
         data_in = np.tile(pattern, (C, 1))  # (C,S*M)
         return data_in
 
@@ -2211,7 +2097,7 @@ def reconstruct_data_in_from_compact(core_count: int,
                 masks_time[c] = create_mask(mask_cfg.mask_size, rng, kind=mask_cfg.mask_kind)
         out = np.empty((C, S * mask_cfg.mask_size), dtype=float)
         for c in range(C):
-            out[c] = np.kron(mg_series, masks_time[c])
+            out[c] = np.kron(input_series, masks_time[c])
         out *= float(mask_cfg.gain_in)
         return out
 
@@ -2219,7 +2105,7 @@ def reconstruct_data_in_from_compact(core_count: int,
         if core_weights is None:
             rng = np.random.default_rng(mask_cfg.seed)
             core_weights = rng.uniform(-1.0, 1.0, size=C)
-        return (np.asarray(core_weights, dtype=float).reshape(C, 1) * mg_series.reshape(1, S)) * float(mask_cfg.gain_in)
+        return (np.asarray(core_weights, dtype=float).reshape(C, 1) * input_series.reshape(1, S)) * float(mask_cfg.gain_in)
 
     raise ValueError(f"Unknown variant: {variant}")
 
@@ -2301,7 +2187,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
         z = np.load(_p_scripts, allow_pickle=False)
 
         if "mg_series" in z.files:
-            mg_series = z["mg_series"]
+            input_series = z["mg_series"]
             variant = params_dict["variant"]
             mask_cfg = MaskConfig(**params_dict["mask"])
             C = int(params_dict["core_count"])
@@ -2313,7 +2199,7 @@ def run_mcf_with_cache(data_in: np.ndarray,
             _ = reconstruct_data_in_from_compact(
                 core_count=C,
                 variant=variant,
-                mg_series=mg_series.astype(float, copy=False),
+                input_series=input_series.astype(float, copy=False),
                 mask_cfg=mask_cfg,
                 mask_time=mask_time,
                 masks_time=masks_time,
@@ -2361,11 +2247,21 @@ def run_mcf_with_cache(data_in: np.ndarray,
     fiber_params_json = json.dumps(params_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     C = int(params_dict["core_count"])
-    mg_cfg = MGConfig(**params_dict["mg"])
+    task_name = params_dict.get("task_name", "mackey_glass")
+    task_cfg_dict = params_dict.get("task_cfg", params_dict.get("mg"))
+    if task_name == "mackey_glass":
+        task_cfg = MGConfig(**task_cfg_dict)
+    else:
+        task_cfg = NARMA10Config(**task_cfg_dict)
     mask_cfg = MaskConfig(**params_dict["mask"])
     variant = params_dict["variant"]
 
-    mg_series = _mg_series_from_cfg(mg_cfg).astype(_real_dtype(cache_bits), copy=False)
+    input_series, _target_series = generate_task_sequences(task_name, task_cfg)
+    mg_series = np.asarray(input_series, dtype=_real_dtype(cache_bits))
+
+    mask_time = None
+    masks_time = None
+    core_weights = None
 
     mask_time = None
     masks_time = None
@@ -2981,7 +2877,7 @@ def run_single_experiment(cfg: ExperimentConfig,
                           save_cache: bool = False,
                           do_learning_curve: bool = False) -> Dict[str, Any]:
     """
-    1) генерируем вход/ряд MG,
+    1) генерируем вход/таргет задачи,
     2) считаем/читаем из кэша MCF,
     3) формируем X,y (символьно, с учётом taps/shift/washout),
        сплиты, обучаем ridge, метрики,
@@ -2990,11 +2886,17 @@ def run_single_experiment(cfg: ExperimentConfig,
 
     # вход
     if cfg.variant == "temporal_unique_per_core":
-        data_in, mg_series = generate_input_temporal_unique_per_core(cfg.core_count, cfg.mg, cfg.mask)
+        data_in, input_series, target_series = generate_input_temporal_unique_per_core(
+            cfg.core_count, cfg.task_cfg, cfg.mask, cfg.task_name
+        )
     elif cfg.variant == "temporal_same_all_cores":
-        data_in, mg_series = generate_input_temporal_same_all_cores(cfg.core_count, cfg.mg, cfg.mask)
+        data_in, input_series, target_series = generate_input_temporal_same_all_cores(
+            cfg.core_count, cfg.task_cfg, cfg.mask, cfg.task_name
+        )
     elif cfg.variant == "spatial_only":
-        data_in, mg_series = generate_input_spatial_only(cfg.core_count, cfg.mg, cfg.mask)
+        data_in, input_series, target_series = generate_input_spatial_only(
+            cfg.core_count, cfg.task_cfg, cfg.mask, cfg.task_name
+        )
     else:
         raise ValueError(f"Unknown variant: {cfg.variant}")
 
@@ -3004,12 +2906,20 @@ def run_single_experiment(cfg: ExperimentConfig,
 
     # 2) рисовалка уже с заполненным window_size
     if cfg.reservoir.display_debug_plots:
-        debug_plot_input_overview(cfg_with_ws, mg_series_used=mg_series)
-        debug_plot_mg_attractor(cfg_with_ws, mg_series_used=mg_series)
+        debug_plot_input_overview(cfg_with_ws,
+                                  input_series=input_series,
+                                  target_series=target_series,
+                                  task_name=cfg.task_name)
 
-    # ключ кэша
-    params_dict = _params_for_cache(cfg_with_ws.core_count, cfg_with_ws.mg, cfg_with_ws.mask,
-                                    cfg_with_ws.reservoir, cfg_with_ws.variant)
+        if cfg.task_name == "mackey_glass":
+            debug_plot_mg_attractor(cfg_with_ws, mg_series_used=target_series)
+
+    params_dict = _params_for_cache(cfg_with_ws.core_count,
+                                    cfg_with_ws.task_name,
+                                    cfg_with_ws.task_cfg,
+                                    cfg_with_ws.mask,
+                                    cfg_with_ws.reservoir,
+                                    cfg_with_ws.variant)
     # основной запуск с кэшированием
     data_out, params_out, cache_key = run_mcf_with_cache(data_in,
                                                          params_dict,
@@ -3036,7 +2946,7 @@ def run_single_experiment(cfg: ExperimentConfig,
         return Xt
 
     X_tapped = _make_tapped(X_sym, int(cfg.training.taps))  # (S - taps + 1, F*taps)
-    y_sym = mg_series.reshape(-1, 1)  # (S,1)
+    y_sym = target_series.reshape(-1, 1)  # (S,1)
 
     # сдвиг таргета на target_shift СИМВОЛОВ
     shift_syms = int(cfg.training.target_shift)
@@ -3105,7 +3015,8 @@ def run_single_experiment(cfg: ExperimentConfig,
         X_test=Xte, y_test=yte, y_test_hat=yte_hat,
         data_in=data_in,
         data_out=data_out,
-        mg_series=mg_series,
+        input_series=input_series,
+        target_series=target_series,
         cache_key=cache_key,
         y_free_run=y_free,
         fiber_params=params_out
@@ -3141,7 +3052,29 @@ def run_single_experiment(cfg: ExperimentConfig,
         else:
             print("Нет данных ни для test, ни для val, ни для train — пропускаю сравнение.")
 
-        debug_plot_readout_train_val_test(result, title="Mackey-Glass series: training and prediction")
+        plot_title = (
+            "Mackey-Glass series: training and prediction"
+            if cfg.task_name == "mackey_glass" else "NARMA10: training and prediction"
+        )
+        debug_plot_readout_train_val_test(result, title=plot_title)
+
+        if yva is not None and yva_hat is not None and min(yva.shape[0], yva_hat.shape[0]) >= 2:
+            plot_fit_predict_scatter(
+                yva.ravel(),
+                yva_hat.ravel(),
+                cfg=cfg_with_ws,
+                title=f"{plot_title}: validation fit-predict scatter",
+                split_name="validation",
+            )
+
+        if yte is not None and yte_hat is not None and min(yte.shape[0], yte_hat.shape[0]) >= 2:
+            plot_fit_predict_scatter(
+                yte.ravel(),
+                yte_hat.ravel(),
+                cfg=cfg_with_ws,
+                title=f"{plot_title}: test fit-predict scatter",
+                split_name="test",
+            )
 
     if do_learning_curve:
         missing = [k for k in ("X_train", "y_train", "X_val", "y_val") if k not in result]
@@ -3653,8 +3586,16 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
             gain_in = (_suggest("gain_in", trial, default_kind="float",
                                 default_low=1.0, default_high=1e2, default_log=True, search_space=param_space))
-            mask_size = _suggest("mask_size", trial, default_kind="int", default_low=30, default_high=400,
-                                 search_space=param_space)
+
+            if base_cfg.variant == "spatial_only":
+                mask_size = 1
+            else:
+                mask_size = normalize_mask_size_for_variant(
+                    base_cfg.variant,
+                    _suggest("mask_size", trial, default_kind="int", default_low=30, default_high=400,
+                             search_space=param_space)
+                )
+
             delay_factor = _suggest("delay_factor_in_symbols", trial, default_kind="int", default_low=1,
                                     default_high=20, search_space=param_space)
             time_step_ps = _suggest("time_step_ps", trial, default_kind="float",
@@ -3664,7 +3605,8 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
 
             cfg = ExperimentConfig(
                 core_count=base_cfg.core_count,
-                mg=base_cfg.mg,
+                task_name=base_cfg.task_name,
+                task_cfg=base_cfg.task_cfg,
                 mask=MaskConfig(mask_size=int(mask_size),
                                 mask_kind=base_cfg.mask.mask_kind,
                                 seed=base_cfg.mask.seed,
@@ -3854,173 +3796,6 @@ def optimize_hyperparams(base_cfg: ExperimentConfig,
     )
 
 
-def _update_plots_and_save(results_stream: list[dict],
-                           base_cfg: ExperimentConfig,
-                           *,
-                           logx: bool = False,
-                           logy: bool = False,
-                           ts: str | None = None) -> dict:
-    """
-    Рисует три графика (NRMSE vs coupling / L_coupling / radius) и пишет CSV.
-    Поведение и стиль согласованы с функциями отрисовки в модуле (Nature-стиль).
-
-    Args:
-        results_stream: список словарей с ключами:
-            {"radius", "coupling", "nrmse_train", "nrmse_val", "nrmse_test"}.
-        base_cfg: конфигурация эксперимента; variant и core_count используются в именах файлов.
-        logx, logy: логарифмические шкалы по осям.
-        ts: фиксированный таймстамп для серии файлов. Если None — создаётся новый.
-
-    Returns:
-        dict с путями до сохранённых файлов: {"p_c", "p_l", "p_r", "p_csv"}.
-    """
-    import csv
-    from datetime import datetime
-    from pathlib import Path
-
-    save_figs_flag = bool(getattr(base_cfg.reservoir, "save_figs", False))
-    out_dir = Path(__file__).parent
-    variant_str = str(base_cfg.variant)
-    core_count = int(base_cfg.core_count)
-    fmt = str(plt.rcParams.get("savefig.format", "pdf")).lower()
-    ts = ts or datetime.now().strftime('%Y%m%d-%H%M')
-
-    p_c = out_dir / f"scan_nrmse_vs_coupling_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_l = out_dir / f"scan_nrmse_vs_Lc_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_r = out_dir / f"scan_nrmse_vs_radius_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_csv = out_dir / f"scan_coupling_results_{variant_str}_C{core_count}_{ts}.csv"
-
-    # валидные точки по coupling
-    valid = [r for r in results_stream if np.isfinite(float(r.get("coupling", np.nan)))]
-    if not valid:
-        return {"p_c": None, "p_l": None, "p_r": None, "p_csv": None}
-
-    coupl = np.array([float(d["coupling"]) for d in valid], float)
-    Lc = np.where((coupl > 0) & np.isfinite(coupl), np.pi / (2.0 * coupl), np.nan)
-    rad = np.array([float(d.get("radius", np.nan)) for d in valid], float)
-    y_tr = np.array([float(d.get("nrmse_train", np.nan)) for d in valid], float)
-    y_va = np.array([float(d.get("nrmse_val", np.nan)) for d in valid], float)
-
-    def _sorted_xy(x_raw, y_raw):
-        x = np.asarray(x_raw, float)
-        y = np.asarray(y_raw, float)
-        m = np.isfinite(x) & np.isfinite(y)
-        if not np.any(m):
-            return None, None
-        x, y = x[m], y[m]
-        order = np.argsort(x)
-        return x[order], y[order]
-
-    # — фигуры под Nature-стиль
-    fig_c, ax_c = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-    fig_l, ax_l = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-    fig_r, ax_r = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-
-    # 1) NRMSE vs coupling
-    ax_c.clear()
-    xc_tr, yc_tr = _sorted_xy(coupl, y_tr)
-    xc_va, yc_va = _sorted_xy(coupl, y_va)
-    drew = False
-    if xc_tr is not None:
-        ax_c.plot(xc_tr, yc_tr,  # marker="o",
-                  label="Train NRMSE")
-        drew = True
-    if xc_va is not None:
-        ax_c.plot(xc_va, yc_va,  # marker="s",
-                  linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_c.set_xlabel("coupling coefficient, 1/m")
-    ax_c.set_ylabel("NRMSE")
-    # if logx:
-    #     ax_c.set_xscale("log")
-    if logy:
-        ax_c.set_yscale("log")
-    if drew:
-        ax_c.legend()
-
-    if save_figs_flag:
-        try:
-            fig_c.savefig(p_c)
-        except Exception as e:
-            print(f"[warn] savefig coupling failed: {e}")
-
-    # 2) NRMSE vs L_coupling
-    ax_l.clear()
-    xl_tr, yl_tr = _sorted_xy(Lc, y_tr)
-    xl_va, yl_va = _sorted_xy(Lc, y_va)
-    drew = False
-    if xl_tr is not None:
-        ax_l.plot(xl_tr, yl_tr,  # marker="o",
-                  label="Train NRMSE")
-        drew = True
-    if xl_va is not None:
-        ax_l.plot(xl_va, yl_va,  # marker="s",
-                  linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_l.set_xlabel("coupling length, m")
-    ax_l.set_ylabel("NRMSE")
-    if logx:
-        ax_l.set_xscale("log")
-    if logy:
-        ax_l.set_yscale("log")
-    if drew:
-        ax_l.legend()
-    if save_figs_flag:
-        try:
-            fig_l.savefig(p_l)
-        except Exception as e:
-            print(f"[warn] savefig Lc failed: {e}")
-
-    # 3) NRMSE vs radius
-    ax_r.clear()
-    xr_tr, yr_tr = _sorted_xy(rad, y_tr)
-    xr_va, yr_va = _sorted_xy(rad, y_va)
-    drew = False
-    if xr_tr is not None:
-        ax_r.plot(xr_tr, yr_tr,
-                  # marker="o",
-                  label="Train NRMSE")
-        drew = True
-    if xr_va is not None:
-        ax_r.plot(xr_va, yr_va,
-                  # marker="s",
-                  linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_r.set_xlabel("inter-core radius, µm")
-    ax_r.set_ylabel("NRMSE")
-    if logx:
-        ax_r.set_xscale("log")
-    if logy:
-        ax_r.set_yscale("log")
-    if drew:
-        ax_r.legend()
-    if save_figs_flag:
-        try:
-            fig_r.savefig(p_r)
-        except Exception as e:
-            print(f"[warn] savefig radius failed: {e}")
-
-    # CSV: полный срез текущего results_stream
-    if save_figs_flag:
-        try:
-            with open(p_csv, "w", newline="") as f:
-                wr = csv.writer(f)
-                wr.writerow(["radius", "coupling", "L_coupling",
-                             "nrmse_train", "nrmse_val", "nrmse_test"])
-                for d in results_stream:
-                    c = float(d.get("coupling", float("nan")))
-                    L = (np.pi / (2.0 * c)) if (np.isfinite(c) and c > 0) else float("nan")
-                    wr.writerow([float(d.get("radius", float("nan"))),
-                                 c, L,
-                                 float(d.get("nrmse_train", float("nan"))),
-                                 float(d.get("nrmse_val", float("nan"))),
-                                 float(d.get("nrmse_test", float("nan")))])
-        except Exception as e:
-            print(f"[warn] write csv failed: {e}")
-
-    return {"p_c": p_c, "p_l": p_l, "p_r": p_r, "p_csv": p_csv}
-
-
 # --- helper: один радиус → один прогон (отдельный процесс) ---
 def _scan_single_radius_task(args):
     """
@@ -4088,7 +3863,7 @@ def find_best_coupling_coefficient(radii: list,
     """
     Перебирает значения layer_radii_array[1] (в микронах) для 7-ядерного волокна, запускает расчёт
     в нескольких процессах и ведёт журнал: train/val NRMSE vs коэффициент/длина связи и радиус.
-    После каждого полученного результата обновляет CSV и три рисунка через _update_plots_and_save.
+    После каждого полученного результата обновляет CSV и три рисунка через update_plots_and_save.
 
     Args:
         merge_with_existing: при True подмешивает строки из ранее сохранённых CSV (если найдены).
@@ -4149,7 +3924,7 @@ def find_best_coupling_coefficient(radii: list,
                 results_stream.append(r)
                 print(r)
                 if save_figs_flag:
-                    _update_plots_and_save(results_stream, base_cfg, logx=logx, logy=logy, ts=ts)
+                    update_plots_and_save(results_stream, base_cfg, logx=logx, logy=logy, ts=ts)
 
     # итоговая фильтрация и финальная отрисовка
     results = [r for r in results_stream if np.isfinite(r.get("coupling", np.nan))
@@ -4158,182 +3933,7 @@ def find_best_coupling_coefficient(radii: list,
         print("find_best_coupling_coefficient: все прогоны вернули нечисловой coupling — пропуск.")
         return
 
-    _update_plots_and_save(results, base_cfg, logx=logx, logy=logy, ts=ts)
-
-
-def plot_combined_csv_results(base_cfg, logx: bool = False, logy: bool = False, save_figs: bool = True):
-    """
-    Находит все CSV-файлы с результатами сканирования в текущей папке,
-    объединяет данные и строит графики NRMSE vs coupling / L_coupling / radius
-    в макетном стиле (Nature, двухколоночная ширина).
-
-    Args:
-        base_cfg: конфигурация эксперимента (variant, core_count)
-        logx: логарифмическая шкала по X
-        logy: логарифмическая шкала по Y
-        save_figs: сохранять ли графики в файлы (формат берётся из rcParams)
-    """
-    import pandas as pd
-
-    variant_str = str(base_cfg.variant)
-    core_count = int(base_cfg.core_count)
-    out_dir = Path(__file__).parent
-
-    # собираем все CSV нужного вида
-    pattern = f"scan_coupling_results_{variant_str}_C{core_count}_*.csv"
-    csv_files = list(out_dir.glob(pattern))
-    if not csv_files:
-        print(f"Не найдено CSV по шаблону: {pattern}")
-        return
-    print(f"Найдено CSV: {len(csv_files)}")
-
-    # объединяем
-    all_df = []
-    for p in csv_files:
-        try:
-            df = pd.read_csv(p)
-            df["source_file"] = p.name
-            all_df.append(df)
-            print(f"Загружено {len(df)} строк из {p.name}")
-        except Exception as e:
-            print(f"Ошибка чтения {p}: {e}")
-    if not all_df:
-        print("Нет данных для объединения")
-        return
-
-    combined_df = pd.concat(all_df, ignore_index=True)
-
-    # удаляем дубликаты по всем столбцам, кроме 'source_file'
-    cols = [c for c in combined_df.columns if c != "source_file"]
-    combined_df = combined_df.drop_duplicates(subset=cols)
-    print(f"Уникальных точек: {len(combined_df)}")
-
-    # фильтруем валидные строки
-    if "coupling" not in combined_df.columns or "radius" not in combined_df.columns:
-        print("В CSV нет обязательных колонок: 'coupling' / 'radius'")
-        return
-    valid = combined_df[np.isfinite(combined_df["coupling"])]
-    if len(valid) == 0:
-        print("Нет валидных данных для построения графиков")
-        return
-
-    # гарантируем наличие L_coupling_m
-    if "L_coupling_m" not in valid.columns:
-        c = valid["coupling"].to_numpy(float)
-        Lc = np.where((c > 0) & np.isfinite(c), np.pi / (2.0 * c), np.nan)
-        valid = valid.assign(L_coupling_m=Lc)
-
-    # извлекаем массивы
-    coupl = valid["coupling"].to_numpy(float)
-    Lc = valid["L_coupling_m"].to_numpy(float)
-    rad = valid["radius"].to_numpy(float)
-    y_tr = valid.get("nrmse_train", pd.Series(np.nan, index=valid.index)).to_numpy(float)
-    y_va = valid.get("nrmse_val", pd.Series(np.nan, index=valid.index)).to_numpy(float)
-
-    def _sorted_xy(x_raw, y_raw):
-        x = np.asarray(x_raw, float)
-        y = np.asarray(y_raw, float)
-        m = np.isfinite(x) & np.isfinite(y)
-        if not np.any(m):
-            return None, None
-        x, y = x[m], y[m]
-        order = np.argsort(x)
-        return x[order], y[order]
-
-    # имена файлов вывода
-    fmt = str(plt.rcParams.get("savefig.format", "pdf")).lower()
-    ts = datetime.now().strftime("%Y%m%d-%H%M")
-    p_c = out_dir / f"combined_nrmse_vs_coupling_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_l = out_dir / f"combined_nrmse_vs_Lc_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_r = out_dir / f"combined_nrmse_vs_radius_{variant_str}_C{core_count}_{ts}.{fmt}"
-    p_csv = out_dir / f"combined_results_{variant_str}_C{core_count}_{ts}.csv"
-
-    # фигуры в стиле Nature: COL2 × 0.38, constrained_layout
-    fig_c, ax_c = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-    fig_l, ax_l = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-    fig_r, ax_r = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
-
-    # --- 1) NRMSE vs coupling
-    xc_tr, yc_tr = _sorted_xy(coupl, y_tr)
-    xc_va, yc_va = _sorted_xy(coupl, y_va)
-    drew = False
-    ax_c.cla()
-    if xc_tr is not None:
-        ax_c.plot(xc_tr, yc_tr, marker="o", label="Train NRMSE")
-        drew = True
-    if xc_va is not None:
-        ax_c.plot(xc_va, yc_va, marker="s", linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_c.set_xlabel("coupling coefficient, 1/m")
-    ax_c.set_ylabel("NRMSE")
-    # if logx:
-    #     ax_c.set_xscale("log")
-    if logy:
-        ax_c.set_yscale("log")
-    if drew:
-        ax_c.legend()
-    if save_figs:
-        try:
-            fig_c.savefig(p_c)
-        except Exception as e:
-            print(f"[warn] savefig coupling failed: {e}")
-
-    # --- 2) NRMSE vs L_coupling
-    xl_tr, yl_tr = _sorted_xy(Lc, y_tr)
-    xl_va, yl_va = _sorted_xy(Lc, y_va)
-    drew = False
-    ax_l.cla()
-    if xl_tr is not None:
-        ax_l.plot(xl_tr, yl_tr, marker="o", label="Train NRMSE")
-        drew = True
-    if xl_va is not None:
-        ax_l.plot(xl_va, yl_va, marker="s", linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_l.set_xlabel("coupling length, m")
-    ax_l.set_ylabel("NRMSE")
-    if logx:
-        ax_l.set_xscale("log")
-    if logy:
-        ax_l.set_yscale("log")
-    if drew:
-        ax_l.legend()
-    if save_figs:
-        try:
-            fig_l.savefig(p_l)
-        except Exception as e:
-            print(f"[warn] savefig L_coupling failed: {e}")
-
-    # --- 3) NRMSE vs radius
-    xr_tr, yr_tr = _sorted_xy(rad, y_tr)
-    xr_va, yr_va = _sorted_xy(rad, y_va)
-    drew = False
-    ax_r.cla()
-    if xr_tr is not None:
-        ax_r.plot(xr_tr, yr_tr, marker="o", label="Train NRMSE")
-        drew = True
-    if xr_va is not None:
-        ax_r.plot(xr_va, yr_va, marker="s", linestyle="--", label="Val NRMSE")
-        drew = True
-    ax_r.set_xlabel("inter-core radius, µm")
-    ax_r.set_ylabel("NRMSE")
-    if logx:
-        ax_r.set_xscale("log")
-    if logy:
-        ax_r.set_yscale("log")
-    if drew:
-        ax_r.legend()
-    if save_figs:
-        try:
-            fig_r.savefig(p_r)
-        except Exception as e:
-            print(f"[warn] savefig radius failed: {e}")
-
-    # экспорт объединённых данных (полезно для отслеживания)
-    if save_figs:
-        try:
-            combined_df.to_csv(p_csv, index=False)
-        except Exception as e:
-            print(f"[warn] write combined csv failed: {e}")
+    update_plots_and_save(results, base_cfg, logx=logx, logy=logy, ts=ts)
 
 
 def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
@@ -4349,7 +3949,7 @@ def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
     """
     Запускает серию оптимизаций `spatial_only` по списку радиусов (µm).
     На КАЖДЫЙ радиус выполняется РОВНО ОДНА оптимизация через optimize_hyperparams.
-    После каждой оптимизации обновляет CSV и три рисунка через _update_plots_and_save.
+    После каждой оптимизации обновляет CSV и три рисунка через update_plots_and_save.
 
     Параметры:
         base_cfg: базовая конфигурация эксперимента.
@@ -4450,7 +4050,7 @@ def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
             "nrmse_test": float(m.get("nrmse_test", np.nan)),
         })
 
-        paths = _update_plots_and_save(results_stream, base_cfg, logx=logx, logy=logy, ts=ts_common)
+        paths = update_plots_and_save(results_stream, base_cfg, logx=logx, logy=logy, ts=ts_common)
 
         # --- CSV: только поля из best_metrics и fiber_params (+ radius) ----------------
         # Заголовок фиксируем по первой записи в этой серии
@@ -4484,7 +4084,7 @@ def run_spatial_only_radii_optuna(base_cfg: ExperimentConfig,
     return {"results_stream": results_stream, "paths": paths}
 
 
-def _per_core(params, key: str, default: float, core_count: int):
+def per_core(params, key: str, default: float, core_count: int):
     v = params.get(key, default)
     if isinstance(v, (list, tuple, np.ndarray)):  # строк тут быть не должно
         if len(v) == core_count:
@@ -4494,44 +4094,107 @@ def _per_core(params, key: str, default: float, core_count: int):
         raise ValueError(f"{key}: expected len 1 or {core_count}, got {len(v)}")
     return (v,) * core_count
 
-# =========================
-# Пример точки входа
-# =========================
 
-if __name__ == "__main__":
+def normalize_mask_size_for_variant(variant: str, mask_size: int | float | None) -> int:
+    variant = str(variant)
 
-    # Базовые параметры
-    force_rerun = False  # игнорировать кэш и считать заново
-    save_cache = False
+    if variant == "spatial_only":
+        return 1
 
-    ########### Parameters for the best regimes #############
+    if mask_size is None:
+        return 1
 
-    params = {}
+    mask_size = int(mask_size)
+    if mask_size < 1:
+        raise ValueError("mask_size must be >= 1")
+
+    return mask_size
 
 
-
-    #####################################################
-
-    layer_count = params.get("layer_count", 1)
-    core_configuration = CoreConfig.hexagonal
-    core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
+def make_layer_radii_array(layer_count: int | float, layer_radius_step_um: float = 30.0) -> np.ndarray:
+    layer_count = int(layer_count)
 
     # layer 0 - центральная сердцевина
     # layer 1 - первый круг из 6 сердцевин
     # layer 2 - второй "круг" из 12 сердцевин, расстояние от которых до центра разное
     # ...
-    layer_radii_array = np.zeros(int(layer_count) + 1)
-    for i in range(int(layer_count) + 1):
+    layer_radii_array = np.zeros(layer_count + 1)
+    for i in range(layer_count + 1):
         if i == 0:
             layer_radii_array[i] = 0  # [mkm]
         if i == 1:
-            layer_radii_array[i] = 30  # 17.3 * 1  # 17.3 # [mkm]
+            layer_radii_array[i] = float(layer_radius_step_um)  # 17.3 * 1  # 17.3 # [mkm]
         if i == 2:
-            layer_radii_array[i] = 30 * 2  # [mkm]
+            layer_radii_array[i] = float(layer_radius_step_um) * 2  # [mkm]
         if i == 3:
-            layer_radii_array[i] = 30 * 3  # [mkm]
+            layer_radii_array[i] = float(layer_radius_step_um) * 3  # [mkm]
 
         # layer_radii_array[i] = 17.3 * (i * 1.5) # [mkm]
+
+    return layer_radii_array
+
+
+def make_experiment_config_from_params(
+        params: dict | None = None,
+        *,
+        task_name: TaskName = "mackey_glass",
+        t_size: int = 20000,
+        mg_tau: float = 17.0,
+        mg_n: int = 10,
+        mg_beta: float = 0.2,
+        mg_gamma: float = 0.1,
+        mg_initial_condition: float = 1.2,
+        mg_dt: float = 1.0,
+        mg_warmup: int = 300,
+        narma_warmup: int = 100,
+        narma_seed: Optional[int] = 42,
+        narma_u_low: float = 0.0,
+        narma_u_high: float = 0.5,
+        mask_kind: str = "uniform",
+        mask_seed: Optional[int] = 42,
+        layer_radius_step_um: float = 30.0,
+        step_number_per_dimensionless_distance: int = 20,
+        upsampling: int = 1,
+        delay_additional_in_mask_steps: int = 0,
+        use_gpu: bool = False,
+        use_torch: bool = False,
+        num_threads: int | str | None = 1,
+        display_debug_plots: bool = True,
+        display_debug_info: bool = False,
+        save_figs: bool = False,
+        save_gif: bool = False,
+        max_hours_total: Optional[float] = 24,
+        precision: Optional[str] = "float64",
+        use_dispersion: Optional[bool] = False,
+        ase_noise_seed: Optional[int] = None,
+        ase_noise_nf_db: Optional[float] = None,
+        ase_noise_optical_bw_hz: Optional[float] = None,
+        ase_noise_compute_effective_osnr: Optional[bool] = None,
+        training_feature_mode: Literal["intensity", "realimag"] = "intensity",
+        training_ridge_alpha: float | str | None = 0,
+        training_washout: Optional[int] = 500,
+        training_target_shift: int = 1,
+        training_train_frac: float = 0.6,
+        training_val_frac: float = 0.2,
+) -> ExperimentConfig:
+    """
+    Единая сборка ExperimentConfig из словаря params.
+
+    Смысл:
+      - основной main больше не дублирует ручную сборку cfg;
+      - Optuna может получать отдельный optuna_base_params и не зависеть от single_params;
+      - студенческий код импортирует эту функцию и не копирует внутренности основного проекта.
+    """
+    params = deepcopy(dict(params or {}))
+
+    layer_count = params.get("layer_count", 1)
+    core_configuration = CoreConfig.hexagonal
+    core_count = get_core_count(core_configuration=core_configuration, ring_count=layer_count)
+
+    layer_radii_array = make_layer_radii_array(
+        layer_count=layer_count,
+        layer_radius_step_um=layer_radius_step_um,
+    )
 
     if "ppump" in params:
         pp = params["ppump"]
@@ -4549,33 +4212,155 @@ if __name__ == "__main__":
         params["g0"] = tuple(float(x) for x in np.asarray(g0_t).reshape(-1))
         params["psat"] = tuple(float(x) for x in np.asarray(psat_t).reshape(-1))
 
-    temporal_modulation_frequency_ghz = params.get("temporal_modulation_frequency_ghz", 0.4)  # GHz
+    temporal_modulation_frequency_ghz = float(params.get("temporal_modulation_frequency_ghz", 1.0))  # GHz
 
-    variant = params.get("variant", "spatial_only")  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
+    variant = params.get(
+        "variant",
+        "temporal_same_all_cores",
+    )  # "spatial_only" "temporal_same_all_cores" "temporal_unique_per_core"
 
-    if variant == "temporal_same_all_cores" or variant == "temporal_unique_per_core":
-        temporal_mask_size = params.get("mask_size", 294)
+    temporal_mask_size = normalize_mask_size_for_variant(
+        variant,
+        params.get("mask_size", 294),
+    )
+
+    if task_name == "mackey_glass":
+        task_cfg = MGConfig(
+            t_size=int(t_size),
+            tau=mg_tau,
+            n=mg_n,
+            beta=mg_beta,
+            gamma=mg_gamma,
+            initial_condition=mg_initial_condition,
+            dt=mg_dt,
+            warmup=mg_warmup,
+        )
+    elif task_name == "narma10":
+        task_cfg = NARMA10Config(
+            t_size=int(t_size),
+            warmup=narma_warmup,
+            seed=narma_seed,
+            u_low=narma_u_low,
+            u_high=narma_u_high,
+        )
     else:
-        temporal_mask_size = 1
+        raise ValueError(f"Unknown task_name: {task_name}")
 
-    mg_cfg = MGConfig(t_size=2 ** 10, tau=17, n=10, beta=0.2, gamma=0.1, initial_condition=1.2, dt=1.0)
-
-    mask_cfg = MaskConfig(mask_size=temporal_mask_size, mask_kind="uniform", seed=42,
-                          gain_in=params.get("gain_in", 30.96))
+    mask_cfg = MaskConfig(
+        mask_size=temporal_mask_size,
+        mask_kind=mask_kind,
+        seed=mask_seed,
+        gain_in=params.get("gain_in", 30.96),
+    )
 
     reservoir_cfg = ReservoirConfig(
         fiber_length_m=params.get("fiber_length_m", 0.3),  # 0.1
         time_step_ps=params.get("time_step_ps", 1.0 / temporal_modulation_frequency_ghz * 1e+3),
-        step_number_per_dimensionless_distance=20,
-        upsampling=1,
+        step_number_per_dimensionless_distance=step_number_per_dimensionless_distance,
+        upsampling=upsampling,
         delay_factor_in_symbols=params.get("delay_factor_in_symbols", 1),
-        delay_additional_in_mask_steps=0,
+        delay_additional_in_mask_steps=delay_additional_in_mask_steps,
         layer_count=layer_count,
         layer_radii_array=layer_radii_array,
-        g0_array=_per_core(params, "g0", 0.0158, core_count),
-        psat_array=_per_core(params, "psat", 1.1054e-05, core_count),
+        g0_array=per_core(params, "g0", 0.0158, core_count),
+        psat_array=per_core(params, "psat", 1.1054e-05, core_count),
         kappa=params.get("kappa", 0.793),  # 0.9
         delta_phase=params.get("delta_phase", 0),
+        use_gpu=use_gpu,
+        use_torch=use_torch,
+        num_threads=num_threads,
+        display_debug_plots=display_debug_plots,
+        display_debug_info=display_debug_info,
+        save_figs=save_figs,
+        save_gif=save_gif,
+        max_hours_total=max_hours_total,
+        precision=precision,
+        use_dispersion=use_dispersion,
+        ase_noise_seed=ase_noise_seed if ase_noise_seed is not None else params.get("ase_noise_seed", None),
+        ase_noise_nf_db=ase_noise_nf_db if ase_noise_nf_db is not None else params.get("ase_noise_nf_db", None),
+        ase_noise_optical_bw_hz=(
+            ase_noise_optical_bw_hz if ase_noise_optical_bw_hz is not None
+            else params.get("ase_noise_optical_bw_hz", None)
+        ),
+        ase_noise_compute_effective_osnr=(
+            ase_noise_compute_effective_osnr if ase_noise_compute_effective_osnr is not None
+            else params.get("ase_noise_compute_effective_osnr", False)
+        ),
+    )
+
+    training_cfg = TrainingConfig(
+        feature_mode=training_feature_mode,
+        taps=int(params.get("taps", 1)),
+        ridge_alpha=params.get("ridge_alpha", training_ridge_alpha),
+        washout=params.get("washout", training_washout),
+        target_shift=int(params.get("target_shift", training_target_shift)),
+        train_frac=float(params.get("train_frac", training_train_frac)),
+        val_frac=float(params.get("val_frac", training_val_frac)),
+    )  # для одиночного запуска
+
+    return ExperimentConfig(
+        core_count=core_count,
+        task_name=task_name,
+        task_cfg=task_cfg,
+        mask=mask_cfg,
+        reservoir=reservoir_cfg,
+        training=training_cfg,
+        variant=variant,
+    )
+
+
+# =========================
+# Пример точки входа
+# =========================
+
+if __name__ == "__main__":
+
+    # Базовые параметры
+    force_rerun = False  # игнорировать кэш и считать заново
+    save_cache = False
+
+    ########### Parameters for the best regimes #############
+
+    params = dict(LOCAL_SINGLE_PARAMS or {})
+
+    # Optuna теперь получает свою отдельную базу.
+    # Если optuna_base_params пустой, то для удобства используем выбранный одиночный режим.
+    optuna_params = dict(LOCAL_OPTUNA_BASE_PARAMS or params)
+
+    # Флаги запуска. Удобство в том, что одиночный прогон и Optuna больше не мешают друг другу.
+    run_single_experiment_now = True
+    run_optuna_now = False
+    run_radii_scan_now = False
+
+    ####### Выбор теста ######
+
+    # task_name = "mackey_glass"
+    # task_t_size = 20000
+    # params["taps"] = 1
+
+    task_name = "narma10"
+    task_t_size = 2000
+    params["taps"] = 20
+    optuna_params["taps"] = 1
+    optuna_params["layer_count"] = 1
+    optuna_params["temporal_modulation_frequency_ghz"] = 1
+    optuna_params["variant"] = "temporal_same_all_cores"
+
+    ##########################
+
+    base_cfg = make_experiment_config_from_params(
+        params,
+        task_name=task_name,
+        t_size=task_t_size,
+        narma_warmup=100,
+        narma_seed=42,
+        narma_u_low=0.0,
+        narma_u_high=0.5,
+        mask_kind="uniform",
+        mask_seed=42,
+        step_number_per_dimensionless_distance=20,
+        upsampling=1,
+        delay_additional_in_mask_steps=0,
         use_gpu=False,
         use_torch=False,
         num_threads=1,
@@ -4583,230 +4368,312 @@ if __name__ == "__main__":
         display_debug_info=False,
         save_figs=False,
         max_hours_total=24,
-        precision='float64',
+        precision="float64",
         use_dispersion=False,
-        ase_noise_seed=params.get("ase_noise_seed", mask_cfg.seed), # включает шум в модели
-        ase_noise_nf_db=params.get("ase_noise_nf_db", 0),
-        ase_noise_optical_bw_hz=params.get("ase_noise_optical_bw_hz", 12.5e9),
-        ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
+        # ase_noise_seed=params.get("ase_noise_seed", 42), # включает шум в модели
+        # ase_noise_nf_db=params.get("ase_noise_nf_db", 5),
+        # ase_noise_optical_bw_hz=params.get("ase_noise_optical_bw_hz", 12.5e9),
+        # ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
+        training_feature_mode="intensity",
+        training_ridge_alpha="val_1se_mean",
+        training_washout=500,
+        training_target_shift=1,
+        training_train_frac=0.8,
+        training_val_frac=0.1,
     )
 
-    training_cfg = TrainingConfig(feature_mode="intensity", taps=1, ridge_alpha=0, washout=500,
-                                  target_shift=1,
-                                  train_frac=0.6, val_frac=0.2)  # для одиночного запуска
-
-    base_cfg = ExperimentConfig(core_count=core_count, mg=mg_cfg, mask=mask_cfg,
-                                reservoir=reservoir_cfg, training=training_cfg,
-                                variant=variant)
-
-    mg_cfg.t_size = 20000  # np.min([int(np.ceil(t_size / 500.0)) * 500, 5000])
+    optuna_base_cfg = make_experiment_config_from_params(
+        optuna_params,
+        task_name=task_name,
+        t_size=task_t_size,
+        mask_kind="uniform",
+        mask_seed=42,
+        step_number_per_dimensionless_distance=20,
+        upsampling=1,
+        delay_additional_in_mask_steps=0,
+        use_gpu=False,
+        use_torch=False,
+        num_threads=1,
+        display_debug_plots=False,
+        display_debug_info=False,
+        save_figs=False,
+        max_hours_total=24,
+        precision="float64",
+        use_dispersion=False,
+        # ase_noise_seed=optuna_params.get("ase_noise_seed", 42), # включает шум в модели
+        # ase_noise_nf_db=optuna_params.get("ase_noise_nf_db", 0),
+        # ase_noise_optical_bw_hz=optuna_params.get("ase_noise_optical_bw_hz", 12.5e9),
+        # ase_noise_compute_effective_osnr=optuna_params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
+        training_feature_mode="intensity",
+        training_ridge_alpha="val_1se_mean",
+        training_washout=500,
+        training_target_shift=1,
+        training_train_frac=0.8,
+        training_val_frac=0.1,
+    )
 
     t = time()
 
-    # ================== DEBUG: gain saturation curve at current operating point ==================
-    # data_in_dbg, _mg = (None, None)
-    # if variant == "temporal_unique_per_core":
-    #     data_in_dbg, _mg = generate_input_temporal_unique_per_core(core_count, mg_cfg, mask_cfg)
-    # elif variant == "temporal_same_all_cores":
-    #     data_in_dbg, _mg = generate_input_temporal_same_all_cores(core_count, mg_cfg, mask_cfg)
-    # elif variant == "spatial_only":
-    #     data_in_dbg, _mg = generate_input_spatial_only(core_count, mg_cfg, mask_cfg)
-    # else:
-    #     raise ValueError(f"Unknown variant: {variant}")
-    #
-    # plot_laser_gain_curve_from_params(
-    #         params,
-    #         data_in_dbg,
-    #         core_count=core_count,
-    #         curve_kind="signal",
-    #         core_index=None,          # по умолчанию центральное ядро
-    #         plot_all_cores=True,     # True, если хотите наложить кривые всех ядер
-    #         show_plot=True,
-    #         save_plot=False,
-    #     )
-    #
-    # # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
-    res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+    if run_single_experiment_now:
 
-    # исследование параметра регуляризации
-    sweep = ridge_alpha_sweep_diagnostics(
-        res,
-        title="Current main params",
-    )
-    #
-    # ridge_alpha_selection_compare_diagnostics(
-    #     res,
-    #     alphas=sweep["alpha_grid"],
-    #     title="Current main params",
-    #     selection_rule="1se_largest",
-    #     normalize_selection_scores=False,
-    # )
+        # ================== DEBUG: gain saturation curve at current operating point ==================
+        # data_in_dbg, _mg, _target = (None, None, None)
+        # if base_cfg.variant == "temporal_unique_per_core":
+        #     data_in_dbg, _mg, _target = generate_input_temporal_unique_per_core(
+        #         base_cfg.core_count,
+        #         base_cfg.task_cfg,
+        #         base_cfg.mask,
+        #         base_cfg.task_name,
+        #     )
+        # elif base_cfg.variant == "temporal_same_all_cores":
+        #     data_in_dbg, _mg, _target = generate_input_temporal_same_all_cores(
+        #         base_cfg.core_count,
+        #         base_cfg.task_cfg,
+        #         base_cfg.mask,
+        #         base_cfg.task_name,
+        #     )
+        # elif base_cfg.variant == "spatial_only":
+        #     data_in_dbg, _mg, _target = generate_input_spatial_only(
+        #         base_cfg.core_count,
+        #         base_cfg.task_cfg,
+        #         base_cfg.mask,
+        #         base_cfg.task_name,
+        #     )
+        # else:
+        #     raise ValueError(f"Unknown variant: {base_cfg.variant}")
+        #
+        # plot_laser_gain_curve_from_params(
+        #         params,
+        #         data_in_dbg,
+        #         core_count=base_cfg.core_count,
+        #         curve_kind="signal",
+        #         core_index=None,          # по умолчанию центральное ядро
+        #         plot_all_cores=True,     # True, если хотите наложить кривые всех ядер
+        #         show_plot=True,
+        #         save_plot=False,
+        #     )
+        #
+        # # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
 
-    if base_cfg.reservoir.ase_noise_seed is not None and base_cfg.reservoir.ase_noise_compute_effective_osnr:
-        print("effective_output_osnr_test_db =", res["metrics"]["effective_output_osnr_test_db"])
-    print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
+        res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+
+        # исследование параметра регуляризации
+        sweep = ridge_alpha_sweep_diagnostics(
+            res,
+            title="Current main params",
+        )
+        #
+        # ridge_alpha_selection_compare_diagnostics(
+        #     res,
+        #     alphas=sweep["alpha_grid"],
+        #     title="Current main params",
+        #     selection_rule="1se_largest",
+        #     normalize_selection_scores=False,
+        # )
+
+        if base_cfg.reservoir.ase_noise_seed is not None and base_cfg.reservoir.ase_noise_compute_effective_osnr:
+            print("effective_output_osnr_test_db =", res["metrics"]["effective_output_osnr_test_db"])
+        print("Val/Test NRMSE:", res["metrics"]["nrmse_val"], res["metrics"]["nrmse_test"])
 
     # =============== Optuna: поиск по κ, g0, Psat, L_fiber и gain_in (лог по мощности) ===================
 
-    # Вариант «temporal_same_all_cores» для одной сердцевины;
-    # окно задержки и размер маски тоже можно подстроить.
-    # Для запуска optuna dashboard установи
-    # pip install optuna-dashboard
-    # и выполни в отдельной консоли после запуска расчета (путь укажи свой до папки проекта)
-    # optuna-dashboard "C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/scripts/mcf_reservori_computing/mcf_optuna.journal" --port 8080
-    # Открой в браузере http://127.0.0.1:8080/dashboard/
-    # На линуксе порт 18080, поэтому
-    # открой в браузере http://127.0.0.1:18080/dashboard
+    if run_optuna_now:
 
-    # !!! в статье формула 10 аппроксимирует волокно с потерями 0.75 1/m. А у нас потерь нет!
-    # test_calc_formula10_and_plot_fig7b(
-    #     calc_g0_psat_func=calc_g0_psat_from_p_pump_josab,
-    #     g0_to_gA_factor=1,  # или 1.0 — в зависимости от того, что именно возвращает твой g0
-    #     p_pump_min_mw=25.0,
-    #     p_pump_max_mw=210.0,
-    #     n_grid=500,
-    #     title_suffix="",
-    #     show_psat_fig7a=True,
-    # )
+        # Вариант «temporal_same_all_cores» для одной сердцевины;
+        # окно задержки и размер маски тоже можно подстроить.
+        # Для запуска optuna dashboard установи
+        # pip install optuna-dashboard
+        # и выполни в отдельной консоли после запуска расчета (путь укажи свой до папки проекта)
+        # optuna-dashboard "C:/Users/Igor/YandexDisk/Code/Photonics/fiberprop/scripts/mcf_reservori_computing/mcf_optuna.journal" --port 8080
+        # Открой в браузере http://127.0.0.1:8080/dashboard/
+        # На линуксе порт 18080, поэтому
+        # открой в браузере http://127.0.0.1:18080/dashboard
 
-    # --- Bounds derived from pump->(g0, Psat) fits (Shtyrina et al., JOSAB 34(2), 227 (2017), doi:10.1364/JOSAB.34.000227) ---
-    # Psat[mW] = 0.1292 * Ppump[mW] - 1.096  =>  Psat > 0 при Ppump > ~8.48 mW
-    p_pump_min_w_for_positive_psat = _round((1.096 / 0.1292) * 1e-3 * 0.7, digit=3)  # W
+        # !!! в статье формула 10 аппроксимирует волокно с потерями 0.75 1/m. А у нас потерь нет!
+        # test_calc_formula10_and_plot_fig7b(
+        #     calc_g0_psat_func=calc_g0_psat_from_p_pump_josab,
+        #     g0_to_gA_factor=1,  # или 1.0 — в зависимости от того, что именно возвращает твой g0
+        #     p_pump_min_mw=25.0,
+        #     p_pump_max_mw=210.0,
+        #     n_grid=500,
+        #     title_suffix="",
+        #     show_psat_fig7a=True,
+        # )
 
-    # Оценка верхних границ g0 и psat (на одно ядро) при заданной длине.
-    # Подстрой p_pump_max_single_core_w под доступный (или планируемый) pump laser.
-    p_pump_max_single_core_w = 3  # W
-    fiber_length_for_bounds_m = float(params.get("fiber_length_m", 0.3))
-    try:
-        _g0_b, _psat_b = calc_g0_psat_from_p_pump_josab(p_pump_max_single_core_w, fiber_length_for_bounds_m, alpha=0)
-        g0_max_bound = float(np.asarray(_g0_b).reshape(-1)[0])
-        psat_max_bound = float(np.asarray(_psat_b).reshape(-1)[0])
-    except Exception:
-        g0_max_bound, psat_max_bound = None, None
+        # --- Bounds derived from pump->(g0, Psat) fits (Shtyrina et al., JOSAB 34(2), 227 (2017), doi:10.1364/JOSAB.34.000227) ---
+        # Psat[mW] = 0.1292 * Ppump[mW] - 1.096  =>  Psat > 0 при Ppump > ~8.48 mW
+        p_pump_min_w_for_positive_psat = _round((1.096 / 0.1292) * 1e-3 * 0.7, digit=3)  # W
 
-    print(f"[pump->gain] Psat>0 requires Ppump > {p_pump_min_w_for_positive_psat * 1e3:.2f} mW per core.")
-    if g0_max_bound is not None and psat_max_bound is not None:
-        print(
-            f"[pump->gain] Upper bound estimate (single core): g0~{g0_max_bound:.3g} 1/m, Psat~{psat_max_bound:.3g} W")
+        # Оценка верхних границ g0 и psat (на одно ядро) при заданной длине.
+        # Подстрой p_pump_max_single_core_w под доступный (или планируемый) pump laser.
+        p_pump_max_single_core_w = 3  # W
+        fiber_length_for_bounds_m = float(optuna_params.get("fiber_length_m", 0.3))
+        try:
+            _g0_b, _psat_b = calc_g0_psat_from_p_pump_josab(p_pump_max_single_core_w, fiber_length_for_bounds_m, alpha=0)
+            g0_max_bound = float(np.asarray(_g0_b).reshape(-1)[0])
+            psat_max_bound = float(np.asarray(_psat_b).reshape(-1)[0])
+        except Exception:
+            g0_max_bound, psat_max_bound = None, None
 
-    # SLM для накачки: оптимизируем общую мощность pump laser и «веса» распределения по ядрам.
-    # pump_slm_w_spec = [{"low": -3.0, "high": 3.0} for _ in range(core_count)]
-    #
-    # param_space = {
-    #     "kappa": {"low": 0.2, "high": 0.99, "sig": 5},
-    #     "delta_phase": 0,  # {"low": 0.0, "high": 2 * np.pi, "sig": 5},
-    #
-    #     # Pump-laser total power (W) + SLM weights -> per-core pump powers via softmax.
-    #     "p_pump_total": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 5},
-    #     "pump_slm_w": pump_slm_w_spec,
-    #
-    #     # Если хочешь вернуться к независимой оптимизации ppump по ядрам — используй ключ "ppump" вместо двух выше.
-    #     # "ppump": [{"low": 0.01, "high": 1.0, "log": True} for _ in range(core_count)],
-    #
-    #     "fiber_length_m": {"low": 0.001, "high": 10, "log": True, "sig": 5},
-    #     "gain_in": {"low": 0.001, "high": 0.1, "log": True, "sig": 5},
-    #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
-    #     "time_step_ps": reservoir_cfg.time_step_ps,
-    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True, "sig": 5},
-    # }
+        print(f"[pump->gain] Psat>0 requires Ppump > {p_pump_min_w_for_positive_psat * 1e3:.2f} mW per core.")
+        if g0_max_bound is not None and psat_max_bound is not None:
+            print(
+                f"[pump->gain] Upper bound estimate (single core): g0~{g0_max_bound:.3g} 1/m, Psat~{psat_max_bound:.3g} W")
 
-    # param_space = {
-    #     "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
-    #     "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
-    #     # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
-    #     "ppump": [
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
-    #         {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 10
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 11
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 12
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 13
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 14
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 15
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 16
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 17
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 18
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 19
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 20
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 21
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 22
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 23
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 24
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 25
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 26
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 27
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 28
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 29
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 30
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 31
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 32
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 33
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 34
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
-    #         # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
-    #     ],
-    #     "fiber_length_m": {"low": 0.01, "high": 0.5, "log": False, "sig": 3},
-    #     "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
-    #     "mask_size": 1, #{"int": True, "low": 5, "high": 350, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 1},
-    #     "time_step_ps": reservoir_cfg.time_step_ps,
-    #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
-    # }
-    #
-    # base_cfg.training.train_frac = 0.6
-    # base_cfg.training.val_frac = 0.2
-    # res = run_experiments(
-    #     base_cfg,
-    #     n_trials_opt=1000000,  # сколько попробовать конфигураций
-    #     param_space=param_space,
-    #     force_rerun=False,  # используй кэш, если ключ совпал
-    #     save_cache=False,
-    # )
-    # print("Лучший результат Optuna:\n", res)
+        param_space = LOCAL_OPTUNA_PARAM_SPACE
+
+        # SLM для накачки: оптимизируем общую мощность pump laser и «веса» распределения по ядрам.
+        # pump_slm_w_spec = [{"low": -3.0, "high": 3.0} for _ in range(optuna_base_cfg.core_count)]
+        #
+        # param_space = {
+        #     "kappa": {"low": 0.2, "high": 0.99, "sig": 5},
+        #     "delta_phase": 0,  # {"low": 0.0, "high": 2 * np.pi, "sig": 5},
+        #
+        #     # Pump-laser total power (W) + SLM weights -> per-core pump powers via softmax.
+        #     "p_pump_total": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 5},
+        #     "pump_slm_w": pump_slm_w_spec,
+        #
+        #     # Если хочешь вернуться к независимой оптимизации ppump по ядрам — используй ключ "ppump" вместо двух выше.
+        #     # "ppump": [{"low": 0.01, "high": 1.0, "log": True} for _ in range(optuna_base_cfg.core_count)],
+        #
+        #     "fiber_length_m": {"low": 0.001, "high": 10, "log": True, "sig": 5},
+        #     "gain_in": {"low": 0.001, "high": 0.1, "log": True, "sig": 5},
+        #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
+        #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
+        #     "time_step_ps": optuna_base_cfg.reservoir.time_step_ps,
+        #     # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True, "sig": 5},
+        # }
+
+        param_space = {
+            "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
+            "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
+            # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
+            "ppump": [
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 10
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 11
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 12
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 13
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 14
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 15
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 16
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 17
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 18
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 19
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 20
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 21
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 22
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 23
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 24
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 25
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 26
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 27
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 28
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 29
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 30
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 31
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 32
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 33
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 34
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
+                # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
+            ],
+            "fiber_length_m": {"low": 0.01, "high": 0.5, "log": False, "sig": 3},
+            "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
+            "mask_size": {"int": True, "low": 5, "high": 350, "step": 1},
+            "delay_factor_in_symbols": {"int": True, "low": 1, "high": 20},
+            "time_step_ps": optuna_base_cfg.reservoir.time_step_ps,
+            # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+        }
+
+        optuna_base_cfg.training.train_frac = 0.8
+        optuna_base_cfg.training.val_frac = 0.1
+
+        if param_space is None:
+            raise ValueError(
+                "param_space is None. Задай optuna_param_space в mcf_optimized_regimes.py "
+                "или раскомментируй один из блоков param_space в main."
+            )
+
+        res = run_experiments(
+            optuna_base_cfg,
+            n_trials_opt=1000000,  # сколько попробовать конфигураций
+            param_space=param_space,
+            force_rerun=False,  # используй кэш, если ключ совпал
+            save_cache=False,
+        )
+        print("Лучший результат Optuna:\n", res)
 
     # ==================== Зависимость NMRSE от коэффициента связи при наличии временной маски =========================
 
-    # n_jobs = 5
-    #
-    # part1 = np.linspace(15, 30, n_jobs * 50, endpoint=False)
-    # part2 = np.linspace(30, 60, n_jobs * 100, endpoint=True)
-    # radii = np.concatenate((part1, part2))
-    # np.random.shuffle(radii)
-    #
-    # find_best_coupling_coefficient([], # radii.tolist(),
-    #                                merge_with_existing=True,
-    #                                variant=variant, base_cfg=base_cfg, n_jobs=n_jobs, logx=True, logy=True)
+    if run_radii_scan_now:
 
-    # ====================== Зависимость NMRSE от коэффициента связи без временной маски с оптимизацией ================
+        # n_jobs = 5
+        #
+        # part1 = np.linspace(15, 30, n_jobs * 50, endpoint=False)
+        # part2 = np.linspace(30, 60, n_jobs * 100, endpoint=True)
+        # radii = np.concatenate((part1, part2))
+        # np.random.shuffle(radii)
+        #
+        # find_best_coupling_coefficient([], # radii.tolist(),
+        #                                merge_with_existing=True,
+        #                                variant=optuna_base_cfg.variant,
+        #                                base_cfg=optuna_base_cfg,
+        #                                n_jobs=n_jobs,
+        #                                logx=True,
+        #                                logy=True)
 
-    # part1 = np.linspace(20, 30, 5, endpoint=False)
-    # part2 = np.linspace(30, 60, 5, endpoint=True)
-    # radii = np.concatenate((part1, part2))[::-1]
-    # # np.random.shuffle(radii)
-    #
-    # param_space = {
-    #     "kappa": {"low": 0.2, "high": 0.99},
-    #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
-    #     "g0": {"low": 0.001, "high": g0_max "log": True},
-    #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
-    #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
-    #     "gain_in": {"low": 1.0, "high": 100.0, "log": True},
-    #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
-    #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
-    #     # "time_step_ps": {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
-    # }
-    #
-    # run_spatial_only_radii_optuna(base_cfg, radii.tolist(), n_trials_opt=10, force_rerun=False, save_cache=False,
-    #                               logx=True, logy=True,
-    #                               param_space=param_space)
+        # ====================== Зависимость NMRSE от коэффициента связи без временной маски с оптимизацией ================
+
+        # part1 = np.linspace(20, 30, 5, endpoint=False)
+        # part2 = np.linspace(30, 60, 5, endpoint=True)
+        # radii = np.concatenate((part1, part2))[::-1]
+        # # np.random.shuffle(radii)
+        #
+        # param_space = {
+        #     "kappa": {"low": 0.2, "high": 0.99},
+        #     "delta_phase": {"low": 0.0, "high": 2 * np.pi},
+        #     "g0": {"low": 0.001, "high": g0_max "log": True},
+        #     "psat": {"low": 1e-5, "high": 1, "log": True},  # 1e-4  # фиксированное, не тюним
+        #     "fiber_length_m": {"low": 0.01, "high": 1, "log": True},
+        #     "gain_in": {"low": 1.0, "high": 100.0, "log": True},
+        #     "mask_size": {"int": True, "low": 5, "high": 300, "step": 1},
+        #     "delay_factor_in_symbols": {"int": True, "low": 1, "high": 50},
+        #     # "time_step_ps": {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
+        # }
+        #
+
+        n_jobs = 5
+
+        part1 = np.linspace(20, 30, 5, endpoint=False)
+        part2 = np.linspace(30, 60, 5, endpoint=True)
+        radii = np.concatenate((part1, part2))[::-1]
+        # np.random.shuffle(radii)
+
+        if param_space is None:
+            raise ValueError(
+                "param_space is None. Задай optuna_param_space в mcf_optimized_regimes.py "
+                "или раскомментируй один из блоков param_space в main."
+            )
+
+        run_spatial_only_radii_optuna(
+            optuna_base_cfg,
+            radii.tolist(),
+            n_trials_opt=10,
+            force_rerun=False,
+            save_cache=False,
+            logx=True,
+            logy=True,
+            param_space=param_space,
+        )
 
     print("Total elapsed time =", time() - t)

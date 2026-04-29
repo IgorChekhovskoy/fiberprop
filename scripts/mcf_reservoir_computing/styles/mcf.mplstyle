@@ -80,6 +80,7 @@ savefig.format: pdf
 # В PDF/SVG держим текст как ТЕКСТ (не кривые) — проще редактировать и соответствовать шрифтовым требованиям
 pdf.fonttype: 42            # TrueType text; увеличивает удобство редактуры (размер файла может быть больше). :contentReference[oaicite:5]{index=5}
 ps.fonttype: 42
+svg.fonttype: none
 
 # Единообразная научная запись (1.23×10^4) через мат-текст
 axes.formatter.use_mathtext: True
