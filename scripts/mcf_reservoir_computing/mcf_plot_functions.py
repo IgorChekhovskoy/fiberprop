@@ -128,14 +128,22 @@ def _task_sequences_full_for_debug(task_name: TaskName,
             )
 
         u_used = u_full[warmup:].astype(float, copy=False)
-        mu = float(np.mean(u_used))
-        sigma = float(np.std(u_used))
-        if sigma < 1e-12:
+        u_mu = float(np.mean(u_used))
+        u_sigma = float(np.std(u_used))
+        if u_sigma < 1e-12:
             u_full_norm = np.zeros_like(u_full, dtype=float)
         else:
-            u_full_norm = (u_full - mu) / sigma
+            u_full_norm = (u_full - u_mu) / u_sigma
 
-        return u_full_norm, y_full, warmup
+        y_used = y_full[warmup:].astype(float, copy=False)
+        y_mu = float(np.mean(y_used))
+        y_sigma = float(np.std(y_used))
+        if y_sigma < 1e-12:
+            y_full_norm = np.zeros_like(y_full, dtype=float)
+        else:
+            y_full_norm = (y_full - y_mu) / y_sigma
+
+        return u_full_norm, y_full_norm, warmup
 
     raise ValueError(f"Unknown task_name: {task_name}")
 
@@ -345,7 +353,7 @@ def debug_plot_input_overview(cfg,
 
 def debug_plot_mg_attractor(cfg,
                             mg_series_used: np.ndarray,
-                            title: str = "Mackey-Glass attractor (delay embedding)"):
+                            title: str = ""):
     """
     3D-визуализация аттрактора Mackey–Glass по delay-embedding: (x(t), x(t-τ), x(t-2τ)).
     Сегменты shift/washout/train/val/test рисуются только если их длина ≥ 2.
@@ -1126,3 +1134,622 @@ def plot_combined_csv_results(base_cfg, logx: bool = False, logy: bool = False, 
             combined_df.to_csv(p_csv, index=False)
         except Exception as e:
             print(f"[warn] write combined csv failed: {e}")
+
+
+def plot_mg_dataset_split_for_article(cfg,
+                                      target_series: Optional[np.ndarray] = None,
+                                      *,
+                                      title: str = "Mackey--Glass series with chronological data split",
+                                      save_fig: Optional[bool] = None,
+                                      explicit_path: Optional[Union[str, Path]] = None,
+                                      show_plot: bool = True):
+    """
+    Публикационный график для статьи:
+      1) показывает только ряд Mackey--Glass;
+      2) показывает только train, validation, test;
+      3) не показывает target shift, внутренний initial drop и temporal masks отдельными областями.
+
+    Важно:
+      • warmup генератора задачи уже отброшен в target_series;
+      • cfg.training.washout — внутреннее техническое имя для дополнительного initial drop;
+      • cfg.training.target_shift нужен для one-step-ahead задачи, но отдельной областью не рисуется.
+    """
+    if str(getattr(cfg, "task_name", "")) != "mackey_glass":
+        raise ValueError("plot_mg_dataset_split_for_article is intended only for task_name='mackey_glass'")
+
+    if target_series is None:
+        _, target_full, task_warmup = _task_sequences_full_for_debug("mackey_glass", cfg.task_cfg)
+        target_series = target_full[int(task_warmup):]
+
+    target_series = np.asarray(target_series, dtype=float).reshape(-1)
+    if target_series.size < 10:
+        raise ValueError("Mackey--Glass series is too short for plotting")
+
+    M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
+    initial_drop_samples = get_washout_samples(cfg)
+    initial_drop_syms = int(np.ceil(int(initial_drop_samples) / max(1, int(M_eff))))
+
+    shift_syms = int(getattr(cfg.training, "target_shift", 0) or 0)
+    shift_syms = max(0, shift_syms)
+
+    usable_len = int(target_series.size) - initial_drop_syms - shift_syms
+    if usable_len <= 0:
+        raise ValueError(
+            "Not enough Mackey--Glass symbols after initial_drop and target_shift: "
+            f"S={target_series.size}, initial_drop={initial_drop_syms}, target_shift={shift_syms}"
+        )
+
+    train_frac = float(getattr(cfg.training, "train_frac", 0.8))
+    val_frac = float(getattr(cfg.training, "val_frac", 0.1))
+    sl_train, sl_val, sl_test = split_train_val_test(usable_len, train_frac, val_frac)
+
+    n_train = int(sl_train.stop - sl_train.start)
+    n_val = int(sl_val.stop - sl_val.start)
+    n_test = int(sl_test.stop - sl_test.start)
+
+    i_drop_L = 0
+    i_drop_R = initial_drop_syms
+    i_tr_L = i_drop_R
+    i_tr_R = i_tr_L + n_train
+    i_va_L = i_tr_R
+    i_va_R = i_va_L + n_val
+    i_te_L = i_va_R
+    i_te_R = i_te_L + n_test
+
+    visible_len = i_te_R
+    if visible_len > target_series.size:
+        visible_len = int(target_series.size)
+
+    x = np.arange(visible_len, dtype=int)
+    y = target_series[:visible_len]
+
+    fig, ax = plt.subplots(figsize=(COL2, COL2 * 0.38), constrained_layout=True)
+
+    ax.plot(x, y, linewidth=1.1, label="Mackey--Glass series")
+    ax.set_xlim(int(x[0]), int(x[-1]))
+    ax.margins(x=0.0)
+
+    def span_if(a, b, color, label, alpha=0.16):
+        a, b = int(a), int(b)
+        if b - a < 1:
+            return
+        a_plot = max(a, int(x[0]))
+        b_plot = min(b, int(x[-1]) + 1)
+        if b_plot - a_plot < 1:
+            return
+        ax.axvspan(a_plot, b_plot, color=color, alpha=alpha, label=label)
+
+    span_if(i_drop_L, i_drop_R, "#888888", "initial drop")
+    span_if(i_tr_L, i_tr_R, "#2ca02c", "train")
+    span_if(i_va_L, i_va_R, "#9467bd", "validation")
+    span_if(i_te_L, i_te_R, "#d62728", "test")
+
+    for xpos in (i_drop_R, i_tr_R, i_va_R):
+        if int(x[0]) < xpos < int(x[-1]):
+            ax.axvline(xpos, color="k", linewidth=0.8, alpha=0.25)
+
+    ax.set_title(title, loc="left")
+    ax.set_xlabel("symbol index")
+    ax.set_ylabel("normalized amplitude")
+
+    split_text = (
+        f"initial drop: {initial_drop_syms}, "
+        f"train/validation/test: {n_train}/{n_val}/{n_test}"
+    )
+    ax.text(
+        0.01,
+        0.02,
+        split_text,
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.70),
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        uniq = dict(zip(labels, handles))
+        leg = ax.legend(uniq.values(), uniq.keys(), loc="upper right", frameon=True)
+        leg.get_frame().set_facecolor((1, 1, 1, 0.70))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.25))
+
+    if save_fig is None:
+        save_fig = bool(getattr(cfg.reservoir, "save_figs", False))
+
+    _maybe_savefig(
+        fig,
+        "mg_dataset_split_for_article",
+        explicit_path=explicit_path,
+        enabled=save_fig,
+    )
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+
+
+# =============================================================================
+# Article figures: final overrides/additions
+# =============================================================================
+
+
+def _hex_core_centers_for_scheme(ring_count: int,
+                                 core_pitch_um: float) -> np.ndarray:
+    """
+    Координаты центров сердцевин для hexagonal MCF.
+
+    Важно: используется та же логика, что и в fiber_base_functions.get_coupling_coefficients(...),
+    чтобы объединённый рисунок повторял одиночные схемы волокна.
+    """
+    from fiberprop.fiber_geometry import CoreConfig, make_eq_mask, get_core_count
+
+    ring_count = int(ring_count)
+    if ring_count < 0:
+        raise ValueError("ring_count must be >= 0")
+
+    core_count = int(get_core_count(CoreConfig.hexagonal, ring_count))
+    mask_array = make_eq_mask(
+        core_configuration=CoreConfig.hexagonal,
+        size=core_count,
+        ring_count=ring_count,
+        display_debug_info=False,
+    )
+    distance_to_fiber_center = [float(k) * float(core_pitch_um) for k in range(ring_count + 1)]
+
+    core_center_coords = []
+    for i in range(core_count):
+        dimensional_radius = np.sqrt(
+            (mask_array[i].number_2d_x * 0.5) ** 2 +
+            (mask_array[i].number_2d_y * 0.5 * np.sqrt(3.0)) ** 2
+        )
+        ring_index = int(np.ceil(dimensional_radius))
+        x_coord = distance_to_fiber_center[ring_index] * mask_array[i].number_2d_x * 0.5 / max(ring_index, 1)
+        y_coord = distance_to_fiber_center[ring_index] * mask_array[i].number_2d_y * 0.5 * np.sqrt(3.0) / max(ring_index, 1)
+        core_center_coords.append((x_coord, y_coord))
+
+    return np.asarray(core_center_coords, dtype=float)
+
+
+def plot_mcf_fiber_schemes_for_article(*,
+                                        core_pitch_um: float = 30.0,
+                                        core_radius_um: float = 2.95,
+                                        cladding_diameter_um: float = 250.0,
+                                        title: Optional[str] = None,
+                                        save_fig: bool = True,
+                                        explicit_path: Optional[Union[str, Path]] = None,
+                                        show_plot: bool = True):
+    """
+    Рисует две схемы MCF в одном файле в стиле Fig. 2 статьи:
+      (a) 7-core hexagonal MCF;
+      (b) 19-core hexagonal MCF.
+
+    Панели рисуются через уже существующую функцию fiber_base_functions.plot_core_centers(...),
+    чтобы одиночные и объединённые схемы имели одинаковую геометрию и стиль.
+    """
+    from fiberprop.fiber_base_functions import plot_core_centers
+
+    fig, axes = plt.subplots(1, 2, figsize=(COL2, COL2 * 0.47), constrained_layout=False)
+    fig.subplots_adjust(left=0.090, right=0.985, bottom=0.205, top=0.960, wspace=0.30)
+
+    coords_7 = _hex_core_centers_for_scheme(1, core_pitch_um)
+    coords_19 = _hex_core_centers_for_scheme(2, core_pitch_um)
+
+    plot_core_centers(
+        coords_7,
+        core_radius_um,
+        cladding_diameter_um,
+        title="",
+        color="red",
+        annotate_indices=False,
+        scale_bar_um=None,
+        save_path=None,
+        show=False,
+        ax=axes[0],
+    )
+    plot_core_centers(
+        coords_19,
+        core_radius_um,
+        cladding_diameter_um,
+        title="",
+        color="red",
+        annotate_indices=False,
+        scale_bar_um=None,
+        save_path=None,
+        show=False,
+        ax=axes[1],
+    )
+
+    for ax, panel_label in zip(axes, ("(a)", "(b)")):
+        ax.text(
+            0.045,
+            0.955,
+            panel_label,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=1.0),
+        )
+
+    if title:
+        fig.suptitle(title, x=0.090, ha="left")
+
+    _maybe_savefig(
+        fig,
+        "mcf_fiber_schemes_for_article",
+        explicit_path=explicit_path,
+        enabled=save_fig,
+    )
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+
+
+def plot_fit_predict_scatter(y_true: np.ndarray,
+                             y_pred: np.ndarray,
+                             tau=None,
+                             n_power=None,
+                             plot_params: Optional[dict] = None,
+                             *,
+                             cfg: Optional[ExperimentConfig] = None,
+                             title: Optional[str] = None,
+                             split_name: str = "validation",
+                             max_points: Optional[int] = None,
+                             save_fig: Optional[bool] = None,
+                             explicit_path: Optional[Union[str, Path]] = None) -> float:
+    """
+    Scatter-график "истина против прогноза" для readout.
+
+    Совместимость:
+      • старый студенческий вызов plot_fit_predict_scatter(y_true, y_pred) сохраняется;
+      • старые аргументы tau/n_power/plot_params не ломают вызовы, но оформление приведено к стилю основного модуля.
+
+    Возвращает NRMSE по всем переданным точкам.
+    """
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
+    n = min(y_true.shape[0], y_pred.shape[0])
+    if n == 0:
+        fig, ax = plt.subplots(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
+        ax.set_title("Fit-predict scatter\nNRMSE=—", loc="left")
+        ax.set_xlabel("ground truth")
+        ax.set_ylabel("prediction")
+        _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
+        plt.show()
+        return float("nan")
+
+    y_true = y_true[:n]
+    y_pred = y_pred[:n]
+
+    err = float("nan") if n < 2 else float(nrmse(y_true, y_pred))
+
+    finite_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(finite_mask):
+        fig, ax = plt.subplots(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
+        ax.set_title("Fit-predict scatter\nNRMSE=—", loc="left")
+        ax.set_xlabel("ground truth")
+        ax.set_ylabel("prediction")
+        _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
+        plt.show()
+        return float("nan")
+
+    yt = y_true[finite_mask]
+    yp = y_pred[finite_mask]
+
+    if max_points is not None and int(max_points) > 0 and yt.shape[0] > int(max_points):
+        idx = np.linspace(0, yt.shape[0] - 1, int(max_points), dtype=int)
+        yt_plot = yt[idx]
+        yp_plot = yp[idx]
+    else:
+        yt_plot = yt
+        yp_plot = yp
+
+    min_v = float(min(np.min(yt), np.min(yp)))
+    max_v = float(max(np.max(yt), np.max(yp)))
+
+    if np.isclose(min_v, max_v):
+        pad = 1.0 if np.isclose(min_v, 0.0) else 0.05 * abs(min_v)
+    else:
+        pad = 0.04 * (max_v - min_v)
+
+    lo = min_v - pad
+    hi = max_v + pad
+
+    if plot_params is not None and "figsize" in plot_params:
+        figsize = plot_params["figsize"]
+    else:
+        figsize = (COL2 * 0.62, COL2 * 0.62)
+
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+
+    marker_size = 7.0
+    marker_alpha = 0.48
+    if plot_params is not None:
+        marker_size = float(plot_params.get("s", marker_size))
+        marker_alpha = float(plot_params.get("scatter_alpha", marker_alpha))
+
+    ax.scatter(
+        yt_plot,
+        yp_plot,
+        s=marker_size,
+        alpha=marker_alpha,
+        linewidths=0.0,
+        rasterized=yt_plot.shape[0] > 3000,
+        label="samples",
+    )
+
+    ax.plot([lo, hi], [lo, hi], ls="--", lw=1.2, color="0.20", label="ideal prediction")
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+
+    for spine in ax.spines.values():
+        spine.set_linewidth(float(plt.rcParams.get("axes.linewidth", 1.0)))
+        spine.set_visible(True)
+
+    if title is None:
+        if cfg is not None:
+            meta = task_debug_meta(getattr(cfg, "task_name", "mackey_glass"))
+            title = f"{meta['task_title']}: {split_name} fit-predict"
+        else:
+            title = f"Fit-predict scatter: {split_name}"
+
+    ax.set_title(f"{title}\nNRMSE={err:.4g}", loc="left")
+    ax.set_xlabel("ground truth")
+    ax.set_ylabel("prediction")
+    ax.legend(loc="upper left", frameon=True)
+
+    if save_fig is None:
+        save_fig = bool(getattr(getattr(cfg, "reservoir", None), "save_figs", False)) if cfg is not None else False
+
+    safe_split = str(split_name).strip().replace(" ", "_") or "split"
+    _maybe_savefig(
+        fig,
+        f"fit_predict_scatter_{safe_split}",
+        explicit_path=explicit_path,
+        enabled=save_fig,
+    )
+    plt.show()
+
+    return err
+
+
+def plot_mg_series_and_attractor_for_article(cfg,
+                                            target_series: Optional[np.ndarray] = None,
+                                            *,
+                                            title: Optional[str] = None,
+                                            save_fig: Optional[bool] = None,
+                                            explicit_path: Optional[Union[str, Path]] = None,
+                                            show_plot: bool = True,
+                                            train_frac: float = 0.8,
+                                            val_frac: float = 0.1,
+                                            attractor_line_alpha: float = 0.82,
+                                            attractor_linewidth: float = 0.9):
+    """
+    Финальный рисунок для статьи в стиле текущего Fig. 4:
+      (a) слева — нормированный ряд Mackey-Glass с warm-up / train / validation / test;
+      (b) справа — аттрактор Mackey-Glass в координатах (x(t), x(t-tau), x(t-2tau)).
+
+    По умолчанию используется split 8:1:1, а warm-up берётся из cfg.task_cfg.warmup.
+    Возвращает fig. Для сохранения используется общий _maybe_savefig и rcParams/savefig.format.
+    """
+    from matplotlib.ticker import FixedLocator
+    from matplotlib.lines import Line2D
+
+    if str(getattr(cfg, "task_name", "")) != "mackey_glass":
+        raise ValueError("plot_mg_series_and_attractor_for_article is intended only for task_name='mackey_glass'")
+
+    _input_full, target_full, task_warmup = _task_sequences_full_for_debug("mackey_glass", cfg.task_cfg)
+    full_series = np.asarray(target_full, dtype=float).reshape(-1)
+    task_warmup = int(task_warmup)
+
+    if target_series is None:
+        n_seq = int(getattr(cfg.task_cfg, "t_size", full_series.size - task_warmup))
+    else:
+        n_seq = int(np.asarray(target_series).reshape(-1).size)
+
+    n_seq = max(1, min(n_seq, int(full_series.size) - task_warmup))
+    if task_warmup + n_seq > full_series.size:
+        raise ValueError("Mackey-Glass full series is too short for the requested warm-up and retained sequence")
+
+    train_frac = float(train_frac)
+    val_frac = float(val_frac)
+    if train_frac < 0.0 or val_frac < 0.0 or train_frac + val_frac >= 1.0:
+        raise ValueError("train_frac and val_frac must be non-negative and train_frac + val_frac < 1")
+
+    n_train = int(n_seq * train_frac)
+    n_val = int(n_seq * val_frac)
+    n_test = int(n_seq - n_train - n_val)
+
+    i_warm_L = 0
+    i_warm_R = task_warmup
+    i_tr_L = i_warm_R
+    i_tr_R = i_tr_L + n_train
+    i_va_L = i_tr_R
+    i_va_R = i_va_L + n_val
+    i_te_L = i_va_R
+    i_te_R = i_te_L + n_test
+
+    visible_len = int(i_te_R)
+    x = np.arange(visible_len, dtype=int)
+    y = full_series[:visible_len]
+
+    retained = full_series[task_warmup:task_warmup + n_seq]
+    tau_samples = max(1, int(round(float(cfg.task_cfg.tau) / float(cfg.task_cfg.dt))))
+    off = 2 * tau_samples
+    if retained.size <= off + 1:
+        raise ValueError(f"Mackey-Glass retained series is shorter than 2tau: S={retained.size}, 2tau={off}")
+
+    X = retained[off:]
+    Y = retained[tau_samples:-tau_samples]
+    Z = retained[:-off]
+    L = X.shape[0]
+
+    i_tr_attr = (0, n_train)
+    i_va_attr = (n_train, n_train + n_val)
+    i_te_attr = (n_train + n_val, n_train + n_val + n_test)
+
+    fig = plt.figure(figsize=(COL2 * 1.58, COL2 * 0.52), constrained_layout=False)
+    ax1 = fig.add_axes([0.055, 0.205, 0.600, 0.705])
+    ax2 = fig.add_axes([0.680, 0.155, 0.305, 0.790], projection="3d")
+
+    ax1.plot(x, y, linewidth=1.0, label="Mackey-Glass series", zorder=3)
+    ax1.set_xlim(int(x[0]), int(x[-1]))
+    ax1.margins(x=0.0)
+
+    def span_if(a, b, color, label, alpha=0.16):
+        a, b = int(a), int(b)
+        if b - a < 1:
+            return
+        a_plot = max(a, int(x[0]))
+        b_plot = min(b, int(x[-1]) + 1)
+        if b_plot - a_plot < 1:
+            return
+        ax1.axvspan(a_plot, b_plot, color=color, alpha=alpha, label=label, zorder=1)
+
+    span_if(i_warm_L, i_warm_R, "#888888", "warm-up")
+    span_if(i_tr_L, i_tr_R, "#2ca02c", "train")
+    span_if(i_va_L, i_va_R, "#9467bd", "validation")
+    span_if(i_te_L, i_te_R, "#d62728", "test")
+
+    for xpos in (i_warm_R, i_tr_R, i_va_R):
+        if int(x[0]) < xpos < int(x[-1]):
+            ax1.axvline(xpos, color="k", linewidth=0.8, alpha=0.25, zorder=2)
+
+    ax1.set_title("Mackey-Glass series with chronological data split", loc="left", pad=7.0)
+    ax1.set_xlabel("symbol index")
+    ax1.set_ylabel("normalized amplitude")
+
+    split_text = f"warm-up: {task_warmup}, train/validation/test: {n_train}/{n_val}/{n_test}"
+    ax1.text(
+        0.012,
+        0.035,
+        split_text,
+        transform=ax1.transAxes,
+        ha="left",
+        va="bottom",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.78, pad=1.5),
+        zorder=5,
+    )
+
+    handles, labels = ax1.get_legend_handles_labels()
+    if handles:
+        uniq = dict(zip(labels, handles))
+        leg = ax1.legend(
+            uniq.values(),
+            uniq.keys(),
+            loc="upper right",
+            bbox_to_anchor=(0.985, 0.985),
+            frameon=True,
+            handlelength=1.8,
+            labelspacing=0.25,
+            borderpad=0.35,
+        )
+        leg.get_frame().set_facecolor((1, 1, 1, 0.74))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.28))
+
+    ax2.set_proj_type("ortho")
+    ax2.view_init(elev=20, azim=-15)
+    ax2.grid(False)
+
+    xyz_all = np.concatenate([X, Y, Z])
+    finite_xyz = xyz_all[np.isfinite(xyz_all)]
+    lim = float(np.nanmax(np.abs(finite_xyz))) if finite_xyz.size else 1.0
+    lim = max(1.6, 1.02 * lim)
+    ticks = [-1.5, 0.0, 1.5]
+
+    ax2.set_xlim(-lim, lim)
+    ax2.set_ylim(-lim, lim)
+    ax2.set_zlim(-lim, lim)
+    ax2.set_box_aspect((1.0, 1.0, 0.86))
+
+    for axis in (ax2.xaxis, ax2.yaxis, ax2.zaxis):
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((0, 0, 0, 0))
+        axis.set_major_locator(FixedLocator(ticks))
+
+    ax2.set_xlabel(r"$x(t)$", labelpad=3.0)
+    ax2.set_ylabel(r"$x(t-\tau)$", labelpad=3.0)
+    ax2.set_zlabel(r"$x(t-2\tau)$", labelpad=3.0)
+
+    line_alpha = float(np.clip(attractor_line_alpha, 0.0, 1.0))
+    lw = float(attractor_linewidth)
+    legend_items = []
+
+    def plot_segment(name, color, bounds, min_len: int = 2):
+        a, b = int(bounds[0]), int(bounds[1])
+        aa, bb = max(a, off), min(b, retained.size)
+        if bb - aa >= min_len:
+            lo = max(0, min(aa - off, L))
+            hi = max(0, min(bb - off, L))
+            if hi - lo >= min_len:
+                ax2.plot(
+                    X[lo:hi],
+                    Y[lo:hi],
+                    Z[lo:hi],
+                    color=color,
+                    alpha=line_alpha,
+                    linewidth=lw,
+                    solid_capstyle="round",
+                    label=name,
+                )
+                legend_items.append(Line2D([0], [0], color=color, linewidth=1.25, label=name))
+                return True
+        return False
+
+    for name, color, bounds in (
+            ("train", "#2ca02c", i_tr_attr),
+            ("validation", "#9467bd", i_va_attr),
+            ("test", "#d62728", i_te_attr)):
+        plot_segment(name, color, bounds)
+
+    if legend_items:
+        uniq = {}
+        for item in legend_items:
+            uniq[item.get_label()] = item
+        leg = ax2.legend(
+            uniq.values(),
+            uniq.keys(),
+            bbox_to_anchor=(0.03, 0.98),
+            loc="upper left",
+            frameon=True,
+            title="Segments:",
+            handlelength=1.7,
+            labelspacing=0.25,
+            borderpad=0.35,
+        )
+        leg.get_frame().set_facecolor((1, 1, 1, 0.74))
+        leg.get_frame().set_edgecolor((0, 0, 0, 0.30))
+
+    fig.text(0.355, 0.050, "(a)", ha="center", va="center")
+    fig.text(0.832, 0.050, "(b)", ha="center", va="center")
+
+    if title:
+        fig.suptitle(title, x=0.055, ha="left")
+
+    if save_fig is None:
+        save_fig = bool(getattr(cfg.reservoir, "save_figs", False))
+
+    _maybe_savefig(
+        fig,
+        "mg_series_and_attractor_for_article",
+        explicit_path=explicit_path,
+        enabled=save_fig,
+    )
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+

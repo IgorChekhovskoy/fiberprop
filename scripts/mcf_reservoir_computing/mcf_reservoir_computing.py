@@ -35,6 +35,7 @@ from scripts.mcf_reservoir_computing.mcf_auxiliary_functions import (
     json_dumps_compact,
     learning_curve_for_result_plotly,
     plot_laser_gain_curve_from_params,
+    plot_gain_operating_maps_from_regimes,
     apply_readout,
     ridge_alpha_sweep_diagnostics,
     ridge_alpha_selection_compare_diagnostics
@@ -45,21 +46,19 @@ from scripts.mcf_reservoir_computing.mcf_plot_functions import (
     debug_plot_mg_attractor,
     debug_plot_readout_train_val_test,
     debug_plot_post_training_comparison,
-    plot_combined_csv_results,
+    # plot_combined_csv_results,
     plot_fit_predict_scatter,
+    plot_mcf_fiber_schemes_for_article,
+    plot_mg_series_and_attractor_for_article,
     update_plots_and_save,
 )
 
 try:
     from scripts.mcf_reservoir_computing.mcf_optimized_regimes import (
         single_params as LOCAL_SINGLE_PARAMS,
-        optuna_base_params as LOCAL_OPTUNA_BASE_PARAMS,
-        optuna_param_space as LOCAL_OPTUNA_PARAM_SPACE,
     )
 except ImportError:
     LOCAL_SINGLE_PARAMS = {}
-    LOCAL_OPTUNA_BASE_PARAMS = {}
-    LOCAL_OPTUNA_PARAM_SPACE = None
 
 STYLE_PATH = Path(__file__).with_name("styles") / "mcf.mplstyle"
 plt.style.use(str(STYLE_PATH))
@@ -1699,7 +1698,9 @@ class TrainingConfig:
             - "intensity" → |U_c(t)|^2 для всех ядер c
             - "realimag"  → concat([Re U_c(t), Im U_c(t)])
       washout : int | None
-          Сколько первых состояний резервуара отбросить при вычислении ошибки на обучающей выборке. None → авто по κ и окну задержки.
+          Внутренний технический параметр: сколько первых состояний резервуара отбросить
+          перед разбиением на train/val/test. None или <= 0 → ничего не отбрасываем.
+          На верхнем уровне пользовательского запуска обычно не задаётся.
       taps : int >= 1
           Сколько последних символов включать в признак рид-аута.
           taps=1 → только текущий символ (история отключена).
@@ -1708,7 +1709,10 @@ class TrainingConfig:
       target_shift : int
           На сколько шагов вперёд предсказываем MG: 1 → one-step-ahead, k → k-step.
       train_frac, val_frac : float
-          Доли данных (после washout) на обучение и валидацию; тест = 1 - train - val.
+          Доли данных на обучение и валидацию; тест = 1 - train - val.
+      settle_split_by_power : bool
+          Внутренний диагностический режим: если True, split_train_val_test может дополнительно
+          отбросить начало по установлению средней мощности data_out. По умолчанию False.
     """
     feature_mode: Literal["intensity", "realimag"] = "intensity"
     washout: Optional[int] = None
@@ -1717,6 +1721,7 @@ class TrainingConfig:
     target_shift: int = 1
     train_frac: float = 0.6
     val_frac: float = 0.2
+    settle_split_by_power: bool = False
 
 
 @dataclass
@@ -1737,14 +1742,13 @@ class ExperimentConfig:
 
 def get_washout_samples(cfg: ExperimentConfig) -> int:
     """
-    ЕДИНЫЙ механизм получения washout в ОТСЧЁТАХ (samples).
+    ЕДИНЫЙ механизм получения внутреннего начального отбрасывания в ОТСЧЁТАХ (samples).
 
     Важно:
       • Если cfg.training.washout задан (int > 0), он трактуется КАК ЧИСЛО СИМВОЛОВ.
-        Тогда переводим в отсчёты: washout_samples = washout_symbols * M_eff,
+        Тогда переводим в отсчёты: initial_drop_samples = initial_drop_symbols * M_eff,
         где M_eff = mask_size для temporal_* и 1 для spatial_only.
-      • Если cfg.training.washout == None или <= 0 — автооценка по петле задержки и κ
-        (несколько витков delay до затухания транзиента).
+      • Если cfg.training.washout == None или <= 0 — ничего не отбрасываем.
 
     Требование: cfg.reservoir.window_size должен быть уже проставлен (см. run_single_experiment).
     """
@@ -1754,8 +1758,7 @@ def get_washout_samples(cfg: ExperimentConfig) -> int:
         M_eff = cfg.mask.mask_size if str(cfg.variant).startswith("temporal_") else 1
         return int(w_syms) * int(M_eff)
 
-    # авто: минимум один виток задержки, максимум три (обычно достаточно)
-    return int(auto_washout_samples(cfg.reservoir, eps=1e-3, min_loops=1, max_loops=3))
+    return 0
 
 
 def task_debug_meta(task_name: TaskName) -> dict[str, str]:
@@ -2377,19 +2380,20 @@ def split_train_val_test(xw_len: int,
                          val_frac: float,
                          *,
                          data_out: Optional[np.ndarray] = None,
-                         settle: bool = True,
+                         settle: bool = False,
                          tail_frac: float = 0.15,
                          win_symbols: int = 200,
                          tol_rel: float = 0.03,
                          tol_abs: float = 0.0,
                          k_sigma: float = 3.0,
-                         align_to: Optional[int] = None) -> tuple[slice, slice, slice]:
+                         align_to: Optional[int] = None,
+                         display_debug_info: bool = False) -> tuple[slice, slice, slice]:
     """
     Возвращает срезы (train, val, test), которые применяются к Xw (т.е. по оси времени Xw).
 
-    1) Если data_out is None, то режем Xw длины xw_len по train_frac/val_frac.
+    1) Если data_out is None или settle=False, то режем Xw длины xw_len по train_frac/val_frac.
 
-    2) Если передан data_out (сырые данные из run_mcf_with_cache), то по мощности |E|^2:
+    2) Если передан data_out и settle=True, то по мощности |E|^2:
        - оцениваем "конечную" среднюю мощность по хвосту сигнала (tail),
        - находим самый ранний момент i (в шкале data_out), после которого одновременно:
            (a) локальная средняя мощность на окне близка к конечной средней,
@@ -2399,12 +2403,13 @@ def split_train_val_test(xw_len: int,
        - и только затем режем оставшуюся часть Xw по train_frac/val_frac.
 
     Параметры подбора точки установления (для data_out):
-      settle: включить/выключить поиск установления.
+      settle: включить/выключить поиск установления. По умолчанию выключен.
       tail_frac: доля конца сигнала для оценки стационарной средней мощности.
       win_symbols: размер окна (в единицах Xw); в шкалу data_out переводится пропорционально длинам.
       tol_rel/tol_abs: допуски на отличие средней мощности от конечной.
       k_sigma: допуск через дисперсию хвоста (k_sigma * std / sqrt(win)).
       align_to: если задано, найденный старт в Xw делается кратным align_to (например mask_size или иной блок).
+      display_debug_info: если True и settle=True, печатаем найденное дополнительное отбрасывание.
     """
     if train_frac + val_frac > 1.0:
         raise ValueError("train_frac + val_frac must be <= 1.0")
@@ -2418,7 +2423,7 @@ def split_train_val_test(xw_len: int,
     if T_xw == 0:
         return slice(0, 0), slice(0, 0), slice(0, 0)
 
-    # --- Case A: classic behaviour (no data_out) -> split Xw directly
+    # --- Case A: classic behaviour (no data_out or disabled settling) -> split Xw directly
     if data_out is None or not settle:
         train_N = round(T_xw * train_frac)
         val_N = round(T_xw * val_frac)
@@ -2430,8 +2435,8 @@ def split_train_val_test(xw_len: int,
         i3 = i2 + test_N
         return slice(i0, i1), slice(i1, i2), slice(i2, i3)
 
-    # --- Case B: data_out provided -> find "settled" start point using power statistics (in data_out),
-    #             then map it to Xw indices
+    # --- Case B: data_out provided and settling enabled -> find "settled" start point using power
+    #             statistics (in data_out), then map it to Xw indices
     data = np.asarray(data_out)
     if data.ndim < 1:
         raise ValueError(f"Unsupported data_out ndim={data.ndim}; expected array with time as the last axis.")
@@ -2510,6 +2515,13 @@ def split_train_val_test(xw_len: int,
     train_N = round(T_eff * train_frac)
     val_N = round(T_eff * val_frac)
     test_N = T_eff - train_N - val_N
+
+    if display_debug_info:
+        print(
+            "[split_train_val_test] power-settling split enabled: "
+            f"xw_len={T_xw}, data_time_len={T_pow}, start_xw={start_xw}, "
+            f"train/val/test={train_N}/{val_N}/{test_N}"
+        )
 
     i0 = start_xw
     i1 = i0 + train_N
@@ -2596,7 +2608,7 @@ def estimate_required_t_size_fast(cfg) -> int:
       Val    >= max(2·D,  500)  (если val_frac > 0),
       Test   >= max(2·D,  500),
     где D = C · M_eff · taps · (1 или 2).
-    Возвращается t_size уже с добавленными washout и target_shift.
+    Возвращается t_size уже с добавленными внутренним initial drop и target_shift.
     """
     C = int(cfg.core_count)
     variant = str(cfg.variant)
@@ -2634,13 +2646,13 @@ def estimate_required_t_size_fast(cfg) -> int:
     )
 
     # служебные хвосты
-    washout = getattr(cfg.training, "washout", None)
-    if washout is None:
-        washout = 300  # безопасный дефолт
-    washout = int(washout)
+    initial_drop = getattr(cfg.training, "washout", None)
+    if initial_drop is None:
+        initial_drop = 0
+    initial_drop = int(max(0, initial_drop))
     target_shift = int(getattr(cfg.training, "target_shift", 0))
 
-    S_total = int(S_needed + washout + max(target_shift, 0))
+    S_total = int(S_needed + initial_drop + max(target_shift, 0))
     return S_total
 
 
@@ -2698,7 +2710,7 @@ def _get_effective_osnr_time_slices(
       full, train, val, test, val_test
 
     Срезы строятся честно в тех же координатах, что и обучение readout:
-      make_states -> taps -> target_shift -> washout -> split_train_val_test
+      make_states -> taps -> target_shift -> internal initial drop -> split_train_val_test
     """
     if data_out.ndim != 2:
         raise ValueError("data_out должен быть формы (C, T)")
@@ -2732,11 +2744,14 @@ def _get_effective_osnr_time_slices(
     if xw_len < 0:
         raise ValueError("washout слишком велик для доступной длины после taps/shift")
 
+    settle_split_by_power = bool(getattr(cfg.training, "settle_split_by_power", False))
     sl_train, sl_val, sl_test = split_train_val_test(
         xw_len,
         cfg.training.train_frac,
         cfg.training.val_frac,
         data_out=data_out,
+        settle=settle_split_by_power,
+        display_debug_info=bool(getattr(cfg.reservoir, "display_debug_info", False)),
     )
 
     sym_offset = w_syms + taps - 1
@@ -2879,7 +2894,7 @@ def run_single_experiment(cfg: ExperimentConfig,
     """
     1) генерируем вход/таргет задачи,
     2) считаем/читаем из кэша MCF,
-    3) формируем X,y (символьно, с учётом taps/shift/washout),
+    3) формируем X,y (символьно, с учётом taps/shift/внутреннего initial drop),
        сплиты, обучаем ridge, метрики,
     4) по желанию — pseudo free-run и сохранение артефактов.
     """
@@ -2955,20 +2970,26 @@ def run_single_experiment(cfg: ExperimentConfig,
     y_aligned = y_sym[(cfg.training.taps - 1 + shift_syms):, :]  # (S - (taps-1) - shift, 1)
     X_aligned = X_tapped[:y_aligned.shape[0], :]
 
-    # === ЕДИНЫЙ washout: считаем в отсчётах и переводим в СИМВОЛЫ, затем отбрасываем первые w_syms ===
+    # === внутренний initial drop: считаем в отсчётах и переводим в СИМВОЛЫ ===
     w_samples = get_washout_samples(cfg_with_ws)
     w_syms = int(np.ceil(w_samples / max(1, int(M_eff))))
     if w_syms > 0:
         if X_aligned.shape[0] <= w_syms or y_aligned.shape[0] <= w_syms:
-            raise ValueError("washout слишком велик для доступной длины после taps/shift")
+            raise ValueError("initial drop слишком велик для доступной длины после taps/shift")
         Xw = X_aligned[w_syms:, :]
         yw = y_aligned[w_syms:, :]
     else:
         Xw, yw = X_aligned, y_aligned
 
     # сплиты
+    settle_split_by_power = bool(getattr(cfg.training, "settle_split_by_power", False))
     sl_train, sl_val, sl_test = split_train_val_test(
-        Xw.shape[0], cfg.training.train_frac, cfg.training.val_frac, data_out=data_out
+        Xw.shape[0],
+        cfg.training.train_frac,
+        cfg.training.val_frac,
+        data_out=data_out,
+        settle=settle_split_by_power,
+        display_debug_info=bool(cfg.reservoir.display_debug_info),
     )
     Xtr, ytr = Xw[sl_train], yw[sl_train]
     Xva, yva = Xw[sl_val], yw[sl_val]
@@ -2996,6 +3017,8 @@ def run_single_experiment(cfg: ExperimentConfig,
         T_total=int(X_sym.shape[0]),
         features_dim=int(Xw.shape[1]),
         taps=int(cfg.training.taps),
+        initial_drop_symbols=int(w_syms),
+        settle_split_by_power=bool(settle_split_by_power),
     )
 
     # pseudo free-run (по тестовым состояниям; это не замкнутый контур)
@@ -4145,8 +4168,6 @@ def make_experiment_config_from_params(
         mg_gamma: float = 0.1,
         mg_initial_condition: float = 1.2,
         mg_dt: float = 1.0,
-        mg_warmup: int = 300,
-        narma_warmup: int = 100,
         narma_seed: Optional[int] = 42,
         narma_u_low: float = 0.0,
         narma_u_high: float = 0.5,
@@ -4172,18 +4193,62 @@ def make_experiment_config_from_params(
         ase_noise_compute_effective_osnr: Optional[bool] = None,
         training_feature_mode: Literal["intensity", "realimag"] = "intensity",
         training_ridge_alpha: float | str | None = 0,
-        training_washout: Optional[int] = 500,
+        training_warmup: Optional[int] = 500,
         training_target_shift: int = 1,
         training_train_frac: float = 0.6,
         training_val_frac: float = 0.2,
+        training_settle_split_by_power: Optional[bool] = None,
 ) -> ExperimentConfig:
     """
-    Единая сборка ExperimentConfig из словаря params.
+    Собирает полный ExperimentConfig для одного MCF-RC запуска.
 
-    Смысл:
-      - основной main больше не дублирует ручную сборку cfg;
-      - Optuna может получать отдельный optuna_base_params и не зависеть от single_params;
-      - студенческий код импортирует эту функцию и не копирует внутренности основного проекта.
+    Функция является единой точкой сборки конфигурации для обычного запуска,
+    Optuna-запуска и серийных расчётов. На вход подаётся компактный словарь
+    режима params и общие настройки эксперимента, а на выходе получается
+    согласованный ExperimentConfig с заполненными task_cfg, mask, reservoir,
+    training и variant.
+
+    Основные группы параметров в params:
+      • геометрия и режим маскирования:
+          "layer_count", "variant", "mask_size";
+      • временная шкала и петля обратной связи:
+          "temporal_modulation_frequency_ghz", "time_step_ps",
+          "delay_factor_in_symbols", "delta_phase", "kappa";
+      • параметры MCF и усиления:
+          "fiber_length_m", "ppump" или напрямую "g0" и "psat";
+      • масштаб входа:
+          "gain_in";
+      • параметры обучения:
+          "taps", "ridge_alpha", "target_shift", "train_frac", "val_frac",
+          "settle_split_by_power";
+      • параметры ASE-шума:
+          "ase_noise_seed", "ase_noise_nf_db", "ase_noise_optical_bw_hz",
+          "ase_noise_compute_effective_osnr".
+
+    Приоритеты:
+      • значения из params используются для конкретного физического режима
+        и параметров readout, если соответствующие ключи заданы;
+      • явные аргументы функции задают общие настройки запуска и fallback-значения;
+      • для ASE-шума явные аргументы функции имеют приоритет над значениями из params;
+      • training_settle_split_by_power, если задан не None, имеет приоритет над
+        params["settle_split_by_power"].
+
+    Важные соглашения:
+      • если в params задан "ppump", то g0 и psat автоматически пересчитываются
+        через calc_g0_psat_from_p_pump_josab(...);
+      • для variant="spatial_only" mask_size принудительно становится равным 1;
+      • training_warmup относится к генератору задачи MG/NARMA10, а не к
+        дополнительному отбрасыванию состояний резервуара;
+      • washout не задаётся на верхнем уровне этой функции: дополнительное
+        отбрасывание начального transient по умолчанию отключено;
+      • settle_split_by_power включает дополнительный поиск участка, где
+        средняя мощность data_out уже близка к хвостовому уровню. По умолчанию
+        этот режим выключен.
+
+    Возвращает:
+      ExperimentConfig:
+          Полную конфигурацию, готовую для run_experiments(...) или
+          run_single_experiment(...).
     """
     params = deepcopy(dict(params or {}))
 
@@ -4233,12 +4298,12 @@ def make_experiment_config_from_params(
             gamma=mg_gamma,
             initial_condition=mg_initial_condition,
             dt=mg_dt,
-            warmup=mg_warmup,
+            warmup=training_warmup,
         )
     elif task_name == "narma10":
         task_cfg = NARMA10Config(
             t_size=int(t_size),
-            warmup=narma_warmup,
+            warmup=training_warmup,
             seed=narma_seed,
             u_low=narma_u_low,
             u_high=narma_u_high,
@@ -4292,10 +4357,14 @@ def make_experiment_config_from_params(
         feature_mode=training_feature_mode,
         taps=int(params.get("taps", 1)),
         ridge_alpha=params.get("ridge_alpha", training_ridge_alpha),
-        washout=params.get("washout", training_washout),
+        # washout=params.get("washout", training_washout),
         target_shift=int(params.get("target_shift", training_target_shift)),
         train_frac=float(params.get("train_frac", training_train_frac)),
         val_frac=float(params.get("val_frac", training_val_frac)),
+        settle_split_by_power=bool(
+            training_settle_split_by_power if training_settle_split_by_power is not None
+            else params.get("settle_split_by_power", False)
+        ),
     )  # для одиночного запуска
 
     return ExperimentConfig(
@@ -4321,38 +4390,46 @@ if __name__ == "__main__":
 
     ########### Parameters for the best regimes #############
 
+    # Одиночный прогон берёт выбранный режим из mcf_optimized_regimes.py.
     params = dict(LOCAL_SINGLE_PARAMS or {})
 
-    # Optuna теперь получает свою отдельную базу.
-    # Если optuna_base_params пустой, то для удобства используем выбранный одиночный режим.
-    optuna_params = dict(LOCAL_OPTUNA_BASE_PARAMS or params)
+    # Optuna-постановка задаётся только здесь, в main.
+    # Сюда кладём фиксированные параметры задачи/архитектуры, которые не перебираются в param_space.
+    optuna_params = {}
 
-    # Флаги запуска. Удобство в том, что одиночный прогон и Optuna больше не мешают друг другу.
+    # Флаги запуска. Одиночный прогон и Optuna больше не мешают друг другу.
     run_single_experiment_now = True
     run_optuna_now = False
     run_radii_scan_now = False
 
     ####### Выбор теста ######
 
-    # task_name = "mackey_glass"
-    # task_t_size = 20000
-    # params["taps"] = 1
-
-    task_name = "narma10"
-    task_t_size = 2000
-    params["taps"] = 20
-    optuna_params["taps"] = 1
+    task_name = "mackey_glass"
+    task_t_size = 10000
+    params["taps"] = 1
     optuna_params["layer_count"] = 1
-    optuna_params["temporal_modulation_frequency_ghz"] = 1
+    optuna_params["taps"] = 1
+    optuna_params["temporal_modulation_frequency_ghz"] = 40
     optuna_params["variant"] = "temporal_same_all_cores"
 
+    # task_name = "narma10"
+    # task_t_size = 10000
+    # params["taps"] = 1
+    # optuna_params["layer_count"] = 1
+    # optuna_params["taps"] = 10
+    # optuna_params["temporal_modulation_frequency_ghz"] = 40
+    # optuna_params["variant"] = "temporal_same_all_cores"
+
     ##########################
+
+    # True  -> split_train_val_test дополнительно ищет установившийся уровень мощности data_out.
+    # False -> обычное хронологическое train/val/test разбиение.
+    training_settle_split_by_power = True
 
     base_cfg = make_experiment_config_from_params(
         params,
         task_name=task_name,
         t_size=task_t_size,
-        narma_warmup=100,
         narma_seed=42,
         narma_u_low=0.0,
         narma_u_high=0.5,
@@ -4376,10 +4453,11 @@ if __name__ == "__main__":
         # ase_noise_compute_effective_osnr=params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
         training_feature_mode="intensity",
         training_ridge_alpha="val_1se_mean",
-        training_washout=500,
+        training_warmup=500,
         training_target_shift=1,
-        training_train_frac=0.8,
-        training_val_frac=0.1,
+        training_train_frac=0.6,
+        training_val_frac=0.2,
+        training_settle_split_by_power=training_settle_split_by_power,
     )
 
     optuna_base_cfg = make_experiment_config_from_params(
@@ -4406,10 +4484,11 @@ if __name__ == "__main__":
         # ase_noise_compute_effective_osnr=optuna_params.get("ase_noise_compute_effective_osnr", False), # nf_db=60 dB => OSNR=21 dB,
         training_feature_mode="intensity",
         training_ridge_alpha="val_1se_mean",
-        training_washout=500,
+        training_warmup=500,
         training_target_shift=1,
         training_train_frac=0.8,
         training_val_frac=0.1,
+        training_settle_split_by_power=training_settle_split_by_power,
     )
 
     t = time()
@@ -4417,45 +4496,148 @@ if __name__ == "__main__":
     if run_single_experiment_now:
 
         # ================== DEBUG: gain saturation curve at current operating point ==================
-        # data_in_dbg, _mg, _target = (None, None, None)
-        # if base_cfg.variant == "temporal_unique_per_core":
-        #     data_in_dbg, _mg, _target = generate_input_temporal_unique_per_core(
-        #         base_cfg.core_count,
-        #         base_cfg.task_cfg,
-        #         base_cfg.mask,
-        #         base_cfg.task_name,
-        #     )
-        # elif base_cfg.variant == "temporal_same_all_cores":
-        #     data_in_dbg, _mg, _target = generate_input_temporal_same_all_cores(
-        #         base_cfg.core_count,
-        #         base_cfg.task_cfg,
-        #         base_cfg.mask,
-        #         base_cfg.task_name,
-        #     )
-        # elif base_cfg.variant == "spatial_only":
-        #     data_in_dbg, _mg, _target = generate_input_spatial_only(
-        #         base_cfg.core_count,
-        #         base_cfg.task_cfg,
-        #         base_cfg.mask,
-        #         base_cfg.task_name,
-        #     )
-        # else:
-        #     raise ValueError(f"Unknown variant: {base_cfg.variant}")
-        #
-        # plot_laser_gain_curve_from_params(
-        #         params,
-        #         data_in_dbg,
-        #         core_count=base_cfg.core_count,
-        #         curve_kind="signal",
-        #         core_index=None,          # по умолчанию центральное ядро
-        #         plot_all_cores=True,     # True, если хотите наложить кривые всех ядер
-        #         show_plot=True,
-        #         save_plot=False,
-        #     )
-        #
+        data_in_dbg, _mg, _target = (None, None, None)
+        if base_cfg.variant == "temporal_unique_per_core":
+            data_in_dbg, _mg, _target = generate_input_temporal_unique_per_core(
+                base_cfg.core_count,
+                base_cfg.task_cfg,
+                base_cfg.mask,
+                base_cfg.task_name,
+            )
+        elif base_cfg.variant == "temporal_same_all_cores":
+            data_in_dbg, _mg, _target = generate_input_temporal_same_all_cores(
+                base_cfg.core_count,
+                base_cfg.task_cfg,
+                base_cfg.mask,
+                base_cfg.task_name,
+            )
+        elif base_cfg.variant == "spatial_only":
+            data_in_dbg, _mg, _target = generate_input_spatial_only(
+                base_cfg.core_count,
+                base_cfg.task_cfg,
+                base_cfg.mask,
+                base_cfg.task_name,
+            )
+        else:
+            raise ValueError(f"Unknown variant: {base_cfg.variant}")
+
+        plot_laser_gain_curve_from_params(
+                params,
+                data_in_dbg,
+                core_count=base_cfg.core_count,
+                curve_kind="signal",
+                core_index=None,          # по умолчанию центральное ядро
+                plot_all_cores=True,     # True, если хотите наложить кривые всех ядер
+                show_plot=True,
+                save_plot=False,
+            )
+
         # # ============= Пример: одиночный прогон с сохранением артефактов и pseudo free-run ==================
 
+        # regimes_for_map = [
+        #     {
+        #         "layer_count": 0,
+        #         "variant": "temporal_same_all_cores",
+        #         "temporal_modulation_frequency_ghz": 40,
+        #         "delay_factor_in_symbols": 1,
+        #         "delta_phase": 6.22,
+        #         "fiber_length_m": 1.214,
+        #         "ppump": 1.594,
+        #         "gain_in": 0.9491,
+        #         "kappa": 0.8529,
+        #         "mask_size": 787,
+        #         "val_nrmse": 0.573,
+        #         "alpha": 483.265,
+        #     },
+        #     {
+        #         "layer_count": 1,
+        #         "variant": "temporal_same_all_cores",
+        #         "temporal_modulation_frequency_ghz": 40,
+        #         "delay_factor_in_symbols": 1,
+        #         "delta_phase": 4.8112,
+        #         "fiber_length_m": 0.281,
+        #         "ppump": (0.487, 1.257, 0.247, 0.987, 0.0168, 0.277, 0.537),
+        #         "gain_in": 0.0931,
+        #         "kappa": 0.69,
+        #         "mask_size": 102,
+        #         "val_nrmse": 0.205,
+        #         "alpha": 6675,
+        #     },
+        #     {
+        #         "layer_count": 2,
+        #         "variant": "temporal_same_all_cores",
+        #         "temporal_modulation_frequency_ghz": 40,
+        #         "delta_phase": 1.482,
+        #         "delay_factor_in_symbols": 1,
+        #         "fiber_length_m": 0.281,
+        #         "ppump": (0.066, 1.626, 1.826, 0.096, 2.116, 2.606, 2.146, 2.276, 0.136, 2.156,
+        #                   1.336, 1.506, 1.966, 0.376, 2.446, 0.286, 0.196, 1.236, 1.086),
+        #         "gain_in": 0.1931,
+        #         "kappa": 0.587,
+        #         "mask_size": 102,
+        #         "val_nrmse": 0.0722,
+        #         "alpha": 5469.86,
+        #     },
+        #     {
+        #         "layer_count": 1,
+        #         "variant": "spatial_only",
+        #         "temporal_modulation_frequency_ghz": 1.0,
+        #         "delay_factor_in_symbols": 1,
+        #         "delta_phase": 1.258,
+        #         "fiber_length_m": 0.12,
+        #         "ppump": (2.05, 1.63, 1.38, 0.136, 1.39, 2.31, 2.47),
+        #         "gain_in": 0.27,
+        #         "kappa": 0.8961,
+        #         "mask_size": 1,
+        #         "val_nrmse": 0.029048,
+        #         "alpha": 18.084,
+        #     },
+        #     {
+        #         "layer_count": 2,
+        #         "variant": "spatial_only",
+        #         "temporal_modulation_frequency_ghz": 1.0,
+        #         "delay_factor_in_symbols": 1,
+        #         "delta_phase": 4.161,
+        #         "fiber_length_m": 0.12,
+        #         "ppump": (0.836, 2.446, 1.426, 2.166, 0.446, 1.316, 2.606, 0.906, 1.956, 1.496,
+        #                   2.066, 2.216, 0.426, 0.136, 1.206, 1.646, 2.186, 1.856, 0.786),
+        #         "gain_in": 0.4401,
+        #         "kappa": 0.881,
+        #         "mask_size": 1,
+        #         "val_nrmse": 0.0152,
+        #         "alpha": 1.08,
+        #     },
+        # ]
+        #
+        # maps = plot_gain_operating_maps_from_regimes(
+        #     regimes_for_map,
+        #     input_power_reference_w=1.0,
+        #     input_scaling_is_field_amplitude=True,
+        #     default_mask_seed=42,
+        #     default_mask_kind="uniform",
+        #     dimensional_surface_length_m=0.281,
+        #     derivative_variable="signal",
+        #     show_surface_piercing=True,
+        #     show_derivative_maps=True,
+        #     title_prefix="Optimized MCF-RC regimes",
+        #     save_plot=True,
+        #     save_dir="figs",
+        #     basename="mcf_operating_points",
+        #     save_formats=("pdf", "png"),
+        # )
+        #
+        # exit(0)
+
         res = run_experiments(base_cfg, force_rerun=force_rerun, save_cache=save_cache)
+
+        # plot_mcf_fiber_schemes_for_article(save_fig=True)
+
+        # if base_cfg.task_name == "mackey_glass":
+        #     plot_mg_series_and_attractor_for_article(
+        #         res.get("cfg", base_cfg),
+        #         target_series=res["target_series"],
+        #         save_fig=True,
+        #     )
 
         # исследование параметра регуляризации
         sweep = ridge_alpha_sweep_diagnostics(
@@ -4506,10 +4688,11 @@ if __name__ == "__main__":
 
         # Оценка верхних границ g0 и psat (на одно ядро) при заданной длине.
         # Подстрой p_pump_max_single_core_w под доступный (или планируемый) pump laser.
-        p_pump_max_single_core_w = 3  # W
+        p_pump_max_single_core_w = 1.5  # W
         fiber_length_for_bounds_m = float(optuna_params.get("fiber_length_m", 0.3))
         try:
-            _g0_b, _psat_b = calc_g0_psat_from_p_pump_josab(p_pump_max_single_core_w, fiber_length_for_bounds_m, alpha=0)
+            _g0_b, _psat_b = calc_g0_psat_from_p_pump_josab(p_pump_max_single_core_w, fiber_length_for_bounds_m,
+                                                            alpha=0)
             g0_max_bound = float(np.asarray(_g0_b).reshape(-1)[0])
             psat_max_bound = float(np.asarray(_psat_b).reshape(-1)[0])
         except Exception:
@@ -4520,7 +4703,7 @@ if __name__ == "__main__":
             print(
                 f"[pump->gain] Upper bound estimate (single core): g0~{g0_max_bound:.3g} 1/m, Psat~{psat_max_bound:.3g} W")
 
-        param_space = LOCAL_OPTUNA_PARAM_SPACE
+        param_space = {}
 
         # SLM для накачки: оптимизируем общую мощность pump laser и «веса» распределения по ядрам.
         # pump_slm_w_spec = [{"low": -3.0, "high": 3.0} for _ in range(optuna_base_cfg.core_count)]
@@ -4545,17 +4728,24 @@ if __name__ == "__main__":
         # }
 
         param_space = {
-            "kappa": {"low": 0.5, "high": 0.99, "sig": 4},
+            "kappa": {"low": 0.5, "high": 0.9, "sig": 3},
             "delta_phase": {"low": 0, "high": 2 * np.pi, "sig": 4},
             # "ppump": {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 4},
             "ppump": [
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 0
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 1
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 2
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 3
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 4
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 5
-                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 6
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 0
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 1
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 2
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 3
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 4
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 5
+                {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},
+                # ядро 6
                 # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 7
                 # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 8
                 # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": False, "sig": 3},  # ядро 9
@@ -4587,21 +4777,20 @@ if __name__ == "__main__":
                 # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 35
                 # {"low": p_pump_min_w_for_positive_psat, "high": p_pump_max_single_core_w, "log": True, "sig": 4},  # ядро 36
             ],
-            "fiber_length_m": {"low": 0.01, "high": 0.5, "log": False, "sig": 3},
-            "gain_in": {"low": 0.0001, "high": 1, "log": False, "sig": 4},
-            "mask_size": {"int": True, "low": 5, "high": 350, "step": 1},
-            "delay_factor_in_symbols": {"int": True, "low": 1, "high": 20},
+            "fiber_length_m": 0.281,  # {"low": 0.01, "high": 1, "log": False, "sig": 3},
+            "gain_in": {"low": 0.01, "high": 0.15, "log": False, "sig": 4},
+            "mask_size": {"int": True, "low": 50, "high": 200, "step": 1},
+            "delay_factor_in_symbols": 1,  # {"int": True, "low": 1, "high": 20},
             "time_step_ps": optuna_base_cfg.reservoir.time_step_ps,
             # {"int": True, "low": 0.01 * 1e+3, "high": 100 * 1e+3, "log": True},
         }
 
-        optuna_base_cfg.training.train_frac = 0.8
-        optuna_base_cfg.training.val_frac = 0.1
+        optuna_base_cfg.training.train_frac = 0.6
+        optuna_base_cfg.training.val_frac = 0.2
 
         if param_space is None:
             raise ValueError(
-                "param_space is None. Задай optuna_param_space в mcf_optimized_regimes.py "
-                "или раскомментируй один из блоков param_space в main."
+                "param_space is None. Раскомментируй один из блоков param_space в main."
             )
 
         res = run_experiments(
@@ -4661,8 +4850,7 @@ if __name__ == "__main__":
 
         if param_space is None:
             raise ValueError(
-                "param_space is None. Задай optuna_param_space в mcf_optimized_regimes.py "
-                "или раскомментируй один из блоков param_space в main."
+                "param_space is None. Раскомментируй один из блоков param_space в main."
             )
 
         run_spatial_only_radii_optuna(

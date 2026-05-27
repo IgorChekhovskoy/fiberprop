@@ -41,7 +41,7 @@ class Fiber:
     - core_radius (float): Радиус сердцевины [mkm].
     - distance_to_fiber_center (float | list | np.ndarray): Расстояние(я) до центра волокна.
     - core_material (FiberMaterial): Материал сердцевин.
-    - material_concentration (float): Концентрация материала (для сплава SiO2-GeO2).
+    - material_concentration (float): Концентрация материала (для сплава SiO2-GeO2) (Dispersion in GeO2 -SiO 2 glasses, James W.Fleming, Eq.(2))
     - n_cladding (float): Показатель преломления оболочки.
     - delta_n_core (float): Разница показателей преломления сердцевина - оболочка.
     - NA (float): Числовая апертура.
