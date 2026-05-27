@@ -657,143 +657,6 @@ def _maybe_savefig(fig,
         print(f"[warn] savefig failed: {e}")
     return None
 
-
-def plot_fit_predict_scatter(y_true: np.ndarray,
-                             y_pred: np.ndarray,
-                             tau=None,
-                             n_power=None,
-                             plot_params: Optional[dict] = None,
-                             *,
-                             cfg: Optional[ExperimentConfig] = None,
-                             title: Optional[str] = None,
-                             split_name: str = "validation",
-                             max_points: Optional[int] = None,
-                             save_fig: Optional[bool] = None,
-                             explicit_path: Optional[Union[str, Path]] = None) -> float:
-    """
-    Scatter-график "истина против прогноза" для readout.
-
-    Совместимость:
-      • старый студенческий вызов plot_fit_predict_scatter(y_true, y_pred) сохраняется;
-      • старые аргументы tau/n_power/plot_params не ломают вызовы, но оформление приведено к стилю основного модуля.
-
-    Возвращает NRMSE по всем переданным точкам.
-    """
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-
-    n = min(y_true.shape[0], y_pred.shape[0])
-    if n == 0:
-        fig, ax = plt.subplots(figsize=(COL2 * 0.52, COL2 * 0.52), constrained_layout=True)
-        ax.set_title("Fit-predict scatter   •   NRMSE=—", loc="left")
-        ax.set_xlabel("ground truth")
-        ax.set_ylabel("prediction")
-        _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
-        plt.show()
-        return float("nan")
-
-    y_true = y_true[:n]
-    y_pred = y_pred[:n]
-
-    err = float("nan") if n < 2 else float(nrmse(y_true, y_pred))
-
-    finite_mask = np.isfinite(y_true) & np.isfinite(y_pred)
-    if not np.any(finite_mask):
-        fig, ax = plt.subplots(figsize=(COL2 * 0.52, COL2 * 0.52), constrained_layout=True)
-        ax.set_title("Fit-predict scatter   •   NRMSE=—", loc="left")
-        ax.set_xlabel("ground truth")
-        ax.set_ylabel("prediction")
-        _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
-        plt.show()
-        return float("nan")
-
-    yt = y_true[finite_mask]
-    yp = y_pred[finite_mask]
-
-    if max_points is not None and int(max_points) > 0 and yt.shape[0] > int(max_points):
-        idx = np.linspace(0, yt.shape[0] - 1, int(max_points), dtype=int)
-        yt_plot = yt[idx]
-        yp_plot = yp[idx]
-    else:
-        yt_plot = yt
-        yp_plot = yp
-
-    min_v = float(min(np.min(yt), np.min(yp)))
-    max_v = float(max(np.max(yt), np.max(yp)))
-
-    if np.isclose(min_v, max_v):
-        pad = 1.0 if np.isclose(min_v, 0.0) else 0.05 * abs(min_v)
-    else:
-        pad = 0.04 * (max_v - min_v)
-
-    lo = min_v - pad
-    hi = max_v + pad
-
-    if plot_params is not None and "figsize" in plot_params:
-        figsize = plot_params["figsize"]
-    else:
-        figsize = (COL2 * 0.52, COL2 * 0.52)
-
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-
-    marker_size = 7.0
-    marker_alpha = 0.48
-    if plot_params is not None:
-        marker_size = float(plot_params.get("s", marker_size))
-        marker_alpha = float(plot_params.get("scatter_alpha", marker_alpha))
-
-    ax.scatter(
-        yt_plot,
-        yp_plot,
-        s=marker_size,
-        alpha=marker_alpha,
-        linewidths=0.0,
-        rasterized=yt_plot.shape[0] > 3000,
-        label="samples",
-    )
-
-    ax.plot([lo, hi], [lo, hi], ls="--", lw=1.2, color="0.20", label="ideal prediction")
-
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(lo, hi)
-    ax.set_aspect("equal", adjustable="box")
-
-    if cfg is not None:
-        meta = task_debug_meta(getattr(cfg, "task_name", "mackey_glass"))
-        default_title = f"{meta['task_title']}: fit-predict scatter"
-        basename = f"fit_predict_scatter_{cfg.variant}_C{cfg.core_count}_{split_name}"
-        save_enabled = getattr(cfg.reservoir, "save_figs", False) if save_fig is None else bool(save_fig)
-    else:
-        default_title = "Fit-predict scatter"
-        basename = f"fit_predict_scatter_{split_name}"
-        save_enabled = bool(save_fig)
-
-    if title is None and tau is not None and n_power is not None:
-        title = f"{default_title}, tau={tau}, n={n_power}"
-    elif title is None:
-        title = default_title
-
-    if np.isfinite(err):
-        title = f"{title}   •   NRMSE={err:.4f}"
-    else:
-        title = f"{title}   •   NRMSE=—"
-
-    ax.set_title(title, loc="left")
-    ax.set_xlabel("ground truth")
-    ax.set_ylabel("prediction")
-
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        leg = ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.02, 0.98), frameon=True)
-        leg.get_frame().set_facecolor((1, 1, 1, 0.6))
-        leg.get_frame().set_edgecolor((0, 0, 0, 0.3))
-
-    _maybe_savefig(fig, basename, explicit_path=explicit_path, enabled=save_enabled)
-    plt.show()
-
-    return err
-
-
 def update_plots_and_save(results_stream: list[dict],
                            base_cfg: ExperimentConfig,
                            *,
@@ -1405,21 +1268,78 @@ def plot_fit_predict_scatter(y_true: np.ndarray,
                              save_fig: Optional[bool] = None,
                              explicit_path: Optional[Union[str, Path]] = None) -> float:
     """
-    Scatter-график "истина против прогноза" для readout.
+    Рисует scatter-график качества readout: истинные значения против прогноза.
 
-    Совместимость:
-      • старый студенческий вызов plot_fit_predict_scatter(y_true, y_pred) сохраняется;
-      • старые аргументы tau/n_power/plot_params не ломают вызовы, но оформление приведено к стилю основного модуля.
+    Функция строит квадратную диаграмму ``ground truth``--``prediction`` для выбранного
+    сегмента данных и добавляет диагональ идеального прогноза. Метрика NRMSE считается
+    по всем переданным точкам после выравнивания длин ``y_true`` и ``y_pred``; параметр
+    ``max_points`` ограничивает только число отображаемых точек и не влияет на метрику.
 
-    Возвращает NRMSE по всем переданным точкам.
+    Параметры
+    ---------
+    y_true, y_pred:
+        Одномерные массивы истинных и предсказанных значений. Массивы приводятся к
+        ``float`` и обрезаются до общей минимальной длины.
+    tau, n_power:
+        Необязательные параметры для совместимости со старыми вызовами. В новой
+        отрисовке не используются, кроме случая, когда пользователь явно передаёт
+        собственный ``title`` через внешний код.
+    plot_params:
+        Необязательный словарь с настройками отрисовки. Поддерживаются ключи
+        ``figsize``, ``s`` и ``scatter_alpha``.
+    cfg:
+        Конфигурация эксперимента. Если задана, используется для подписи задачи и
+        для определения флага сохранения рисунков.
+    title:
+        Необязательное имя задачи для заголовка. Если не задано, имя берётся из
+        ``cfg``. Итоговый заголовок всегда имеет вид
+        ``<имя задачи>: <segment> NRMSE=<value>``.
+    split_name:
+        Имя сегмента данных: например ``"train"``, ``"validation"`` или ``"test"``.
+    max_points:
+        Максимальное число точек, которое нужно отрисовать. Метрика считается по
+        всем валидным точкам.
+    save_fig:
+        Явно включает или отключает сохранение. Если ``None`` и задан ``cfg``, берётся
+        ``cfg.reservoir.save_figs``.
+    explicit_path:
+        Полный путь для сохранения. Если задан, имеет приоритет над автоматическим
+        именем файла.
+
+    Возвращает
+    ----------
+    float
+        NRMSE между ``y_true`` и ``y_pred`` по всем переданным валидным точкам.
     """
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
 
     n = min(y_true.shape[0], y_pred.shape[0])
+    def _fit_predict_title_base(raw_title: Optional[str]) -> str:
+        if raw_title is None:
+            if cfg is not None:
+                meta = task_debug_meta(getattr(cfg, "task_name", "mackey_glass"))
+                raw_title = meta["task_title"]
+            else:
+                raw_title = "Fit-predict"
+
+        base = str(raw_title).replace("\n", " ")
+        redundant_title_part = " ".join(("training", "and", "prediction"))
+        for phrase in (redundant_title_part, "fit-predict", "scatter"):
+            base = base.replace(phrase, "")
+        base = " ".join(base.split()).strip(" :")
+        if ":" in base:
+            base = base.split(":", 1)[0].strip()
+        if base.endswith(" series"):
+            base = base[:-len(" series")].strip()
+        return base or "Fit-predict"
+
+    title_base = _fit_predict_title_base(title)
+    split_label = str(split_name).strip() or "split"
+
     if n == 0:
         fig, ax = plt.subplots(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
-        ax.set_title("Fit-predict scatter\nNRMSE=—", loc="left")
+        ax.set_title(f"{title_base}: {split_label} NRMSE=—", loc="left")
         ax.set_xlabel("ground truth")
         ax.set_ylabel("prediction")
         _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
@@ -1434,7 +1354,7 @@ def plot_fit_predict_scatter(y_true: np.ndarray,
     finite_mask = np.isfinite(y_true) & np.isfinite(y_pred)
     if not np.any(finite_mask):
         fig, ax = plt.subplots(figsize=(COL2 * 0.62, COL2 * 0.62), constrained_layout=True)
-        ax.set_title("Fit-predict scatter\nNRMSE=—", loc="left")
+        ax.set_title(f"{title_base}: {split_label} NRMSE=—", loc="left")
         ax.set_xlabel("ground truth")
         ax.set_ylabel("prediction")
         _maybe_savefig(fig, "fit_predict_scatter", explicit_path=explicit_path, enabled=bool(save_fig))
@@ -1496,14 +1416,7 @@ def plot_fit_predict_scatter(y_true: np.ndarray,
         spine.set_linewidth(float(plt.rcParams.get("axes.linewidth", 1.0)))
         spine.set_visible(True)
 
-    if title is None:
-        if cfg is not None:
-            meta = task_debug_meta(getattr(cfg, "task_name", "mackey_glass"))
-            title = f"{meta['task_title']}: {split_name} fit-predict"
-        else:
-            title = f"Fit-predict scatter: {split_name}"
-
-    ax.set_title(f"{title}\nNRMSE={err:.4g}", loc="left")
+    ax.set_title(f"{title_base}: {split_label} NRMSE={err:.4g}", loc="left")
     ax.set_xlabel("ground truth")
     ax.set_ylabel("prediction")
     ax.legend(loc="upper left", frameon=True)
